@@ -1517,6 +1517,94 @@ impl Agent {
             }
         })
     }
+
+    /// Run one agent turn under an EXPLICIT tool policy.
+    ///
+    /// Exists because [`Agent::process_message`] builds its own `LoopConfig`
+    /// with `allowed_tools: None`, and in `LoopConfig` that `None` means *no
+    /// restriction at all*. Anything reachable from a remote caller must go
+    /// through here instead, so the policy cannot be forgotten.
+    ///
+    /// `allowed_tools` is a plain `Vec`, never an `Option`: an empty vector is
+    /// a valid policy meaning "no tools", and is the correct fail-closed
+    /// default. Returns the raw [`LoopOutcome`] so the caller can map terminal
+    /// states (completed / canceled / failed).
+    ///
+    /// [`LoopOutcome`]: crate::loop_runner::LoopOutcome
+    pub async fn run_with_policy(
+        &self,
+        prompt: &str,
+        allowed_tools: Vec<String>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<crate::loop_runner::LoopOutcome> {
+        let model = self.config.openrouter.model.clone();
+        let max_iter = self.config.max_iterations();
+        let loop_config = policy_loop_config(
+            allowed_tools,
+            &model,
+            max_iter,
+            self.config.empty_response_retry_limit(),
+            self.registry.effective_context_window(&model),
+        );
+
+        let system_content = self.build_subagent_system_prompt("").await;
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(MessageContent::from_text(system_content)),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::from_text(prompt)),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let make_ctx = {
+            let sandbox_dir = self.config.sandbox.allowed_directory.clone();
+            let home_dir = self.config.resolved_home.clone();
+            let sender = self.sender.clone();
+            let cancel_registry = self.cancel_registry.clone();
+            move |_user_id: &str, _chat_id: &str| ToolContext {
+                sandbox_dir: sandbox_dir.clone(),
+                home_dir: home_dir.clone(),
+                sender: sender.clone(),
+                cancel_registry: cancel_registry.clone(),
+                user_id: String::new(),
+                chat_id: String::new(),
+                tool_ui_mode: crate::tool_registry::ToolUiMode::Minimal,
+            }
+        };
+
+        // `special_tool_handler: None` is deliberate. `invoke_agent` and
+        // `spawn_agents` are not registry tools (see `src/agent.rs:1306`), so a
+        // registry-derived `["*"]` cannot reach them, and passing `None` keeps
+        // that true for A2A peers. Do not pass a handler here.
+        // Bound to a local before `.await`: as a tail expression the temporary
+        // `AgenticLoop` would outlive `loop_config` and fail to borrow-check.
+        let outcome = crate::loop_runner::AgenticLoop::new(
+            &self.llm,
+            &self.tool_registry,
+            &self.mcp,
+            &loop_config,
+            cancel_token,
+            None,
+            None,
+            self.sender.as_ref() as &dyn PlatformSender,
+            Box::new(make_ctx),
+            None,
+        )
+        .run(
+            &mut crate::loop_runner::MessageContainer::Plain(std::mem::take(&mut messages)),
+            "",
+            "",
+        )
+        .await;
+        outcome
+    }
 }
 
 /// Build a context-forked message list for a /btw side question.
@@ -1716,9 +1804,75 @@ fn is_compacted_regurgitation(raw: &str, parsed: &serde_json::Value) -> bool {
     false
 }
 
+/// Build the `LoopConfig` for a caller that supplies an explicit policy.
+///
+/// Free function rather than a method so the security property is testable
+/// without constructing an `Agent` or reaching an LLM: `allowed_tools` must
+/// come out as `Some(..)`, never `None`. In `LoopConfig` a `None` here means
+/// *no restriction at all* (`src/config.rs:313-320`), which is exactly how a
+/// remote peer would gain `execute_command`.
+fn policy_loop_config(
+    allowed_tools: Vec<String>,
+    model: &str,
+    max_iter: u32,
+    empty_response_retry_limit: u32,
+    context_window: usize,
+) -> crate::loop_runner::LoopConfig {
+    crate::loop_runner::LoopConfig {
+        max_iterations: max_iter,
+        empty_response_retry_limit,
+        context_window,
+        loop_detection_enabled: true,
+        interactive_loop_callback: false,
+        allowed_tools: Some(allowed_tools),
+        langsmith_project: None,
+        model: Some(model.to_string()),
+        tool_event_tx: None,
+        stream_token_tx: None,
+        recovery_nudge: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_loop_config_is_never_unrestricted() {
+        // The whole reason `run_with_policy` exists. `allowed_tools: None` in
+        // a LoopConfig means *no restriction at all*, so a remote caller
+        // reaching a loop built this way would get `execute_command`.
+        let cfg = policy_loop_config(vec!["read_file".to_string()], "m", 5, 3, 100);
+        assert!(
+            cfg.allowed_tools.is_some(),
+            "an explicit-policy loop must never be unrestricted"
+        );
+        assert_eq!(
+            cfg.allowed_tools.as_ref().unwrap(),
+            &vec!["read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn policy_loop_config_preserves_an_empty_policy_as_empty_not_unrestricted() {
+        // The fail-closed direction: a caller that resolved zero tools must get
+        // zero tools, NOT the `None` that means "everything".
+        let cfg = policy_loop_config(Vec::new(), "m", 5, 3, 100);
+        match cfg.allowed_tools {
+            Some(v) => assert!(v.is_empty(), "empty policy must stay empty"),
+            None => panic!("empty policy collapsed to None, which means UNRESTRICTED"),
+        }
+    }
+
+    #[test]
+    fn policy_loop_config_does_not_widen_the_allowlist() {
+        // No auto-injection: unlike the subagent path, this must not add
+        // read_skill_file / read_agent_file behind the caller's back.
+        let cfg = policy_loop_config(vec!["read_file".to_string()], "m", 5, 3, 100);
+        let tools = cfg.allowed_tools.unwrap();
+        assert_eq!(tools.len(), 1, "policy must not be widened: {tools:?}");
+        assert!(!tools.contains(&"execute_command".to_string()));
+    }
 
     #[test]
     fn test_effective_subagent_tools_includes_read_tools() {
