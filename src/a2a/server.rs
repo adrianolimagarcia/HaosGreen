@@ -7,9 +7,9 @@ use crate::skills::SkillRegistry;
 use anyhow::{Context, Result};
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use std::net::SocketAddr;
@@ -25,14 +25,29 @@ pub struct A2aState {
     /// listener has bound, so it reflects the address that was actually bound
     /// (see `resolve_endpoint_url`); it is never mutated afterwards.
     pub endpoint_url: String,
+    /// The SDK's request handler, holding the executor and task store.
+    pub handler: Arc<a2a_server::DefaultRequestHandler>,
 }
 
-/// Build the shared listener state.
-pub fn build_state(config: A2aConfig, skills: SkillRegistry, endpoint_url: &str) -> Arc<A2aState> {
+/// Build the shared listener state from an executor and a task store.
+///
+/// Takes the two SDK abstractions rather than an `Arc<Agent>` so the router is
+/// testable without constructing one: `Agent::new` needs 17 arguments
+/// including a self-referential `Weak<Agent>`. `spawn` is what binds them to
+/// the real agent.
+pub fn build_state(
+    config: A2aConfig,
+    skills: SkillRegistry,
+    endpoint_url: &str,
+    executor: impl a2a_server::AgentExecutor,
+    store: impl a2a_server::TaskStore,
+) -> Arc<A2aState> {
+    let handler = Arc::new(a2a_server::DefaultRequestHandler::new(executor, store));
     Arc::new(A2aState {
         config,
         skills,
         endpoint_url: endpoint_url.to_string(),
+        handler,
     })
 }
 
@@ -82,9 +97,19 @@ pub fn resolve_endpoint_url(config: &A2aConfig, bound: SocketAddr) -> String {
 /// handler reads a request body in Phase 1, so the limit is currently inert:
 /// it binds as soon as a body extractor is added to a handler.
 pub fn router(state: Arc<A2aState>) -> Router {
+    // The SDK serves its JSON-RPC binding at "/", so nest it under the path
+    // Phase 1 already published. `ConnectInfo<SocketAddr>` survives the nest,
+    // so the IP allowlist keeps working.
+    let sdk = a2a_server::jsonrpc::jsonrpc_router(state.handler.clone());
+
+    let jsonrpc_routes: Router<Arc<A2aState>> =
+        Router::new().nest_service("/jsonrpc", sdk).route_layer(
+            axum::middleware::from_fn_with_state(state.clone(), auth_gate),
+        );
+
     Router::new()
         .route("/.well-known/agent-card.json", get(agent_card_handler))
-        .route("/jsonrpc", post(jsonrpc_handler))
+        .merge(jsonrpc_routes)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         // Outermost, so requests rejected by the body limit are traced too.
         .layer(TraceLayer::new_for_http())
@@ -97,56 +122,43 @@ async fn agent_card_handler(State(state): State<Arc<A2aState>>) -> impl IntoResp
     Json(card)
 }
 
-/// JSON-RPC endpoint. Phase 1 authenticates and then refuses, because no
-/// executor exists yet. Returning 501 rather than 200 is deliberate: a client
-/// must not believe a task was accepted.
-async fn jsonrpc_handler(
+/// Authenticate a request before it reaches the SDK handler, and forward the
+/// resolved peer name so the executor can re-derive its policy.
+///
+/// Status codes match Phase 1 exactly: 401 for a missing or wrong token, 403
+/// for a disallowed address, 500 for an ambiguous (duplicated) token.
+///
+/// The peer name travels as a request header because `service_params` is the
+/// only identity channel the SDK offers -- it sets `ctx.user` to `None`
+/// unconditionally (`handler.rs:558`).
+async fn auth_gate(
     State(state): State<Arc<A2aState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let bearer = headers
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let bearer = req
+        .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| parse_bearer(Some(v)));
 
     match authenticate(&state.config, bearer, addr.ip()) {
         Ok(identity) => {
-            // Log the raw configured policy, not `identity.allowed_tools.len()`.
-            // `authenticate` resolves that list against an EMPTY available-tool
-            // set, so a `["*"]` peer — the most privileged configuration there
-            // is — reports length 0. Logging that number would understate the
-            // peer at the exact moment of the security decision. `None` here
-            // means the conservative default allowlist, not "no tools".
-            let configured_tools = state
-                .config
-                .peers
-                .get(&identity.name)
-                .and_then(|peer| peer.tools.as_deref());
-            info!(
-                peer = %identity.name,
-                configured_tools = ?configured_tools,
-                "A2A peer authenticated; no executor implemented yet (Phase 2). \
-                 Tool policy is provisional: resolve it against the live registry before use"
-            );
-            (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32601,
-                        "message": "No A2A method is implemented yet"
-                    }
-                })),
-            )
+            info!(peer = %identity.name, peer_ip = %addr.ip(), "A2A peer authenticated");
+            let value = axum::http::HeaderValue::from_str(&identity.name)
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static(""));
+            req.headers_mut()
+                .insert(crate::a2a::executor::PEER_HEADER, value);
+            next.run(req).await
         }
         Err(AuthError::MissingToken) => {
             warn!(peer_ip = %addr.ip(), "A2A request without a bearer token");
-            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({}))).into_response()
         }
         Err(AuthError::InvalidToken) => {
             warn!(peer_ip = %addr.ip(), "A2A request with an unknown token");
-            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({}))).into_response()
         }
         Err(AuthError::AmbiguousToken) => {
             // Misconfiguration, not a client error: two peers share a token.
@@ -160,16 +172,17 @@ async fn jsonrpc_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({})),
             )
+                .into_response()
         }
         Err(AuthError::IpNotAllowed) => {
             warn!(peer_ip = %addr.ip(), "A2A peer authenticated from a disallowed address");
-            (StatusCode::FORBIDDEN, Json(serde_json::json!({})))
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({}))).into_response()
         }
     }
 }
 
 /// Extract the token from an `Authorization: Bearer <token>` header value.
-fn parse_bearer(header: Option<&str>) -> Option<&str> {
+pub(crate) fn parse_bearer(header: Option<&str>) -> Option<&str> {
     let value = header?.trim_start();
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
@@ -193,7 +206,12 @@ fn parse_bearer(header: Option<&str>) -> Option<&str> {
 /// Building the state here rather than taking it from the caller is what lets
 /// `endpoint_url` stay an immutable `String`: nothing needs to mutate it, so
 /// no `OnceLock`/`RwLock` is required.
-pub async fn spawn(config: A2aConfig, skills: SkillRegistry) -> Result<SocketAddr> {
+pub async fn spawn(
+    config: A2aConfig,
+    skills: SkillRegistry,
+    executor: impl a2a_server::AgentExecutor,
+    store: impl a2a_server::TaskStore,
+) -> Result<SocketAddr> {
     let addr = config.bind.clone();
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -207,7 +225,7 @@ pub async fn spawn(config: A2aConfig, skills: SkillRegistry) -> Result<SocketAdd
     let endpoint_url = resolve_endpoint_url(&config, local);
     info!(address = %local, advertised = %endpoint_url, "A2A listener started");
 
-    let app = router(build_state(config, skills, &endpoint_url));
+    let app = router(build_state(config, skills, &endpoint_url, executor, store));
 
     tokio::spawn(async move {
         // `into_make_service_with_connect_info` is required for the
@@ -231,6 +249,31 @@ mod tests {
     use crate::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
     use crate::skills::SkillRegistry;
     use std::collections::HashMap;
+
+    /// Minimal executor so the router can be built without an `Agent`.
+    struct StubExecutor;
+
+    #[async_trait::async_trait]
+    impl a2a_server::AgentExecutor for StubExecutor {
+        fn execute(
+            &self,
+            _ctx: a2a_server::ExecutorContext,
+        ) -> futures::stream::BoxStream<
+            'static,
+            Result<a2a::event::StreamResponse, a2a::errors::A2AError>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        fn cancel(
+            &self,
+            _ctx: a2a_server::ExecutorContext,
+        ) -> futures::stream::BoxStream<
+            'static,
+            Result<a2a::event::StreamResponse, a2a::errors::A2AError>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+    }
 
     fn test_config() -> A2aConfig {
         let mut peers = HashMap::new();
@@ -284,7 +327,13 @@ mod tests {
 
     #[test]
     fn router_builds_without_panicking() {
-        let state = build_state(test_config(), SkillRegistry::new(), "http://localhost:8443");
+        let state = build_state(
+            test_config(),
+            SkillRegistry::new(),
+            "http://localhost:8443",
+            StubExecutor,
+            a2a_server::InMemoryTaskStore::new(),
+        );
         let _router = router(state);
     }
 

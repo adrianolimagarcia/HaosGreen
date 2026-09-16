@@ -454,7 +454,16 @@ async fn main() -> Result<()> {
                 // `spawn` binds, then derives the advertised URL from the
                 // address it actually bound, so the Agent Card never
                 // advertises port 0 for an ephemeral bind.
-                if let Err(e) = rustfox::a2a::server::spawn(config.a2a.clone(), a2a_skills).await {
+                let a2a_executor = rustfox::a2a::A2aExecutor::new(agent.clone());
+                let a2a_store = rustfox::a2a::SqliteTaskStore::new(agent.memory.connection());
+                if let Err(e) = rustfox::a2a::server::spawn(
+                    config.a2a.clone(),
+                    a2a_skills,
+                    a2a_executor,
+                    a2a_store,
+                )
+                .await
+                {
                     tracing::error!(error = %e, "A2A listener failed to start");
                 }
             }
