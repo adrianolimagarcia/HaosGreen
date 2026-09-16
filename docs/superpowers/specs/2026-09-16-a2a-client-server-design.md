@@ -1,17 +1,24 @@
 # A2A (Agent2Agent) Client + Server Design
 
 Date: 2026-09-16
-Status: Server phases 1–3 implemented; Phase 4 streaming and Phase 5 client remain
+Status: Server phases 1–4 implemented; Phase 5 outbound client remains
 
 ## Current implementation status
 
 The server-side phases are implemented and covered by unit and live E2E tests:
 `AgentExecutor` drives the RustFox agent loop under the authenticated peer tool
-policy; `SendMessage`, `GetTask`, and `CancelTask` use the SDK router and SQLite
-task store; and `TaskGate` bounds concurrent tasks. The SDK supports
-`returnImmediately`, with `GetTask` available for polling. Remaining work is
-Phase 4 SSE streaming (`SendStreamingMessage`) and Phase 5 outbound client
-support (`client.rs` and the `call_a2a_agent` tool).
+policy; `SendMessage`, `SendStreamingMessage`, `GetTask`, and `CancelTask` use
+the SDK router and SQLite task store; and `TaskGate` bounds concurrent tasks.
+The SDK JSON-RPC router is mounted at `/jsonrpc`; its streaming method returns
+`text/event-stream` with one JSON-RPC response in each SSE `data:` event. The
+provider response is locally chunked into token-sized pieces internally, but
+these are not emitted as A2A Message events; SSE currently streams lifecycle
+transitions. The production `A2aExecutor` emits `TASK_STATE_WORKING`, then emits
+a terminal task whose state reflects the agent outcome (`TASK_STATE_COMPLETED`,
+`TASK_STATE_FAILED`, or `TASK_STATE_CANCELED`) and whose history includes the
+terminal reply. The
+remaining work is Phase 5 outbound client support (`client.rs` and the
+`call_a2a_agent` tool).
 
 ## Goal
 
@@ -213,9 +220,9 @@ POST /jsonrpc   SendMessage
      └─ respond: Task (long) or Message (fast resolution)
 ```
 
-`SendStreamingMessage` wires `LoopConfig.stream_token_tx` into the SDK's SSE writer.
-`CancelTask` resolves through `cancel_token_registry`, the same mechanism
-`/stop` uses.
+`SendStreamingMessage` uses the SDK JSON-RPC SSE binding mounted at `/jsonrpc`.
+The production `A2aExecutor` emits `working`, then the terminal task; provider output is chunked internally but not emitted as A2A Message events. `CancelTask` resolves through
+`cancel_token_registry`, the same mechanism `/stop` uses.
 
 ## Security Model
 
@@ -375,11 +382,11 @@ depend on were in place.
 | 1 | `card.rs` + `auth.rs` + `policy.rs` + config plumbing; Agent Card served, endpoints reject unauthenticated requests | — | success criteria 1 and 3 |
 | 2 | `task_store.rs` + `executor.rs` + `SendMessage` synchronous path; task reaches `completed` | 1 | success criteria 2 and 4 |
 | 3 | `GetTask`, `CancelTask`, semaphore; lifecycle fully async | 2 | success criteria 5 |
-| 4 | `SendStreamingMessage` SSE | 3 | streaming interop test |
+| 4 | `SendStreamingMessage` SSE | 3 | streaming interop test (implemented) |
 | 5 | `client.rs` + `call_a2a_agent` tool | 2 | success criterion 6 |
 
 Phase 1 established authentication before the executor was introduced. The
-server-side implementation now covers Phases 1–3; Phases 4–5 remain future work
+server-side implementation now covers Phases 1–4; Phase 5 remains future work
 as noted above.
 
 ## Risks

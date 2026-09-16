@@ -13,12 +13,33 @@
 //! [`Agent::run_with_policy`]: crate::agent::Agent::run_with_policy
 
 use crate::a2a::policy::resolve_allowed_tools;
+use crate::llm::{ChatMessage, MessageContent};
 use a2a::errors::A2AError;
-use a2a::event::StreamResponse;
+use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::types::{Message, Part, PartContent, Role, Task, TaskState, TaskStatus};
 use a2a_server::{AgentExecutor, ExecutorContext, ServiceParams};
 use futures::stream::BoxStream;
 use std::sync::Arc;
+
+struct AgentTaskCleanup {
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<crate::loop_runner::LoopOutcome>>>,
+    agent: Arc<crate::agent::Agent>,
+    key: String,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for AgentTaskCleanup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        self.cancel.cancel();
+        // Drop may run after the runtime has shut down. Never spawn here:
+        // synchronous best-effort cleanup is safe in both runtime and teardown
+        // contexts; normal execution performs awaited cleanup below.
+        self.agent.try_clear_cancel_token(&self.key);
+    }
+}
 
 /// Header the auth middleware uses to hand the resolved peer name to the SDK
 /// handler.
@@ -170,6 +191,7 @@ impl AgentExecutor for A2aExecutor {
         // Hazard: emitting `StreamResponse::Task` REPLACES the stored task
         // (handler.rs:218), so history must be carried forward or it is lost.
         let prior_history = ctx.stored_task.as_ref().and_then(|t| t.history.clone());
+        let prior_artifacts = ctx.stored_task.as_ref().and_then(|t| t.artifacts.clone());
 
         // Resolved BEFORE the async block: the returned stream must be
         // `'static`, and `policy_for` borrows `&self`. Resolving here also
@@ -177,81 +199,102 @@ impl AgentExecutor for A2aExecutor {
         let allowed = self.policy_for(&peer);
         let gate = self.gate.clone();
 
-        // The executor emits exactly one terminal event, so `once` is enough
-        // and needs no extra dependency.
-        Box::pin(futures::stream::once(async move {
-            // Acquired BEFORE registering the cancel token: a refused task must
-            // not leave a token in the registry for CancelTask to cancel. The
-            // permit is held for the whole turn, bounding concurrency.
+        Box::pin(async_stream::stream! {
             let _permit = match gate.try_acquire() {
                 Ok(p) => p,
                 Err(full) => {
                     tracing::warn!(task_id = %task_id, peer = %peer, limit = gate.limit(),
                         "A2A task refused: concurrency limit reached");
-                    return Ok(StreamResponse::Task(failed_task(
-                        &task_id,
-                        &context_id,
-                        &full.message,
-                    )));
+                    yield Ok(StreamResponse::Task(failed_task(&task_id, &context_id, &full.message)));
+                    return;
                 }
             };
 
             let key = cancel_key(&task_id);
             let cancel = agent.register_cancel_token(&key).await;
 
-            tracing::info!(
-                task_id = %task_id,
-                peer = %peer,
-                tools = allowed.len(),
-                "A2A task starting"
-            );
+            yield Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                status: TaskStatus { state: TaskState::Working, message: None, timestamp: None },
+                metadata: None,
+            }));
 
-            let outcome = agent.run_with_policy(&prompt, allowed, Some(cancel)).await;
+            let (token_tx, mut token_rx) = tokio::sync::mpsc::channel::<String>(128);
+            let prior_history_for_agent = prior_history.clone();
+            let agent_task = {
+                let agent = agent.clone();
+                let prompt = prompt.clone();
+                let allowed = allowed.clone();
+                let cancel_for_task = cancel.clone();
+                tokio::spawn(async move {
+                    agent.run_with_policy_streaming_history(
+                        prior_history_for_agent.unwrap_or_default().into_iter().filter_map(|message| {
+                            let role = match message.role {
+                                Role::User => "user",
+                                Role::Agent => "assistant",
+                                _ => return None,
+                            };
+                            let text = message.parts.iter().filter_map(|part| match &part.content {
+                                PartContent::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            }).collect::<Vec<_>>().join("\n");
+                            (!text.is_empty()).then(|| ChatMessage {
+                                role: role.to_string(),
+                                content: Some(MessageContent::from_text(text)),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            })
+                        }),
+                        &prompt,
+                        allowed,
+                        Some(cancel_for_task),
+                        Some(token_tx),
+                    ).await
+                })
+            };
+            let mut cleanup = AgentTaskCleanup {
+                handle: Some(agent_task),
+                agent: agent.clone(),
+                key: key.clone(),
+                cancel: cancel.clone(),
+            };
+            let outcome = loop {
+                tokio::select! {
+                    Some(_token) = token_rx.recv() => {}
+                    result = cleanup.handle.as_mut().expect("agent handle available") => break result,
+                }
+            };
+            cleanup.handle.take();
             agent.clear_cancel_token(&key).await;
-
+            let outcome = match outcome {
+                Ok(result) => result,
+                Err(join_error) => Err(anyhow::anyhow!("agent task failed: {join_error}")),
+            };
             let (state, text) = match outcome {
                 Ok(crate::loop_runner::LoopOutcome::FinalResponse(t)) => (TaskState::Completed, t),
-                Ok(crate::loop_runner::LoopOutcome::MaxIterations) => (
-                    TaskState::Failed,
-                    "The agent reached its maximum number of iterations.".to_string(),
-                ),
-                Ok(crate::loop_runner::LoopOutcome::Cancelled) => {
-                    (TaskState::Canceled, "Cancelled.".to_string())
-                }
+                Ok(crate::loop_runner::LoopOutcome::MaxIterations) => (TaskState::Failed, "The agent reached its maximum number of iterations.".to_string()),
+                Ok(crate::loop_runner::LoopOutcome::Cancelled) => (TaskState::Canceled, "Cancelled.".to_string()),
                 Err(e) => (TaskState::Failed, format!("Agent error: {e}")),
             };
-
             let mut history = prior_history.unwrap_or_default();
-            history.push(Message {
-                message_id: uuid::Uuid::new_v4().to_string(),
-                context_id: Some(context_id.clone()),
-                task_id: Some(task_id.clone()),
-                role: Role::Agent,
-                parts: vec![Part::text(text)],
-                metadata: None,
-                extensions: None,
-                reference_task_ids: None,
-            });
-
-            Ok(StreamResponse::Task(Task {
-                id: task_id,
-                context_id,
-                status: TaskStatus {
-                    state,
-                    message: None,
-                    timestamp: None,
-                },
-                artifacts: None,
-                history: Some(history),
-                metadata: None,
-            }))
-        }))
+            history.push(Message { message_id: uuid::Uuid::new_v4().to_string(), context_id: Some(context_id.clone()), task_id: Some(task_id.clone()), role: Role::Agent, parts: vec![Part::text(text)], metadata: None, extensions: None, reference_task_ids: None });
+            yield Ok(StreamResponse::Task(Task { id: task_id, context_id, status: TaskStatus { state, message: None, timestamp: None }, artifacts: prior_artifacts, history: Some(history), metadata: None }));
+        })
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let agent = self.agent.clone();
         let task_id = ctx.task_id.clone();
         let context_id = ctx.context_id.clone();
+        let history = ctx
+            .stored_task
+            .as_ref()
+            .and_then(|task| task.history.clone());
+        let artifacts = ctx
+            .stored_task
+            .as_ref()
+            .and_then(|task| task.artifacts.clone());
 
         Box::pin(futures::stream::once(async move {
             let cancelled = agent.cancel_processing(&cancel_key(&task_id)).await;
@@ -270,8 +313,8 @@ impl AgentExecutor for A2aExecutor {
                     message: None,
                     timestamp: None,
                 },
-                artifacts: None,
-                history: None,
+                artifacts,
+                history,
                 metadata: None,
             }))
         }))

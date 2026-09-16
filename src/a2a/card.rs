@@ -62,7 +62,7 @@ pub fn build_agent_card(
         version: cfg.version.clone(),
         supported_interfaces: vec![AgentInterface::new(endpoint_url, BINDING_JSONRPC)],
         capabilities: AgentCapabilities {
-            streaming: Some(false),
+            streaming: Some(true),
             push_notifications: Some(false),
             ..AgentCapabilities::default()
         },
@@ -174,6 +174,12 @@ mod tests {
     fn empty_registry_yields_empty_skills_not_an_error() {
         let card = build_agent_card(&cfg(), &registry(vec![]), "http://localhost:8443");
         assert!(card.skills.is_empty());
+    }
+
+    #[test]
+    fn card_advertises_streaming() {
+        let card = build_agent_card(&cfg(), &registry(vec![]), "http://localhost:8443");
+        assert_eq!(card.capabilities.streaming, Some(true));
     }
 
     #[test]

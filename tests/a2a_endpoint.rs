@@ -1,11 +1,56 @@
 //! End-to-end checks for the A2A listener: the card is public, everything
 //! else is refused without a valid peer.
 
+use a2a::errors::A2AError;
+use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
+use a2a::types::{Task, TaskState, TaskStatus};
+use a2a_server::{AgentExecutor, ExecutorContext};
+use futures::stream::BoxStream;
 use rustfox::a2a::server::{build_state, router, spawn};
 use rustfox::a2a::NoopExecutor;
 use rustfox::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
 use rustfox::skills::SkillRegistry;
 use std::collections::HashMap;
+
+struct StreamingExecutor;
+
+impl AgentExecutor for StreamingExecutor {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let completed = StreamResponse::Task(Task {
+            id: ctx.task_id,
+            context_id: ctx.context_id,
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        });
+        Box::pin(futures::stream::iter([Ok(working), Ok(completed)]))
+    }
+
+    fn cancel(
+        &self,
+        _ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        Box::pin(futures::stream::empty())
+    }
+}
 
 fn config() -> A2aConfig {
     let mut peers = HashMap::new();
@@ -31,12 +76,12 @@ fn config() -> A2aConfig {
 }
 
 /// Bind an ephemeral port and return its base URL plus a shutdown handle.
-async fn start() -> (String, tokio::task::JoinHandle<()>) {
+async fn start_with<E: AgentExecutor>(executor: E) -> (String, tokio::task::JoinHandle<()>) {
     let state = build_state(
         config(),
         SkillRegistry::new(),
         "http://placeholder",
-        NoopExecutor,
+        executor,
         a2a_server::InMemoryTaskStore::new(),
     );
     let app = router(state);
@@ -51,6 +96,90 @@ async fn start() -> (String, tokio::task::JoinHandle<()>) {
         .unwrap();
     });
     (format!("http://{addr}"), handle)
+}
+
+async fn start() -> (String, tokio::task::JoinHandle<()>) {
+    start_with(NoopExecutor).await
+}
+
+#[tokio::test]
+async fn authenticated_send_streaming_message_returns_working_and_completed_sse() {
+    let (base, handle) = start_with(StreamingExecutor).await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/jsonrpc"))
+        .bearer_auth("s3cret")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage",
+            "params": {"message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}}
+        }))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let body = response.text().await.unwrap();
+    let frames: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data.trim()).expect("SSE data must be JSON"))
+        .collect();
+    assert_eq!(
+        frames.len(),
+        2,
+        "expected working and completed frames: {body}"
+    );
+    for frame in &frames {
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert_eq!(frame["id"], 1);
+        assert!(frame["result"].is_object(), "missing result: {frame}");
+    }
+    let payloads: Vec<&serde_json::Value> = frames.iter().map(|frame| &frame["result"]).collect();
+    fn contains_state(value: &serde_json::Value, state: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                (key == "state" && value == state) || contains_state(value, state)
+            }),
+            serde_json::Value::Array(values) => {
+                values.iter().any(|value| contains_state(value, state))
+            }
+            _ => false,
+        }
+    }
+    assert!(payloads
+        .iter()
+        .any(|payload| contains_state(payload, "TASK_STATE_WORKING")));
+    assert!(payloads
+        .iter()
+        .any(|payload| contains_state(payload, "TASK_STATE_COMPLETED")));
+    assert!(
+        body.contains("TASK_STATE_WORKING"),
+        "missing working event: {body}"
+    );
+    assert!(
+        body.contains("TASK_STATE_COMPLETED"),
+        "missing completed event: {body}"
+    );
+    assert!(body.contains("data: "), "missing SSE JSON-RPC data: {body}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn unauthenticated_send_streaming_message_is_401() {
+    let (base, handle) = start_with(StreamingExecutor).await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/jsonrpc"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage", "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    handle.abort();
 }
 
 #[tokio::test]

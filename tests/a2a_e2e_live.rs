@@ -84,6 +84,7 @@ const PROMPT: &str = "Reply with the single word: pong";
 /// The wire spelling `a2a-lf` serializes `TaskState::Completed` to. Confirmed
 /// in `a2a-lf-0.3.1/src/types.rs:114` and in the generated ProtoJSON serde impl
 /// for `lf.a2a.v1.TaskState`.
+const TASK_STATE_WORKING: &str = "TASK_STATE_WORKING";
 const TASK_STATE_COMPLETED: &str = "TASK_STATE_COMPLETED";
 
 /// A `PlatformSender` that drops everything on the floor.
@@ -477,7 +478,7 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
     let task = &json["result"]["task"];
     assert!(
         !task.is_null(),
-        "the result must carry a task (not a bare message): {body}"
+        "the result must carry task; bare result.message is rejected: {body}"
     );
 
     let state = task["status"]["state"]
@@ -518,18 +519,31 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
         .as_str()
         .expect("the result task must have an id")
         .to_string();
-    let get = client
-        .post(format!("http://{addr}/jsonrpc"))
-        .bearer_auth(PEER_TOKEN)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "GetTask",
-            "params": {"id": task_id}
-        }))
-        .send()
-        .await
-        .expect("GetTask must complete");
-    let get_body: serde_json::Value = get.json().await.expect("GetTask must be JSON");
-    assert_eq!(get_body["result"]["id"], task_id);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let get_body = loop {
+        let response = client
+            .post(format!("http://{addr}/jsonrpc"))
+            .bearer_auth(PEER_TOKEN)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "GetTask",
+                "params": {"id": task_id}
+            }))
+            .send()
+            .await
+            .expect("GetTask polling must complete");
+        let body: serde_json::Value = response.json().await.expect("GetTask must be JSON");
+        assert_eq!(body["result"]["id"], task_id);
+        match body["result"]["status"]["state"].as_str() {
+            Some(TASK_STATE_COMPLETED) => break body,
+            Some("TASK_STATE_WORKING") => {}
+            state => panic!("unexpected task state: {state:?}; body: {body}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task did not reach completion: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(get_body["result"]["status"]["state"], TASK_STATE_COMPLETED);
 
     let bogus = client
@@ -546,6 +560,102 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
     assert_eq!(bogus_body["error"]["code"], -32001);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RUSTFOX_A2A_LIVE=1 and a live OpenAI-compatible LLM"]
+async fn an_authenticated_peer_streams_working_and_completed_pong() {
+    if std::env::var("RUSTFOX_A2A_LIVE").as_deref() != Ok("1") {
+        println!("SKIP: RUSTFOX_A2A_LIVE is not set to 1");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("create a temp dir");
+    let config_path = write_config(tmp.path());
+    let memory = MemoryStore::open_in_memory().expect("open an in-memory memory store");
+    let a2a = a2a_config();
+    let agent = build_agent(&config_path, &memory, a2a.clone()).await;
+    let store = SqliteTaskStore::new(agent.memory.connection());
+    let state = build_state(
+        a2a,
+        SkillRegistry::new(),
+        "http://placeholder",
+        A2aExecutor::new(agent),
+        store,
+    );
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral loopback port");
+    let addr = listener.local_addr().expect("read the bound address");
+    let _server = ServerGuard(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("the A2A listener must not fail");
+    }));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("build the HTTP client");
+    let response = client
+        .post(format!("http://{addr}/jsonrpc"))
+        .bearer_auth(PEER_TOKEN)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "SendStreamingMessage",
+            "params": {"message": {"messageId": "stream-m1", "role": "ROLE_USER", "parts": [{"text": PROMPT}]}}
+        }))
+        .send()
+        .await
+        .expect("SendStreamingMessage must complete");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(reqwest::header::CONTENT_TYPE),
+        Some(&reqwest::header::HeaderValue::from_static(
+            "text/event-stream"
+        ))
+    );
+    let body = response.text().await.expect("read SSE response body");
+    println!("stream body: {body}");
+
+    let mut events = Vec::new();
+    for line in body.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        let event: serde_json::Value = serde_json::from_str(line).expect("SSE data must be JSON");
+        assert_eq!(
+            event["jsonrpc"], "2.0",
+            "each SSE event must be JSON-RPC: {event}"
+        );
+        assert_eq!(
+            event["id"], 7,
+            "each SSE event must retain request id: {event}"
+        );
+        assert!(
+            event.get("error").is_none() || event["error"].is_null(),
+            "SSE error: {event}"
+        );
+        events.push(event);
+    }
+    assert!(
+        !events.is_empty(),
+        "response must contain JSON-RPC SSE data events"
+    );
+
+    let encoded = serde_json::to_string(&events).expect("serialize parsed events");
+    assert!(
+        encoded.contains(TASK_STATE_WORKING),
+        "missing working event: {body}"
+    );
+    assert!(
+        encoded.contains(TASK_STATE_COMPLETED),
+        "missing completed event: {body}"
+    );
+    assert!(
+        encoded.to_lowercase().contains("pong"),
+        "stream must contain the terminal reply containing pong: {body}"
+    );
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires RUSTFOX_A2A_LIVE=1"]
 async fn an_in_progress_task_can_be_canceled() {

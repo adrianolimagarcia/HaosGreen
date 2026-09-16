@@ -573,6 +573,18 @@ impl Agent {
         self.cancel_token_registry.lock().await.remove(user_id);
     }
 
+    /// Best-effort synchronous cancel-token cleanup for destructor paths.
+    ///
+    /// Drop implementations cannot safely await, and must not assume a Tokio
+    /// runtime is still alive. Returning whether the registry was cleaned lets
+    /// callers avoid spawning a task when no runtime (or lock) is available.
+    pub fn try_clear_cancel_token(&self, user_id: &str) -> bool {
+        self.cancel_token_registry
+            .try_lock()
+            .map(|mut registry| registry.remove(user_id).is_some())
+            .unwrap_or(false)
+    }
+
     /// Fetch the context window size for the current model from the
     /// provider API and cache it. Non-fatal — uses static fallback on
     /// failure.
@@ -1537,6 +1549,43 @@ impl Agent {
         allowed_tools: Vec<String>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<crate::loop_runner::LoopOutcome> {
+        self.run_with_policy_streaming(prompt, allowed_tools, cancel_token, None)
+            .await
+    }
+
+    /// Run under an explicit tool policy and stream final-response chunks.
+    pub async fn run_with_policy_streaming(
+        &self,
+        prompt: &str,
+        allowed_tools: Vec<String>,
+        cancel_token: Option<CancellationToken>,
+        stream_token_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<crate::loop_runner::LoopOutcome> {
+        self.run_with_policy_streaming_history(
+            std::iter::empty(),
+            prompt,
+            allowed_tools,
+            cancel_token,
+            stream_token_tx,
+        )
+        .await
+    }
+
+    /// Run under an explicit tool policy with prior user/agent turns.
+    ///
+    /// History is data only: it cannot alter the explicit tool allowlist or
+    /// grant access to special subagent handlers.
+    pub async fn run_with_policy_streaming_history<I>(
+        &self,
+        history: I,
+        prompt: &str,
+        allowed_tools: Vec<String>,
+        cancel_token: Option<CancellationToken>,
+        stream_token_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<crate::loop_runner::LoopOutcome>
+    where
+        I: IntoIterator<Item = ChatMessage>,
+    {
         let model = self.config.openrouter.model.clone();
         let max_iter = self.config.max_iterations();
         let loop_config = policy_loop_config(
@@ -1545,23 +1594,29 @@ impl Agent {
             max_iter,
             self.config.empty_response_retry_limit(),
             self.registry.effective_context_window(&model),
+            stream_token_tx,
         );
 
         let system_content = self.build_subagent_system_prompt("").await;
-        let mut messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: Some(MessageContent::from_text(system_content)),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::from_text(prompt)),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ];
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: Some(MessageContent::from_text(system_content)),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        messages.extend(history.into_iter().filter(|message| {
+            matches!(message.role.as_str(), "user" | "assistant")
+                && message
+                    .content
+                    .as_ref()
+                    .is_some_and(|content| !content.is_empty())
+        }));
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::from_text(prompt)),
+            tool_calls: None,
+            tool_call_id: None,
+        });
 
         let make_ctx = {
             let sandbox_dir = self.config.sandbox.allowed_directory.clone();
@@ -1817,6 +1872,7 @@ fn policy_loop_config(
     max_iter: u32,
     empty_response_retry_limit: u32,
     context_window: usize,
+    stream_token_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> crate::loop_runner::LoopConfig {
     crate::loop_runner::LoopConfig {
         max_iterations: max_iter,
@@ -1828,7 +1884,7 @@ fn policy_loop_config(
         langsmith_project: None,
         model: Some(model.to_string()),
         tool_event_tx: None,
-        stream_token_tx: None,
+        stream_token_tx,
         recovery_nudge: None,
     }
 }
@@ -1842,7 +1898,7 @@ mod tests {
         // The whole reason `run_with_policy` exists. `allowed_tools: None` in
         // a LoopConfig means *no restriction at all*, so a remote caller
         // reaching a loop built this way would get `execute_command`.
-        let cfg = policy_loop_config(vec!["read_file".to_string()], "m", 5, 3, 100);
+        let cfg = policy_loop_config(vec!["read_file".to_string()], "m", 5, 3, 100, None);
         assert!(
             cfg.allowed_tools.is_some(),
             "an explicit-policy loop must never be unrestricted"
@@ -1857,7 +1913,7 @@ mod tests {
     fn policy_loop_config_preserves_an_empty_policy_as_empty_not_unrestricted() {
         // The fail-closed direction: a caller that resolved zero tools must get
         // zero tools, NOT the `None` that means "everything".
-        let cfg = policy_loop_config(Vec::new(), "m", 5, 3, 100);
+        let cfg = policy_loop_config(Vec::new(), "m", 5, 3, 100, None);
         match cfg.allowed_tools {
             Some(v) => assert!(v.is_empty(), "empty policy must stay empty"),
             None => panic!("empty policy collapsed to None, which means UNRESTRICTED"),
@@ -1868,7 +1924,7 @@ mod tests {
     fn policy_loop_config_does_not_widen_the_allowlist() {
         // No auto-injection: unlike the subagent path, this must not add
         // read_skill_file / read_agent_file behind the caller's back.
-        let cfg = policy_loop_config(vec!["read_file".to_string()], "m", 5, 3, 100);
+        let cfg = policy_loop_config(vec!["read_file".to_string()], "m", 5, 3, 100, None);
         let tools = cfg.allowed_tools.unwrap();
         assert_eq!(tools.len(), 1, "policy must not be widened: {tools:?}");
         assert!(!tools.contains(&"execute_command".to_string()));
