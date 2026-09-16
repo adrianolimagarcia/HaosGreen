@@ -561,20 +561,27 @@ use crate::config::A2aPeerConfig;
 ///
 /// # Deliberate exclusions
 ///
-/// `read_soul_file` and `plan_view` are excluded because both can read outside
-/// the sandbox:
+/// `read_soul_file` and `plan_view` are excluded even though both have since
+/// been hardened (commits `fe7fe2c` and `e667ccb`): `read_soul_file` now
+/// validates `file_name` against a fixed allowlist and refuses symlinks, and
+/// the `plan_*` handlers route their resolved path through
+/// `validate_sandbox_path`.
 ///
-/// - `read_soul_file(file_name)` validates nothing at runtime — its JSON-schema
-///   `enum` is only a hint to the LLM. `file_name = "config.toml"` returns the
-///   RustFox home's `config.toml`, which holds the OpenRouter API key and every
-///   A2A peer bearer token. A path-traversal `file_name` escapes the home
-///   directory entirely.
-/// - `plan_view(title)` joins an unvalidated, attacker-controlled `title` onto
-///   the `.plans` directory; an absolute `title` replaces the whole prefix.
+/// The exclusion is kept as defence in depth, because both remain the most
+/// powerful read primitives in the set:
 ///
-/// A peer that authenticates over A2A can drive an agent holding
-/// `execute_command`, so this default must never widen the blast radius beyond
-/// the sandbox and the shared memory store.
+/// - `read_soul_file` reads from the RustFox **home**, not the sandbox. Its
+///   containment rests on a hand-written allowlist plus an `O_NOFOLLOW` open,
+///   and anything that regresses either one re-exposes `config.toml` — which
+///   holds the OpenRouter API key and every A2A peer bearer token.
+/// - `plan_view` reads a path derived from an LLM-supplied `title`. It is
+///   contained by validation, but it is a second, weaker path to the same
+///   filesystem that `read_file` already covers properly.
+///
+/// Neither is needed for a peer to do useful work: `read_file` and
+/// `list_files` cover the sandbox with a single, well-tested containment
+/// check. Keeping the wider primitives out means a future regression in
+/// either cannot become a remote credential disclosure.
 pub const DEFAULT_PEER_TOOLS: &[&str] = &[
     "read_file",
     "list_files",
@@ -956,9 +963,15 @@ pub fn authenticate(
         return Err(AuthError::IpNotAllowed);
     }
 
-    // Resolved against a fixed set here; the caller re-resolves against the
-    // live tool registry. An empty `available` still yields the default list,
-    // which is what we want for the identity record.
+    // Resolved here against an EMPTY `available` set; the caller MUST
+    // re-resolve against the live tool registry before using it.
+    //
+    // With `available = &[]` the three cases collapse to: `None` → the default
+    // allowlist (the case we want for the identity record); `Some(list)` →
+    // `list` verbatim; `Some(["*"])` → `[]`, NOT every tool. So this provisional
+    // `allowed_tools` is only correct for the default peer — for a wildcard
+    // peer it under-reports and must be recomputed by the caller. Treat it as a
+    // placeholder, never as the final policy.
     let allowed_tools = crate::a2a::policy::resolve_allowed_tools(matched_name, peer, &[]);
 
     Ok(PeerIdentity {
@@ -1527,7 +1540,7 @@ In `src/main.rs`, locate where the supervisor backends and scheduler are wired (
         let endpoint_url = format!("http://{}", config.a2a.bind);
         let a2a_state = rustfox::a2a::server::build_state(
             config.a2a.clone(),
-            skill_registry.clone(),
+            a2a_skills,
             &endpoint_url,
         );
         if let Err(e) = rustfox::a2a::server::spawn(a2a_state).await {
@@ -1540,7 +1553,19 @@ In `src/main.rs`, locate where the supervisor backends and scheduler are wired (
     }
 ```
 
-Adapt the variable name for the loaded skill registry to whatever `main.rs` already uses at that point (`grep -n "SkillRegistry" src/main.rs` to find it). If no registry value is in scope there, move this block to immediately after the registry is constructed.
+**As implemented:** `main.rs` owns the loaded registry as `skills` (line 185) and moves it
+into `Agent::new(...)` (line 253), so the listener takes a clone captured before that
+move — `let a2a_skills = skills.clone();` next to the other `skills.clone()` calls around
+line 213. The block above sits after the supervisor wiring and before
+`info!("Bot is starting...")`.
+
+> **Known limitation (found in final review).** `format!("http://{}", config.a2a.bind)`
+> advertises the raw bind string. With `bind = "0.0.0.0:8443"` — the obvious LAN
+> setting — the card tells a remote peer to connect to `http://0.0.0.0:8443`, which
+> resolves to *that peer's own loopback*. With port `0` it advertises port `0` even
+> though `spawn()` knows the real bound port and discards it. A `[a2a].public_url`
+> config key and using `listener.local_addr()` are the fix; see the final review
+> follow-up commit.
 
 `endpoint_url` uses `http://` because Phase 1 has no TLS. Phase 3 (TLS) must update this to `https://` when `[a2a].tls` is enabled, otherwise the advertised interface will not match the actual transport.
 
@@ -1751,7 +1776,7 @@ One adaptation note remains, in Task 7 Step 1: the name of the in-scope `SkillRe
 - `resolve_allowed_tools(&str, &A2aPeerConfig, &[String]) -> Vec<String>` — defined Task 3, called Task 4 Step 3.
 - `DEFAULT_PEER_TOOLS: &[&str]` — defined Task 3, re-exported in `mod.rs`.
 - `authenticate(&A2aConfig, Option<&str>, IpAddr) -> Result<PeerIdentity, AuthError>` — defined Task 4, called Task 6 Step 3.
-- `AuthError` variants `MissingToken` / `InvalidToken` / `IpNotAllowed` — defined Task 4, matched exhaustively in Task 6 Step 3.
+- `AuthError` variants `MissingToken` / `InvalidToken` / `AmbiguousToken` / `IpNotAllowed` — defined Task 4, matched exhaustively in Task 6 Step 3.
 - `PeerIdentity { name, allowed_tools }` — defined Task 4, read in Task 6.
 - `build_agent_card(&A2aCardConfig, &SkillRegistry, &str) -> AgentCard` — defined Task 5, called Task 6 Step 3.
 - `build_state(A2aConfig, SkillRegistry, &str) -> Arc<A2aState>` — defined Task 6, called Tasks 7 and 8.

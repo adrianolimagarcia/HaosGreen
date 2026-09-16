@@ -175,15 +175,47 @@ The tool policy default is deliberately conservative. A peer block with no
 `tools` key resolves to exactly this list, and nothing else:
 
 ```
-read_file, list_files, read_soul_file, read_skill_file, read_agent_file,
-search_memory, recall, remember, plan_view
+read_file, list_files, read_skill_file, read_agent_file,
+search_memory, recall, remember
 ```
 
 Explicitly **absent** from the default, and reachable only by naming them or by
 `["*"]`: `execute_command`, `write_file`, `send_file`, `self_upgrade`,
 `schedule_task`, `cancel_scheduled_task`, `rerun_scheduled_task`,
 `try_new_tech`, `write_skill_file`, `write_agent_file`, `update_soul_file`,
-`revert_soul_file`, `patch_skill`, `invoke_agent`, `spawn_agents`.
+`revert_soul_file`, `patch_skill`, `read_soul_file`, `plan_view`.
+
+### Why `read_soul_file` and `plan_view` are excluded
+
+Both were originally in this list and were **removed** after review (commits
+`6cdc8f8`, `fe7fe2c`, `e667ccb`). An earlier revision of this document listed
+them as safe because they are "read-only" — but read-only is not the same as
+*confined*, and that framing is precisely what let the problem survive design
+review:
+
+- **`read_soul_file`** reads relative to the RustFox **home**, not the sandbox.
+  Its JSON-schema `enum` was only a hint to the LLM, never enforced at runtime,
+  so `file_name = "config.toml"` returned `~/.rustfox/config.toml` — the
+  OpenRouter API key and **every peer bearer token in this system**. The tool
+  has since been hardened (allowlist plus `O_NOFOLLOW`), but it remains the only
+  read primitive that reaches the credential store, so it stays out on
+  defence-in-depth grounds: a future regression in either control would be a
+  remote credential disclosure.
+- **`plan_view`** read a path derived from an LLM-supplied `title`. Now
+  validated and sandbox-contained, but it is a second, weaker route to the
+  filesystem that `read_file` already covers properly.
+
+Neither is needed for a peer to do useful work: `read_file` and `list_files`
+cover the sandbox through a single, well-tested containment check. Keeping the
+wider primitives out means a regression in either cannot become a remote
+credential disclosure. **Do not add them back to match an older revision of
+this document.**
+
+Note on `["*"]`: the wildcard expands to the tool names the runtime actually
+exposes, derived from the registered tool handlers. `invoke_agent` and
+`spawn_agents` are handled in the agent loop but are not defined as tool
+handlers, so a registry-derived wildcard does **not** grant them. Treat the
+wildcard as "every registered tool", not as an exhaustive escalation path.
 
 The default is an allowlist, not a denylist: a tool added to RustFox in the
 future is **not** granted to peers until it is added here. This matters because
