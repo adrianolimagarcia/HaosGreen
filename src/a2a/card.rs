@@ -26,11 +26,30 @@ pub fn build_agent_card(
     schemes.insert(
         "bearer".to_string(),
         SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
-            scheme: "Bearer".to_string(),
+            scheme: "bearer".to_string(),
             description: Some("Static per-peer bearer token".to_string()),
             bearer_format: None,
         }),
     );
+
+    let mut sec_req = HashMap::new();
+    sec_req.insert("bearer".to_string(), Vec::new());
+
+    let mut skills: Vec<AgentSkill> = registry
+        .list()
+        .into_iter()
+        .map(|s| AgentSkill {
+            id: s.name.clone(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+            tags: s.tags.clone(),
+            examples: None,
+            input_modes: None,
+            output_modes: None,
+            security_requirements: None,
+        })
+        .collect();
+    skills.sort_by(|a, b| a.id.cmp(&b.id));
 
     AgentCard {
         name: cfg.name.clone(),
@@ -44,25 +63,12 @@ pub fn build_agent_card(
         },
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        skills: registry
-            .list()
-            .into_iter()
-            .map(|s| AgentSkill {
-                id: s.name.clone(),
-                name: s.name.clone(),
-                description: s.description.clone(),
-                tags: s.tags.clone(),
-                examples: None,
-                input_modes: None,
-                output_modes: None,
-                security_requirements: None,
-            })
-            .collect(),
+        skills,
         provider: None,
         documentation_url: None,
         icon_url: None,
         security_schemes: Some(schemes),
-        security_requirements: None,
+        security_requirements: Some(vec![sec_req]),
         signatures: None,
     }
 }
@@ -194,5 +200,28 @@ mod tests {
         let json = serde_json::to_string(&card).unwrap();
         let back: a2a::agent_card::AgentCard = serde_json::from_str(&json).unwrap();
         assert_eq!(card, back);
+    }
+
+    #[test]
+    fn card_declares_security_requirements() {
+        let card = build_agent_card(&cfg(), &registry(vec![]), "http://localhost:8443");
+        let reqs = card
+            .security_requirements
+            .as_ref()
+            .expect("requirements required");
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].contains_key("bearer"));
+    }
+
+    #[test]
+    fn skills_are_sorted_deterministically_by_id() {
+        let reg = registry(vec![
+            skill("zeta", "z", &[]),
+            skill("alpha", "a", &[]),
+            skill("mid", "m", &[]),
+        ]);
+        let card = build_agent_card(&cfg(), &reg, "http://localhost:8443");
+        let ids: Vec<&str> = card.skills.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mid", "zeta"]);
     }
 }
