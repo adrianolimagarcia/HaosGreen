@@ -290,15 +290,21 @@ Create `src/a2a/mod.rs`:
 //!
 //! Phase 1 covers the Agent Card, authentication and the per-peer tool policy.
 //! See `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md`.
+//!
+//! Each module is declared by the task that creates it: `auth` in Task 4,
+//! `card` in Task 5, `server` in Task 6. Declaring them here now would not
+//! compile, because those files do not exist yet.
 
-pub mod auth;
-pub mod card;
 pub mod policy;
-pub mod server;
 
-pub use auth::{authenticate, AuthError, PeerIdentity};
 pub use policy::{resolve_allowed_tools, DEFAULT_PEER_TOOLS};
 ```
+
+> **Note for Tasks 4, 5 and 6:** each must add its own `pub mod <name>;` line and
+> any re-exports to `src/a2a/mod.rs` as part of its work. Task 4 adds
+> `pub mod auth;` plus `pub use auth::{authenticate, AuthError, PeerIdentity};`,
+> Task 5 adds `pub mod card;`, Task 6 adds `pub mod server;`. They are not
+> declared up front because the files do not exist yet.
 
 - [ ] **Step 2: Add the module to the crate root**
 
