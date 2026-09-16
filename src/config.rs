@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,6 +32,8 @@ pub struct Config {
     pub supervisor: SupervisorConfig,
     #[serde(default)]
     pub subagents: SubagentsConfig,
+    #[serde(default)]
+    pub a2a: A2aConfig,
     /// Explicit provider sections (multi-provider mode). Optional —
     /// when empty, `build_providers()` synthesizes a single OpenRouter
     /// provider from the legacy `[openrouter]` section.
@@ -63,6 +66,73 @@ impl Default for SupervisorConfig {
             risk: RiskThresholdsConfig::default(),
         }
     }
+}
+
+/// A2A (Agent2Agent) protocol settings.
+///
+/// Disabled by default. Enabling this opens a network listener; read
+/// `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md` §2 and §6
+/// before turning it on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct A2aConfig {
+    /// Master switch. `false` means no listener is started at all.
+    pub enabled: bool,
+    /// Listen address. Defaults to loopback; raising this to a LAN address is
+    /// a deliberate act.
+    pub bind: String,
+    /// Maximum A2A tasks executing concurrently. Excess tasks queue.
+    pub max_concurrent_tasks: usize,
+    /// Agent Card metadata.
+    pub card: A2aCardConfig,
+    /// Known peers, keyed by peer name. A request whose token matches no entry
+    /// here is rejected. An empty map means nobody can connect.
+    pub peers: HashMap<String, A2aPeerConfig>,
+}
+
+impl Default for A2aConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8443".to_string(),
+            max_concurrent_tasks: 4,
+            card: A2aCardConfig::default(),
+            peers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct A2aCardConfig {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+}
+
+impl Default for A2aCardConfig {
+    fn default() -> Self {
+        Self {
+            name: "RustFox".to_string(),
+            description: "Self-hosted Telegram AI assistant".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct A2aPeerConfig {
+    /// Bearer token this peer must present.
+    pub token: String,
+    /// Allowed source addresses: exact IPs (`10.0.0.5`) or CIDR blocks
+    /// (`192.168.1.0/24`). Empty means no address is allowed.
+    #[serde(default)]
+    pub ip: Vec<String>,
+    /// Tool allowlist for this peer. `None` applies `DEFAULT_PEER_TOOLS`.
+    /// `Some(["*"])` grants every tool, including shell. An explicit list is
+    /// used verbatim.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1310,5 +1380,85 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.fallback.chain.is_empty());
+    }
+
+    /// Minimal config that parses. `Config` has **no `Default` impl**, and
+    /// `telegram.bot_token`, `telegram.allowed_user_ids` and
+    /// `openrouter.api_key` are required fields with no serde default.
+    fn minimal_config() -> Config {
+        toml::from_str(
+            r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+"#,
+        )
+        .expect("minimal config must parse")
+    }
+
+    #[test]
+    fn a2a_disabled_by_default() {
+        let cfg = minimal_config();
+        assert!(!cfg.a2a.enabled, "A2A must be opt-in");
+    }
+
+    #[test]
+    fn a2a_binds_localhost_by_default() {
+        let cfg = minimal_config();
+        assert_eq!(cfg.a2a.bind, "127.0.0.1:8443");
+    }
+
+    #[test]
+    fn a2a_max_concurrent_tasks_defaults_to_four() {
+        let cfg = minimal_config();
+        assert_eq!(cfg.a2a.max_concurrent_tasks, 4);
+    }
+
+    #[test]
+    fn a2a_peer_without_tools_parses_as_none() {
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a.peers.laptop]
+token = "s3cret"
+ip = ["192.168.1.0/24"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let peer = cfg.a2a.peers.get("laptop").expect("peer must parse");
+        assert_eq!(peer.token, "s3cret");
+        assert_eq!(peer.ip, vec!["192.168.1.0/24".to_string()]);
+        assert!(
+            peer.tools.is_none(),
+            "absent tools key must be None, not an empty vec — None means \
+             'apply the conservative default', Some(vec![]) means 'no tools'"
+        );
+    }
+
+    #[test]
+    fn a2a_peer_with_wildcard_parses() {
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a.peers.buildbox]
+token = "t"
+ip = ["10.8.0.4"]
+tools = ["*"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let peer = cfg.a2a.peers.get("buildbox").unwrap();
+        assert_eq!(peer.tools.as_ref().unwrap(), &vec!["*".to_string()]);
     }
 }
