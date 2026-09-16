@@ -155,6 +155,11 @@ impl A2aConfig {
         self.validate_public_url()?;
         self.validate_tls()?;
         self.validate_peers()?;
+        if self.max_concurrent_tasks == 0 {
+            anyhow::bail!(
+                "[a2a] max_concurrent_tasks must be at least 1 (0 would refuse every task)"
+            );
+        }
         self.warn_on_non_loopback_bind();
         Ok(())
     }
@@ -1756,6 +1761,17 @@ version = "9.9.9"
                 ip: ip.iter().map(|s| s.to_string()).collect(),
                 tools: None,
             },
+        );
+    }
+
+    #[test]
+    fn a2a_zero_max_concurrent_tasks_is_refused() {
+        let mut cfg = a2a_cfg();
+        cfg.max_concurrent_tasks = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("max_concurrent_tasks"),
+            "error must name the field: {err}"
         );
     }
 
