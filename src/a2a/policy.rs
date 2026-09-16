@@ -29,16 +29,27 @@ use tracing::warn;
 ///
 /// # Deliberate exclusions
 ///
-/// `read_soul_file` and `plan_view` are excluded because both can read outside
-/// the sandbox:
+/// `read_soul_file` and `plan_view` are excluded even though both have since
+/// been hardened (commits `fe7fe2c` and `e667ccb`): `read_soul_file` now
+/// validates `file_name` against a fixed allowlist and refuses symlinks, and
+/// the `plan_*` handlers route their resolved path through
+/// `validate_sandbox_path`.
 ///
-/// - `read_soul_file(file_name)` validates nothing at runtime — its JSON-schema
-///   `enum` is only a hint to the LLM. `file_name = "config.toml"` returns the
-///   RustFox home's `config.toml`, which holds the OpenRouter API key and every
-///   A2A peer bearer token. A path-traversal `file_name` escapes the home
-///   directory entirely.
-/// - `plan_view(title)` joins an unvalidated, attacker-controlled `title` onto
-///   the `.plans` directory; an absolute `title` replaces the whole prefix.
+/// The exclusion is kept as defence in depth, because both remain the most
+/// powerful read primitives in the set:
+///
+/// - `read_soul_file` reads from the RustFox **home**, not the sandbox. Its
+///   containment rests on a hand-written allowlist plus an `O_NOFOLLOW` open,
+///   and anything that regresses either one re-exposes `config.toml` — which
+///   holds the OpenRouter API key and every A2A peer bearer token.
+/// - `plan_view` reads a path derived from an LLM-supplied `title`. It is
+///   contained by validation, but it is a second, weaker path to the same
+///   filesystem that `read_file` already covers properly.
+///
+/// Neither is needed for a peer to do useful work: `read_file` and
+/// `list_files` cover the sandbox with a single, well-tested containment
+/// check. Keeping the wider primitives out means a future regression in
+/// either cannot become a remote credential disclosure.
 ///
 /// A peer that authenticates over A2A can drive an agent holding
 /// `execute_command`, so this default must never widen the blast radius beyond
