@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "a2a-lf"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b24d0f12bb1205e7ff85edbac2ea34aedd028f31dfebe8628e3aae4a66c200bd"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,6 +178,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -705,7 +725,7 @@ version = "0.4.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fdf00e8af6d0b3e92d4bbf9b76f773d8b84ea80f310324ad16cbdc2e653e02c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "crc32fast",
  "image",
  "quick-xml 0.41.0",
@@ -1267,7 +1287,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2395,7 +2415,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -2439,7 +2459,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -2502,7 +2522,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bef41ebc9ebed2c1b1d90203e9d1756091e8a00bbc3107676151f39868ca0ee"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "http",
@@ -2682,10 +2702,11 @@ dependencies = [
 name = "rustfox"
 version = "1.0.2"
 dependencies = [
+ "a2a-lf",
  "anyhow",
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "docx-rs",
@@ -2694,6 +2715,7 @@ dependencies = [
  "image",
  "include_dir",
  "infer",
+ "ipnet",
  "nix",
  "ocrs",
  "pdf-extract",
@@ -2710,12 +2732,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlite-vec",
+ "subtle",
  "teloxide",
  "tempfile",
  "tokio",
  "tokio-cron-scheduler",
  "tokio-util",
  "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2990,7 +3014,7 @@ version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bs58",
  "chrono",
  "hex",
@@ -3622,6 +3646,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 
@@ -3801,7 +3826,7 @@ version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "cookie_store",
  "der 0.8.1",
  "encoding_rs",
@@ -3824,7 +3849,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "http",
  "httparse",
  "log",
@@ -4475,7 +4500,7 @@ version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dba6063ff82cdbd9a765add16d369abe81e520f836054e997c2db217ceca40c0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "ed25519-dalek",
  "thiserror 2.0.19",
 ]
