@@ -309,6 +309,27 @@ impl MemoryStore {
                 FOREIGN KEY (task_id) REFERENCES sup_tasks(id)
             );
             CREATE INDEX IF NOT EXISTS idx_sup_artifacts_task ON sup_artifacts(task_id, kind);
+
+            -- A2A: one row per remote task. `state` is the A2A TaskState
+            -- lowercased so it can be filtered; `data` holds the whole
+            -- serialized `a2a::Task` so the SDK's TaskStore round-trips every
+            -- field it cares about without us mirroring its schema.
+            --
+            -- History lives inside `data`, not a separate table: the SDK's
+            -- `Task` already carries its own `history`, and a second table
+            -- would be a second source of truth with no reader. Add one in the
+            -- phase that actually queries messages.
+            CREATE TABLE IF NOT EXISTS a2a_tasks (
+                id          TEXT PRIMARY KEY,
+                context_id  TEXT NOT NULL,
+                peer        TEXT NOT NULL DEFAULT '',
+                state       TEXT NOT NULL,
+                data        TEXT NOT NULL,
+                version     INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_a2a_tasks_peer ON a2a_tasks(peer, updated_at);
             ",
         )?;
 
@@ -480,6 +501,41 @@ mod tests {
                 .unwrap();
             assert!(exists, "table {tbl} missing");
         }
+    }
+
+    #[test]
+    fn a2a_tasks_table_exists_after_migration() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let conn = memory.connection();
+        let conn = conn.blocking_lock();
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
+                ["a2a_tasks"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "table a2a_tasks missing");
+    }
+
+    #[test]
+    fn a2a_tasks_accepts_a_round_trip_row() {
+        // Guards the column set the SqliteTaskStore writes: a NOT NULL column
+        // added later without a default would break the store's INSERT.
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let conn = memory.connection();
+        let conn = conn.blocking_lock();
+        conn.execute(
+            "INSERT INTO a2a_tasks (id, context_id, peer, state, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["t1", "ctx", "laptop", "submitted", "{}"],
+        )
+        .expect("insert must succeed with the columns the store supplies");
+        let version: i64 = conn
+            .query_row("SELECT version FROM a2a_tasks WHERE id='t1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 1, "version must default to 1");
     }
 
     #[test]
