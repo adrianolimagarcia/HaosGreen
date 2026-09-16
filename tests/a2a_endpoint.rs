@@ -71,7 +71,7 @@ async fn jsonrpc_without_token_is_401() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/jsonrpc"))
-        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}))
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage"}))
         .send()
         .await
         .unwrap();
@@ -86,7 +86,7 @@ async fn jsonrpc_with_bad_token_is_401() {
     let resp = client
         .post(format!("{base}/jsonrpc"))
         .bearer_auth("wrong")
-        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}))
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage"}))
         .send()
         .await
         .unwrap();
@@ -101,7 +101,7 @@ async fn jsonrpc_with_valid_token_reaches_the_handler() {
     let resp = client
         .post(format!("{base}/jsonrpc"))
         .bearer_auth("s3cret")
-        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}))
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage"}))
         .send()
         .await
         .unwrap();
