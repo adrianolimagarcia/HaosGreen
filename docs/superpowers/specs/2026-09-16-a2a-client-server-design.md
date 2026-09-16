@@ -39,8 +39,13 @@ Dependency fit verified against this repo's `Cargo.lock`:
 | `reqwest ^0.12` (server) | 0.12.28 |
 | `chrono`, `serde`, `serde_json`, `uuid`, `async-trait`, `futures`, `tracing` | all present |
 
-New transitive dependencies: `tower-http`, `auto_impl`, `semver`, `base64 0.23`
-(repo has 0.22). `a2a-client-lf` 0.2.5 requires `a2a-lf ^0.3.1`, so the
+Genuinely new packages introduced by the SDK: `a2a-lf` 0.3.1 and `base64 0.23.1`
+(RustFox already has 0.22; the two coexist as separate majors and cannot be
+deduplicated because `reqwest`, `rmcp` and `teloxide-core` still require 0.22).
+`ipnet` 2.12.1, `subtle` 2.6.1 and `tower-http` 0.6.11 are **already present
+transitively** and are only promoted to direct dependencies. This was verified
+against the lockfile: the only additions are `a2a-lf` and `base64 0.23.1`, with
+zero existing package versions changed. `a2a-client-lf` 0.2.5 requires `a2a-lf ^0.3.1`, so the
 inconsistent workspace versions are compatible.
 
 Server extension points confirmed on docs.rs for `a2a-server-lf` 0.3.1:

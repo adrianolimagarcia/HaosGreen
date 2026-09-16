@@ -641,6 +641,26 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_ipv6_does_not_match_an_ipv4_allowlist() {
+        // `ipnet`'s `Contains<&IpAddr> for IpNet` only compares same-family
+        // addresses (ipnet-2.12.1/src/ipnet.rs:1418): an `Ipv4Net` never
+        // matches an `IpAddr::V6`, even for a v4-mapped address. This fails
+        // CLOSED, so it is not a bypass — but on a dual-stack listener an
+        // otherwise-allowed peer is refused with a bare 403 and no obvious
+        // cause.
+        //
+        // This test pins the current behaviour deliberately. If dual-stack
+        // support becomes a requirement, the fix is to normalise
+        // `IpAddr::V6` v4-mapped addresses (`::ffff:a.b.c.d`) to `IpAddr::V4`
+        // before matching, and this test must be inverted.
+        let cfg = cfg_with(vec![("laptop", "s3cret", vec!["192.168.1.0/24"])]);
+        assert_eq!(
+            authenticate(&cfg, Some("s3cret"), ip("::ffff:192.168.1.10")),
+            Err(AuthError::IpNotAllowed)
+        );
+    }
+
+    #[test]
     fn identity_carries_resolved_tools() {
         let cfg = cfg_with(vec![("laptop", "t", vec!["10.0.0.1"])]);
         let id = authenticate(&cfg, Some("t"), ip("10.0.0.1")).unwrap();
