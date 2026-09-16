@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
     let sender: Arc<dyn rustfox::platform::sender::PlatformSender> = Arc::new(
         rustfox::platform::telegram::TelegramAdapter::new((*bot).clone()),
     );
+    let a2a_skills = skills.clone();
     let skills_rw = Arc::new(tokio::sync::RwLock::new(skills.clone()));
     let agents_rw = Arc::new(tokio::sync::RwLock::new(agents.clone()));
     let restart_pending = Arc::new(AtomicBool::new(false));
@@ -439,6 +440,20 @@ async fn main() -> Result<()> {
         ),
         Ok(_) => info!("  Supervisor: ready (registry has reasoning + shell backends)"),
         Err(e) => warn!("  Supervisor: failed to enumerate resumable tasks: {e}"),
+    }
+
+    // A2A listener (Phase 1: Agent Card + authentication only).
+    if config.a2a.enabled {
+        let endpoint_url = format!("http://{}", config.a2a.bind);
+        let a2a_state =
+            rustfox::a2a::server::build_state(config.a2a.clone(), a2a_skills, &endpoint_url);
+        if let Err(e) = rustfox::a2a::server::spawn(a2a_state).await {
+            // A misconfigured A2A listener must not prevent the Telegram bot
+            // from starting; log loudly and continue.
+            tracing::error!(error = %e, "A2A listener failed to start");
+        }
+    } else {
+        tracing::debug!("A2A disabled");
     }
 
     // Run the Telegram platform with signal-driven graceful shutdown
