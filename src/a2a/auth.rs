@@ -79,9 +79,15 @@ pub fn authenticate(
         return Err(AuthError::IpNotAllowed);
     }
 
-    // Resolved against a fixed set here; the caller re-resolves against the
-    // live tool registry. An empty `available` still yields the default list,
-    // which is what we want for the identity record.
+    // Resolved here against an EMPTY `available` set; the caller MUST
+    // re-resolve against the live tool registry before using it.
+    //
+    // With `available = &[]` the three cases collapse to: `None` → the default
+    // allowlist (the case we want for the identity record); `Some(list)` →
+    // `list` verbatim; `Some(["*"])` → `[]`, NOT every tool. So this provisional
+    // `allowed_tools` is only correct for the default peer — for a wildcard
+    // peer it under-reports and must be recomputed by the caller. Treat it as a
+    // placeholder, never as the final policy.
     let allowed_tools = crate::a2a::policy::resolve_allowed_tools(matched_name, peer, &[]);
 
     Ok(PeerIdentity {
