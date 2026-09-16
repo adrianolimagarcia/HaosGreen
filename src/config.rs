@@ -152,9 +152,33 @@ impl A2aConfig {
     /// A non-loopback `bind` is only warned about, never rejected: the design
     /// allows raising the bind, it just must be a deliberate act.
     pub fn validate(&self) -> Result<()> {
+        self.validate_public_url()?;
         self.validate_tls()?;
         self.validate_peers()?;
         self.warn_on_non_loopback_bind();
+        Ok(())
+    }
+
+    /// `public_url` is advertised verbatim in the Agent Card, so a value with no
+    /// scheme (e.g. `rustfox.example.com:8443`) would be served as-is and no
+    /// peer could ever reach it — the same silent-discovery breakage I1 fixes
+    /// for the derived URL. Reject it up front rather than ship a dead card.
+    fn validate_public_url(&self) -> Result<()> {
+        if let Some(url) = self
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            let lower = url.to_ascii_lowercase();
+            if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+                bail!(
+                    "[a2a].public_url = {url:?} is not an http(s) URL; the Agent Card advertises \
+                     it verbatim, so peers could not reach this agent. Use e.g. \
+                     \"https://rustfox.example.com:8443\"."
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1924,5 +1948,53 @@ public_url = "https://rustfox.example.com"
             cfg.a2a.public_url.as_deref(),
             Some("https://rustfox.example.com")
         );
+    }
+
+    #[test]
+    fn a2a_validate_accepts_http_and_https_public_urls() {
+        for url in ["http://192.168.1.50:8443", "https://rustfox.example.com"] {
+            let mut cfg = a2a_cfg();
+            cfg.public_url = Some(url.to_string());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{url:?} is a valid public_url: {e}"));
+        }
+    }
+
+    #[test]
+    fn a2a_validate_rejects_a_public_url_without_a_scheme() {
+        // The card advertises `public_url` verbatim. A bare host:port would be
+        // served as-is, so no peer could ever reach this agent -- the same
+        // silent-discovery breakage as advertising `0.0.0.0`.
+        let mut cfg = a2a_cfg();
+        cfg.public_url = Some("rustfox.example.com:8443".to_string());
+        let err = cfg
+            .validate()
+            .expect_err("a schemeless public_url must be refused")
+            .to_string();
+        assert!(
+            err.contains("public_url") && err.contains("rustfox.example.com:8443"),
+            "the error must name the key and quote the value: {err}"
+        );
+    }
+
+    #[test]
+    fn a2a_validate_treats_a_blank_public_url_as_unset() {
+        // Whitespace is not a URL, but it is also not an intent to set one, so
+        // it must fall back to the derived URL rather than fail startup.
+        for blank in ["", "   ", "\t"] {
+            let mut cfg = a2a_cfg();
+            cfg.public_url = Some(blank.to_string());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{blank:?} must be treated as unset: {e}"));
+        }
+    }
+
+    #[test]
+    fn a2a_validate_trims_a_public_url_before_checking_it() {
+        // Surrounding whitespace must not turn a valid URL into a rejection.
+        let mut cfg = a2a_cfg();
+        cfg.public_url = Some("  https://rustfox.example.com  ".to_string());
+        cfg.validate()
+            .expect("a padded but valid URL must be accepted");
     }
 }
