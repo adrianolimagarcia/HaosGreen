@@ -70,14 +70,67 @@ fn prompt_from(ctx: &ExecutorContext) -> String {
         .unwrap_or_default()
 }
 
+/// Bound on concurrently running A2A agent turns.
+///
+/// A semaphore with `max_concurrent_tasks` permits. `execute` takes a permit
+/// with `try_acquire_owned` and, when the limit is held, fails the task
+/// immediately instead of queueing it: with a synchronous `SendMessage` a
+/// queued task would occupy the peer's HTTP connection for the entire queue
+/// wait with no feedback.
+#[derive(Debug, Clone)]
+pub struct TaskGate {
+    permits: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+}
+
+/// The semaphore is exhausted.
+#[derive(Debug)]
+pub struct GateFull {
+    pub message: String,
+}
+
+impl TaskGate {
+    pub fn new(limit: usize) -> Self {
+        // Clamp: `max_concurrent_tasks = 0` must mean "one at a time", never
+        // "refuse everything forever". Config validation rejects 0 anyway;
+        // this is defence in depth for callers that skip it.
+        let limit = limit.max(1);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn try_acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, GateFull> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GateFull {
+                message: format!(
+                    "concurrency limit reached (max_concurrent_tasks = {})",
+                    self.limit
+                ),
+            })
+    }
+}
+
 /// Drives an A2A task through the RustFox agent loop.
 pub struct A2aExecutor {
     agent: Arc<crate::agent::Agent>,
+    gate: TaskGate,
 }
 
 impl A2aExecutor {
     pub fn new(agent: Arc<crate::agent::Agent>) -> Self {
-        Self { agent }
+        let limit = agent.config.a2a.max_concurrent_tasks;
+        Self {
+            agent,
+            gate: TaskGate::new(limit),
+        }
     }
 
     /// Resolve a peer's tool policy against the **live** tool registry.
@@ -122,10 +175,27 @@ impl AgentExecutor for A2aExecutor {
         // `'static`, and `policy_for` borrows `&self`. Resolving here also
         // keeps the policy a snapshot of the registry at request time.
         let allowed = self.policy_for(&peer);
+        let gate = self.gate.clone();
 
         // The executor emits exactly one terminal event, so `once` is enough
         // and needs no extra dependency.
         Box::pin(futures::stream::once(async move {
+            // Acquired BEFORE registering the cancel token: a refused task must
+            // not leave a token in the registry for CancelTask to cancel. The
+            // permit is held for the whole turn, bounding concurrency.
+            let _permit = match gate.try_acquire() {
+                Ok(p) => p,
+                Err(full) => {
+                    tracing::warn!(task_id = %task_id, peer = %peer, limit = gate.limit(),
+                        "A2A task refused: concurrency limit reached");
+                    return Ok(StreamResponse::Task(failed_task(
+                        &task_id,
+                        &context_id,
+                        &full.message,
+                    )));
+                }
+            };
+
             let key = cancel_key(&task_id);
             let cancel = agent.register_cancel_token(&key).await;
 
@@ -205,6 +275,32 @@ impl AgentExecutor for A2aExecutor {
                 metadata: None,
             }))
         }))
+    }
+}
+
+/// A terminal `Failed` task carrying `message`, used for errors that happen
+/// before the agent turn starts (e.g. the concurrency gate refusing a task).
+fn failed_task(task_id: &str, context_id: &str, message: &str) -> Task {
+    Task {
+        id: task_id.to_string(),
+        context_id: context_id.to_string(),
+        status: TaskStatus {
+            state: TaskState::Failed,
+            message: Some(Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                context_id: Some(context_id.to_string()),
+                task_id: Some(task_id.to_string()),
+                role: Role::Agent,
+                parts: vec![Part::text(message)],
+                metadata: None,
+                extensions: None,
+                reference_task_ids: None,
+            }),
+            timestamp: None,
+        },
+        artifacts: None,
+        history: None,
+        metadata: None,
     }
 }
 
@@ -308,5 +404,48 @@ mod tests {
         for t in crate::a2a::DEFAULT_PEER_TOOLS {
             assert!(resolved.iter().any(|r| r == t), "{t} must be granted");
         }
+    }
+
+    #[test]
+    fn gate_acquires_when_under_the_limit() {
+        let gate = TaskGate::new(2);
+        let p1 = gate.try_acquire().expect("first permit");
+        let _p2 = gate.try_acquire().expect("second permit");
+        drop(p1);
+    }
+
+    #[test]
+    fn gate_refuses_when_the_limit_is_held() {
+        let gate = TaskGate::new(1);
+        let _held = gate.try_acquire().expect("first permit must succeed");
+        assert!(
+            gate.try_acquire().is_err(),
+            "a second task must be refused while the only permit is held"
+        );
+    }
+
+    #[test]
+    fn gate_never_creates_a_zero_permit_deadlock() {
+        // `max_concurrent_tasks = 0` must clamp to 1, not create a gate that
+        // refuses every task forever.
+        let gate = TaskGate::new(0);
+        assert_eq!(gate.limit(), 1);
+        let _ = gate
+            .try_acquire()
+            .expect("a zero-configured gate must still admit one task");
+    }
+
+    #[test]
+    fn gate_reports_the_limit_in_the_error() {
+        let gate = TaskGate::new(3);
+        let _a = gate.try_acquire().unwrap();
+        let _b = gate.try_acquire().unwrap();
+        let _c = gate.try_acquire().unwrap();
+        let err = gate.try_acquire().unwrap_err();
+        assert!(
+            err.message.contains("3"),
+            "error must name the limit: {}",
+            err.message
+        );
     }
 }
