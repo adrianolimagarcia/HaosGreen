@@ -8,6 +8,7 @@
 //! compile, because those files do not exist yet.
 
 pub mod auth;
+pub mod card;
 pub mod policy;
 
 pub use auth::{authenticate, AuthError, PeerIdentity};
