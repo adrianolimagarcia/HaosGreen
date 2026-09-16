@@ -7,6 +7,8 @@
 //! `card` in Task 5, `server` in Task 6. Declaring them here now would not
 //! compile, because those files do not exist yet.
 
+pub mod auth;
 pub mod policy;
 
+pub use auth::{authenticate, AuthError, PeerIdentity};
 pub use policy::{resolve_allowed_tools, DEFAULT_PEER_TOOLS};
