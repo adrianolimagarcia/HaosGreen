@@ -86,6 +86,19 @@ pub struct A2aConfig {
     /// Listen address. Defaults to loopback; raising this to a LAN address is
     /// a deliberate act.
     pub bind: String,
+    /// Externally reachable base URL that peers should use to reach this
+    /// agent, e.g. `https://rustfox.example.com:8443`. It is what the Agent
+    /// Card advertises verbatim in `supportedInterfaces[].url`.
+    ///
+    /// Required whenever `bind` names an unspecified address (`0.0.0.0`,
+    /// `::`) or any other host a peer cannot route to: without it the card
+    /// advertises the bind address itself, and a peer connecting to
+    /// `0.0.0.0` reaches *its own* loopback rather than this agent. Startup
+    /// logs a warning in that case.
+    ///
+    /// When unset, the URL is derived from the address the listener actually
+    /// bound (so an ephemeral `bind` port advertises the real port).
+    pub public_url: Option<String>,
     /// Maximum A2A tasks executing concurrently. Excess tasks queue.
     pub max_concurrent_tasks: usize,
     /// Agent Card metadata.
@@ -100,6 +113,7 @@ impl Default for A2aConfig {
         Self {
             enabled: false,
             bind: "127.0.0.1:8443".to_string(),
+            public_url: None,
             max_concurrent_tasks: 4,
             card: A2aCardConfig::default(),
             peers: HashMap::new(),
@@ -1551,5 +1565,31 @@ version = "9.9.9"
         assert_eq!(cfg.a2a.card.name, "Custom");
         assert_eq!(cfg.a2a.card.description, "Custom agent");
         assert_eq!(cfg.a2a.card.version, "9.9.9");
+    }
+
+    #[test]
+    fn a2a_public_url_defaults_to_none() {
+        assert!(minimal_config().a2a.public_url.is_none());
+    }
+
+    #[test]
+    fn a2a_public_url_parses_from_toml() {
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a]
+enabled = true
+public_url = "https://rustfox.example.com"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.a2a.public_url.as_deref(),
+            Some("https://rustfox.example.com")
+        );
     }
 }

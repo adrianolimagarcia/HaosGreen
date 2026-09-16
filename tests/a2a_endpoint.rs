@@ -1,7 +1,7 @@
 //! End-to-end checks for the A2A listener: the card is public, everything
 //! else is refused without a valid peer.
 
-use rustfox::a2a::server::{build_state, router};
+use rustfox::a2a::server::{build_state, router, spawn};
 use rustfox::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
 use rustfox::skills::SkillRegistry;
 use std::collections::HashMap;
@@ -109,4 +109,52 @@ async fn jsonrpc_with_valid_token_reaches_the_handler() {
     // here would mean a client believes a task was accepted when it was not.
     assert_eq!(resp.status(), 501);
     handle.abort();
+}
+
+/// `config()` binds `127.0.0.1:0`. The card must advertise the port the OS
+/// actually assigned — advertising `:0` makes the endpoint unreachable.
+#[tokio::test]
+async fn card_advertises_the_real_port_for_an_ephemeral_bind() {
+    let addr = spawn(config(), SkillRegistry::new())
+        .await
+        .expect("binding an ephemeral loopback port must succeed");
+    assert_ne!(addr.port(), 0, "the OS must have assigned a real port");
+
+    let card: serde_json::Value =
+        reqwest::get(format!("http://{addr}/.well-known/agent-card.json"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let url = card["supportedInterfaces"][0]["url"]
+        .as_str()
+        .expect("the card must carry an interface URL");
+    assert_eq!(
+        url,
+        format!("http://{addr}"),
+        "the advertised URL must match the address that was actually bound"
+    );
+    assert!(!url.ends_with(":0"), "port 0 must never be advertised");
+}
+
+/// `public_url` is what an operator sets when the bind address is not
+/// reachable by peers; it must win over the derived URL verbatim.
+#[tokio::test]
+async fn public_url_overrides_the_advertised_url() {
+    let mut cfg = config();
+    cfg.public_url = Some("https://rustfox.example.com:8443".to_string());
+    let addr = spawn(cfg, SkillRegistry::new()).await.unwrap();
+
+    let card: serde_json::Value =
+        reqwest::get(format!("http://{addr}/.well-known/agent-card.json"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"],
+        "https://rustfox.example.com:8443"
+    );
 }

@@ -444,10 +444,10 @@ async fn main() -> Result<()> {
 
     // A2A listener (Phase 1: Agent Card + authentication only).
     if config.a2a.enabled {
-        let endpoint_url = format!("http://{}", config.a2a.bind);
-        let a2a_state =
-            rustfox::a2a::server::build_state(config.a2a.clone(), a2a_skills, &endpoint_url);
-        if let Err(e) = rustfox::a2a::server::spawn(a2a_state).await {
+        // `spawn` binds, then derives the advertised URL from the address it
+        // actually bound, so the Agent Card never advertises port 0 for an
+        // ephemeral bind.
+        if let Err(e) = rustfox::a2a::server::spawn(config.a2a.clone(), a2a_skills).await {
             // A misconfigured A2A listener must not prevent the Telegram bot
             // from starting; log loudly and continue.
             tracing::error!(error = %e, "A2A listener failed to start");

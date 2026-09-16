@@ -20,6 +20,9 @@ use tracing::{info, warn};
 pub struct A2aState {
     pub config: A2aConfig,
     pub skills: SkillRegistry,
+    /// Base URL advertised in the Agent Card. Resolved once, after the
+    /// listener has bound, so it reflects the address that was actually bound
+    /// (see `resolve_endpoint_url`); it is never mutated afterwards.
     pub endpoint_url: String,
 }
 
@@ -30,6 +33,43 @@ pub fn build_state(config: A2aConfig, skills: SkillRegistry, endpoint_url: &str)
         skills,
         endpoint_url: endpoint_url.to_string(),
     })
+}
+
+/// Resolve the base URL the Agent Card advertises to peers.
+///
+/// `[a2a].public_url` wins when set. Otherwise the URL is derived from `bound`
+/// — the address the listener *actually* bound, not `config.bind` verbatim.
+/// That matters for an ephemeral `bind` (`127.0.0.1:0`), which would otherwise
+/// advertise port 0, and it turns a hostname bind (`localhost:8443`) into the
+/// concrete address it resolved to.
+///
+/// An unspecified bind (`0.0.0.0`, `::`) is advertised as-is but warned about:
+/// the card is served either way, and a remote peer connecting to `0.0.0.0`
+/// would reach its own loopback rather than this agent. Substituting a
+/// guessed hostname would be worse than saying so. Loopback binds are not
+/// warned about — a peer running on this same host is a supported setup, and
+/// warning on the default configuration would be noise.
+pub fn resolve_endpoint_url(config: &A2aConfig, bound: SocketAddr) -> String {
+    if let Some(url) = config
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return url.to_string();
+    }
+
+    let derived = format!("http://{bound}");
+    if bound.ip().is_unspecified() {
+        warn!(
+            bind = %bound,
+            advertised = %derived,
+            "A2A: the advertised endpoint URL is not reachable by a remote peer, because \
+             [a2a].bind is an unspecified address — a peer connecting to it reaches its own \
+             loopback. Set [a2a].public_url to this host's externally reachable base URL."
+        );
+    }
+    derived
 }
 
 /// Build the A2A router.
@@ -125,14 +165,19 @@ fn parse_bearer(header: Option<&str>) -> Option<&str> {
     Some(token)
 }
 
-/// Start the A2A listener. Returns once the listener is bound; the serving
-/// task runs in the background.
+/// Start the A2A listener and return the address it bound.
 ///
 /// The bind address is resolved before spawning so a configuration error
 /// surfaces at startup rather than silently inside a detached task.
-pub async fn spawn(state: Arc<A2aState>) -> Result<()> {
-    let addr = state.config.bind.clone();
-    let app = router(Arc::clone(&state));
+///
+/// The advertised URL is resolved *after* the bind and the state is built from
+/// it, so `A2aState.endpoint_url` always names the real port — an ephemeral
+/// `bind` of `127.0.0.1:0` advertises the port the OS assigned, never port 0.
+/// Building the state here rather than taking it from the caller is what lets
+/// `endpoint_url` stay an immutable `String`: nothing needs to mutate it, so
+/// no `OnceLock`/`RwLock` is required.
+pub async fn spawn(config: A2aConfig, skills: SkillRegistry) -> Result<SocketAddr> {
+    let addr = config.bind.clone();
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -142,7 +187,10 @@ pub async fn spawn(state: Arc<A2aState>) -> Result<()> {
         .local_addr()
         .context("A2A: could not read the bound address")?;
 
-    info!(address = %local, "A2A listener started");
+    let endpoint_url = resolve_endpoint_url(&config, local);
+    info!(address = %local, advertised = %endpoint_url, "A2A listener started");
+
+    let app = router(build_state(config, skills, &endpoint_url));
 
     tokio::spawn(async move {
         // `into_make_service_with_connect_info` is required for the
@@ -157,7 +205,7 @@ pub async fn spawn(state: Arc<A2aState>) -> Result<()> {
         }
     });
 
-    Ok(())
+    Ok(local)
 }
 
 #[cfg(test)]
@@ -221,5 +269,93 @@ mod tests {
     fn router_builds_without_panicking() {
         let state = build_state(test_config(), SkillRegistry::new(), "http://localhost:8443");
         let _router = router(state);
+    }
+
+    // ---------------------------------------------------------------------
+    // Advertised endpoint URL
+    // ---------------------------------------------------------------------
+
+    fn bound(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn advertised_url_uses_the_actual_bound_port_not_port_zero() {
+        // `test_config()` binds "127.0.0.1:0". The OS picks the real port;
+        // advertising the literal `bind` would put `:0` in the Agent Card and
+        // no peer could ever reach it.
+        let cfg = test_config();
+        assert!(
+            cfg.bind.ends_with(":0"),
+            "precondition: bind asks for port 0"
+        );
+        let url = resolve_endpoint_url(&cfg, bound("127.0.0.1:54321"));
+        assert_eq!(url, "http://127.0.0.1:54321");
+        assert!(!url.ends_with(":0"), "port 0 must never be advertised");
+    }
+
+    #[test]
+    fn advertised_url_keeps_the_bound_host() {
+        let mut cfg = test_config();
+        cfg.bind = "192.168.1.5:8443".to_string();
+        assert_eq!(
+            resolve_endpoint_url(&cfg, bound("192.168.1.5:8443")),
+            "http://192.168.1.5:8443"
+        );
+    }
+
+    #[test]
+    fn advertised_url_brackets_an_ipv6_address() {
+        let mut cfg = test_config();
+        cfg.bind = "[::1]:8443".to_string();
+        assert_eq!(
+            resolve_endpoint_url(&cfg, bound("[::1]:8443")),
+            "http://[::1]:8443"
+        );
+    }
+
+    #[test]
+    fn public_url_overrides_the_derived_url() {
+        let mut cfg = test_config();
+        cfg.public_url = Some("https://rustfox.example.com:8443".to_string());
+        assert_eq!(
+            resolve_endpoint_url(&cfg, bound("0.0.0.0:54321")),
+            "https://rustfox.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn public_url_is_trimmed() {
+        let mut cfg = test_config();
+        cfg.public_url = Some("  https://rustfox.example.com  ".to_string());
+        assert_eq!(
+            resolve_endpoint_url(&cfg, bound("127.0.0.1:54321")),
+            "https://rustfox.example.com"
+        );
+    }
+
+    #[test]
+    fn blank_public_url_falls_back_to_the_derived_url() {
+        // `public_url = ""` is a common way to disable a key; it must not
+        // produce an empty `url` in the card.
+        let mut cfg = test_config();
+        cfg.public_url = Some("   ".to_string());
+        assert_eq!(
+            resolve_endpoint_url(&cfg, bound("127.0.0.1:54321")),
+            "http://127.0.0.1:54321"
+        );
+    }
+
+    #[test]
+    fn unspecified_bind_is_advertised_verbatim_and_warned_about() {
+        // No hostname is invented: the operator gets the warning and sets
+        // `public_url`. This test pins the value; the warning is asserted by
+        // reading the source of `resolve_endpoint_url`, since capturing
+        // `tracing` output needs a subscriber the test suite does not install.
+        let mut cfg = test_config();
+        cfg.bind = "0.0.0.0:8443".to_string();
+        let url = resolve_endpoint_url(&cfg, bound("0.0.0.0:8443"));
+        assert_eq!(url, "http://0.0.0.0:8443");
+        assert!(bound("0.0.0.0:8443").ip().is_unspecified());
     }
 }
