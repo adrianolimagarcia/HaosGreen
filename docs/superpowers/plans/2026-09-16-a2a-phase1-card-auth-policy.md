@@ -263,7 +263,7 @@ In the `Config` struct, after the `subagents` field:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test --lib a2a_ 2>&1 | tail -20`
-Expected: PASS, 4 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn default_excludes_execute_command() {
-        let resolved = resolve_allowed_tools(&peer(None), &all_tool_names());
+        let resolved = resolve_allowed_tools("p", &peer(None), &all_tool_names());
         assert!(
             !resolved.contains(&"execute_command".to_string()),
             "a peer with no explicit tools list must never receive shell access"
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn default_excludes_every_privileged_tool() {
-        let resolved = resolve_allowed_tools(&peer(None), &all_tool_names());
+        let resolved = resolve_allowed_tools("p", &peer(None), &all_tool_names());
         for forbidden in [
             "execute_command",
             "write_file",
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn default_contains_read_only_tools() {
-        let resolved = resolve_allowed_tools(&peer(None), &all_tool_names());
+        let resolved = resolve_allowed_tools("p", &peer(None), &all_tool_names());
         for expected in ["read_file", "list_files", "search_memory", "recall"] {
             assert!(
                 resolved.contains(&expected.to_string()),
@@ -381,22 +381,92 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_expands_to_every_available_tool() {
+    fn wildcard_alone_expands_to_every_available_tool() {
         let available = all_tool_names();
-        let resolved = resolve_allowed_tools(&peer(Some(vec!["*"])), &available);
+        let resolved = resolve_allowed_tools("p", &peer(Some(vec!["*"])), &available);
         assert_eq!(resolved.len(), available.len());
         assert!(resolved.contains(&"execute_command".to_string()));
     }
 
     #[test]
+    fn mixed_wildcard_is_not_a_grant_of_every_tool() {
+        // Before the wildcard arm required a sole element, this list granted
+        // every tool including shell. An operator writing this expects to
+        // narrow, so it must not widen.
+        let resolved = resolve_allowed_tools("p", &peer(Some(vec!["read_file", "*"])), &all_tool_names());
+        assert!(
+            !resolved.contains(&"execute_command".to_string()),
+            "a mixed wildcard must not grant shell"
+        );
+    }
+
+    #[test]
+    fn default_peer_tools_all_exist_in_the_real_handlers() {
+        // The regression guard for renames. DEFAULT_PEER_TOOLS is a
+        // hand-maintained list in a different module from the tool
+        // definitions, so a rename in `builtin_tools.rs` would silently make
+        // an entry inert — no compile error, no test failure, the peer just
+        // loses access. This test links the two.
+        use crate::builtin_tools::BuiltinTools;
+        use crate::memory::MemoryStore;
+        use crate::memory_tools::MemoryTools;
+        use crate::skill_tools::SkillTools;
+        use crate::skills::SkillRegistry;
+        use crate::tool_registry::ToolHandler;
+        use std::path::PathBuf;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let skills: Arc<RwLock<SkillRegistry>> = Arc::new(RwLock::new(SkillRegistry::new()));
+        let agents: Arc<RwLock<SkillRegistry>> = Arc::new(RwLock::new(SkillRegistry::new()));
+
+        let builtin = BuiltinTools::new(
+            PathBuf::from("/tmp/rustfox-test/skills"),
+            Arc::clone(&skills),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let skill_tools = SkillTools::new(
+            PathBuf::from("/tmp/rustfox-test/skills"),
+            PathBuf::from("/tmp/rustfox-test/agents"),
+            Arc::clone(&skills),
+            agents,
+        );
+        let memory_tools = MemoryTools::new(
+            MemoryStore::open_in_memory().expect("in-memory memory store should open"),
+        );
+
+        let handlers: [&dyn ToolHandler; 3] = [&builtin, &skill_tools, &memory_tools];
+        let mut real_names: Vec<String> = Vec::new();
+        for handler in handlers {
+            real_names.extend(handler.define().into_iter().map(|d| d.function.name));
+        }
+
+        assert!(
+            !real_names.is_empty(),
+            "collected no tool definitions — the test is not exercising real handlers"
+        );
+
+        for expected in DEFAULT_PEER_TOOLS {
+            assert!(
+                real_names.iter().any(|n| n == expected),
+                "DEFAULT_PEER_TOOLS entry `{expected}` is not a tool any real handler defines; \
+                 it was probably renamed or removed, which would silently strip the peer's \
+                 access to it. Real tool names: {real_names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_list_is_used_verbatim() {
-        let resolved = resolve_allowed_tools(&peer(Some(vec!["read_file", "recall"])), &all_tool_names());
+        let resolved = resolve_allowed_tools("p", &peer(Some(vec!["read_file", "recall"])), &all_tool_names());
         assert_eq!(resolved, vec!["read_file".to_string(), "recall".to_string()]);
     }
 
     #[test]
     fn explicit_empty_list_grants_nothing() {
-        let resolved = resolve_allowed_tools(&peer(Some(vec![])), &all_tool_names());
+        let resolved = resolve_allowed_tools("p", &peer(Some(vec![])), &all_tool_names());
         assert!(
             resolved.is_empty(),
             "Some(vec![]) is an explicit denial, distinct from None"
@@ -410,7 +480,7 @@ mod tests {
         // must not leak the new tool into the default policy.
         let mut available = all_tool_names();
         available.push("some_future_dangerous_tool".to_string());
-        let resolved = resolve_allowed_tools(&peer(None), &available);
+        let resolved = resolve_allowed_tools("p", &peer(None), &available);
         assert!(!resolved.contains(&"some_future_dangerous_tool".to_string()));
     }
 
@@ -472,18 +542,47 @@ use crate::config::A2aPeerConfig;
 /// grant every new tool to every peer, which is the failure mode this list
 /// exists to prevent.
 ///
-/// Every entry is read-only or memory-scoped. Nothing here writes to disk,
-/// executes a process, or mutates the agent's own configuration.
+/// # What these entries can actually reach
+///
+/// None of them executes a process or mutates the agent's own configuration,
+/// but "read-only" is not the same as "confined":
+///
+/// - `read_file` and `list_files` are confined to the sandbox: both route the
+///   requested path through `validate_sandbox_path`, which canonicalises the
+///   sandbox root and rejects anything that escapes it.
+/// - `read_skill_file` and `read_agent_file` read the configured skills and
+///   agents directories.
+/// - `search_memory` searches the **entire** conversation database — every
+///   user, every chat — not a peer-scoped subset.
+/// - `recall` reads the global `knowledge` table with no per-peer scoping.
+/// - `remember` **writes** to the `knowledge` table in `rustfox.db`. This is
+///   the one mutating entry here; it is granted because it is memory-scoped
+///   and cannot reach the filesystem, but it is a write.
+///
+/// # Deliberate exclusions
+///
+/// `read_soul_file` and `plan_view` are excluded because both can read outside
+/// the sandbox:
+///
+/// - `read_soul_file(file_name)` validates nothing at runtime — its JSON-schema
+///   `enum` is only a hint to the LLM. `file_name = "config.toml"` returns the
+///   RustFox home's `config.toml`, which holds the OpenRouter API key and every
+///   A2A peer bearer token. A path-traversal `file_name` escapes the home
+///   directory entirely.
+/// - `plan_view(title)` joins an unvalidated, attacker-controlled `title` onto
+///   the `.plans` directory; an absolute `title` replaces the whole prefix.
+///
+/// A peer that authenticates over A2A can drive an agent holding
+/// `execute_command`, so this default must never widen the blast radius beyond
+/// the sandbox and the shared memory store.
 pub const DEFAULT_PEER_TOOLS: &[&str] = &[
     "read_file",
     "list_files",
-    "read_soul_file",
     "read_skill_file",
     "read_agent_file",
     "search_memory",
     "recall",
     "remember",
-    "plan_view",
 ];
 
 /// The wildcard entry meaning "every tool available".
@@ -492,24 +591,84 @@ const WILDCARD: &str = "*";
 /// Resolve the tool names a peer may invoke.
 ///
 /// - `None` → [`DEFAULT_PEER_TOOLS`]
-/// - `Some(["*"])` → every name in `available`
+/// - `Some(["*"])` → every name in `available`, with a warning naming the peer
 /// - `Some(list)` → `list` verbatim, including `Some([])` meaning no tools
 ///
-/// `available` is the full set of tool names the runtime exposes; it is only
-/// consulted for the wildcard case.
-pub fn resolve_allowed_tools(peer: &A2aPeerConfig, available: &[String]) -> Vec<String> {
+/// `available` is the full set of tool names the runtime exposes. It is
+/// consulted for the wildcard case and for reporting requested-but-unknown
+/// names; an explicit list is returned as written, so a name that no handler
+/// defines simply resolves to a tool the peer can never call.
+///
+/// # The wildcard must be the sole entry
+///
+/// `"*"` is honoured only when it is the *only* element of the list. A list
+/// that mixes `"*"` with other names — `["read_file", "*"]` — is a
+/// configuration error and is treated as an explicit list: the wildcard is
+/// ignored and the peer receives only the literal names given. A warning is
+/// emitted naming the peer.
+///
+/// Rationale: the wildcard branch is the most dangerous one, because it grants
+/// `execute_command`. Ambiguity there must resolve toward refusing rather than
+/// toward granting shell. Silently letting the wildcard win would also mean an
+/// explicit narrowing such as `["read_file", "*"]` reads as a restriction while
+/// actually being a full grant.
+///
+/// `peer_name` is used for logging only; it never affects the result.
+pub fn resolve_allowed_tools(
+    peer_name: &str,
+    peer: &A2aPeerConfig,
+    available: &[String],
+) -> Vec<String> {
     match &peer.tools {
         None => DEFAULT_PEER_TOOLS.iter().map(|s| s.to_string()).collect(),
-        Some(list) if list.iter().any(|t| t == WILDCARD) => available.to_vec(),
-        Some(list) => list.clone(),
+        Some(list) if list.len() == 1 && list[0].as_str() == WILDCARD => {
+            warn!(
+                peer = %peer_name,
+                tool_count = available.len(),
+                "A2A peer declared the \"*\" wildcard as its sole tool entry: granting every \
+                 available tool, including shell execution via execute_command"
+            );
+            available.to_vec()
+        }
+        Some(list) => {
+            if list.iter().any(|t| t.as_str() == WILDCARD) {
+                warn!(
+                    peer = %peer_name,
+                    "\"*\" was listed together with other entries; ignoring the wildcard and \
+                     treating the entry as an explicit list, because a mixed wildcard is a \
+                     configuration error and must not grant every tool"
+                );
+            }
+            for requested in list {
+                if !available.iter().any(|a| a == requested) {
+                    warn!(
+                        peer = %peer_name,
+                        tool = %requested,
+                        "A2A peer requested a tool that is not available in this runtime; it \
+                         will be ignored"
+                    );
+                }
+            }
+            list.clone()
+        }
     }
 }
 ```
 
+This block requires `use tracing::warn;` alongside `use crate::config::A2aPeerConfig;` at the
+top of the file.
+
+> **Amended during review.** This step originally shipped a 9-entry list including
+> `read_soul_file` and `plan_view`, a 2-argument signature, and a wildcard arm
+> matching on `any()`. A code-quality review proved that `read_soul_file` returns
+> `~/.rustfox/config.toml` (API keys plus every peer token) and that
+> `["read_file", "*"]` silently granted shell. The block above is the corrected,
+> committed form.
+
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --lib a2a::policy 2>&1 | tail -20`
-Expected: PASS, 7 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 7: Commit**
 
@@ -800,7 +959,7 @@ pub fn authenticate(
     // Resolved against a fixed set here; the caller re-resolves against the
     // live tool registry. An empty `available` still yields the default list,
     // which is what we want for the identity record.
-    let allowed_tools = crate::a2a::policy::resolve_allowed_tools(peer, &[]);
+    let allowed_tools = crate::a2a::policy::resolve_allowed_tools(matched_name, peer, &[]);
 
     Ok(PeerIdentity {
         name: matched_name.to_string(),
@@ -1589,7 +1748,7 @@ One adaptation note remains, in Task 7 Step 1: the name of the in-scope `SkillRe
 
 **Type consistency.** Verified across tasks:
 
-- `resolve_allowed_tools(&A2aPeerConfig, &[String]) -> Vec<String>` — defined Task 3, called Task 4 Step 3.
+- `resolve_allowed_tools(&str, &A2aPeerConfig, &[String]) -> Vec<String>` — defined Task 3, called Task 4 Step 3.
 - `DEFAULT_PEER_TOOLS: &[&str]` — defined Task 3, re-exported in `mod.rs`.
 - `authenticate(&A2aConfig, Option<&str>, IpAddr) -> Result<PeerIdentity, AuthError>` — defined Task 4, called Task 6 Step 3.
 - `AuthError` variants `MissingToken` / `InvalidToken` / `IpNotAllowed` — defined Task 4, matched exhaustively in Task 6 Step 3.
