@@ -26,7 +26,12 @@ pub fn build_agent_card(
     schemes.insert(
         "bearer".to_string(),
         SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
-            scheme: "bearer".to_string(),
+            // "Bearer" is the IANA-registered spelling (RFC 6750) and the form
+            // the A2A spec's own sample card uses. Comparison is
+            // case-insensitive per RFC 9110, so "bearer" would also work, but
+            // a strict client doing an exact match against the registry string
+            // would reject it -- so use the canonical spelling.
+            scheme: "Bearer".to_string(),
             description: Some("Static per-peer bearer token".to_string()),
             bearer_format: None,
         }),
@@ -247,7 +252,13 @@ mod tests {
             "A2A v1.0 maps the `http_auth_security_scheme` oneof member to a \
              wrapper key; a2a-lf 0.3.1 implements exactly that"
         );
-        assert_eq!(scheme["httpAuthSecurityScheme"]["scheme"], "bearer");
+        // "Bearer" is the IANA-registered spelling (RFC 6750) and matches the
+        // A2A spec's sample card. Comparison is case-insensitive per RFC 9110,
+        // but the canonical spelling is what a strict client would match.
+        assert_eq!(
+            scheme["httpAuthSecurityScheme"]["scheme"], "Bearer",
+            "use the IANA-registered scheme spelling, not a lowercased variant"
+        );
         assert!(
             scheme.get("type").is_none(),
             "the v1.0 form has no `type` discriminator; if this assertion \
