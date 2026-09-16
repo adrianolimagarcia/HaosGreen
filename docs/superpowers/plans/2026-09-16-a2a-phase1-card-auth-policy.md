@@ -14,14 +14,19 @@
 
 ## Scope
 
-This plan implements **Phase 1 only** of the spec. Phases 2–5 (`TaskStore`, `AgentExecutor`, `tasks/*`, SSE streaming, A2A client) get their own plans.
+This plan records the original Phase 1 implementation. The subsequent Phase 2–3
+plans have since added `TaskStore`, `AgentExecutor`, `SendMessage`, `GetTask`,
+`CancelTask`, and the concurrency gate. Remaining work is Phase 4 SSE streaming
+and Phase 5 A2A client support.
 
 Deliverable: success criteria 1 and 3 from the spec —
 
 1. A remote A2A client can fetch `/.well-known/agent-card.json` and see RustFox's skills.
 3. An unauthenticated or non-allowlisted peer receives 401/403 and no agent work is performed.
 
-Criterion 3 is only half-testable here: no agent work *can* be performed because the executor does not exist yet. Task 7 asserts the 401/403 half.
+Criterion 3 was only half-testable during this phase: agent work was not yet
+available through A2A. Task 7 asserted the 401/403 half; later phases now cover
+execution and lifecycle behavior.
 
 ## File Structure
 

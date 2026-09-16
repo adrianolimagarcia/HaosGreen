@@ -88,12 +88,16 @@ src/
 │   ├── sender.rs       # PlatformSender trait
 │   ├── telegram.rs     # teloxide bot: dispatch, handle_message, all bot commands
 │   └── tool_notifier.rs# Friendly per-tool progress messages
-├── a2a/                # Agent2Agent protocol (Phase 1: card + auth + policy)
+├── a2a/                # Agent2Agent protocol (server phases 1–3: card, auth,
+│                       #   policy, executor, task store, GetTask/CancelTask,
+│                       #   and concurrency gate; streaming/client remain)
 │   ├── mod.rs
 │   ├── card.rs         # Agent Card generation (/.well-known/agent-card.json)
 │   ├── auth.rs         # Bearer + IP authentication -> PeerIdentity
 │   ├── policy.rs       # Per-peer tool allowlist (DEFAULT_PEER_TOOLS)
-│   └── server.rs       # axum listener: card route + JSON-RPC endpoint
+│   ├── executor.rs     # AgentExecutor and TaskGate concurrency control
+│   ├── task_store.rs   # SQLite-backed A2A task persistence
+│   └── server.rs       # axum listener: card + authenticated JSON-RPC routes
 ├── supervisor/         # Autonomous task runner (see below)
 └── utils/
 ```
@@ -293,16 +297,13 @@ dispatch through a `special_tool_handler` closure instead.
 
 ## A2A (Agent2Agent) protocol
 
-Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs`
-starts an axum listener alongside the Telegram bot. Phase 1 implements the Agent
-Card, authentication and the per-peer tool policy; there is **no task executor
-yet**, so `/jsonrpc` authenticates and then returns **501**.
+Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs` starts an axum listener alongside the Telegram bot. The server currently provides the Agent Card, authentication, per-peer tool policy, a real `AgentExecutor`/task store, `SendMessage`, `GetTask`, `CancelTask`, and a `TaskGate` concurrency semaphore. The SDK also supports `returnImmediately`; Phase 4 SSE streaming and Phase 5 outbound client support remain outstanding.
 
 - `GET /.well-known/agent-card.json` — **public**, no auth. Lists skills by
   name/description/tags only; instruction bodies are never included.
 - `POST /jsonrpc` — requires a per-peer bearer token **and** a source IP matching
   the same peer. 401 (bad/absent token), 403 (IP not allowed), 500 (duplicate
-  tokens), 501 (Phase 1 stub).
+  tokens), and JSON-RPC task-method responses for authenticated requests.
 
 Config lives in `[a2a]`, `[a2a.card]` and `[a2a.peers.<name>]`; see
 `config.example.toml`. `A2aConfig::validate()` runs at startup and refuses to
@@ -312,7 +313,9 @@ than silently served as plaintext). A listener failure never prevents the
 Telegram bot from starting.
 
 Design spec: `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md`.
-Phase 1 plan: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-policy.md`.
+Implementation plans: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-policy.md`,
+`docs/superpowers/plans/2026-09-16-a2a-phase2-task-store-executor.md`, and
+`docs/superpowers/plans/2026-09-16-a2a-phase3-concurrency-get-cancel.md`.
 
 > **Security invariants — do not weaken without a written reason:**
 > - `DEFAULT_PEER_TOOLS` (`src/a2a/policy.rs`) is an **allowlist**. A tool added

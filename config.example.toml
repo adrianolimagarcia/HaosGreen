@@ -269,7 +269,8 @@ Be concise and helpful."""
 #                                             # binding 0.0.0.0 or sitting behind a proxy.
 #                                             # Omit to derive it from the bound address.
 #                                             # Must include http:// or https://.
-# max_concurrent_tasks = 4                    # Reserved; enforced from Phase 3.
+# max_concurrent_tasks = 4                    # Maximum concurrent agent turns.
+#                                             # Excess SendMessage requests fail fast.
 #
 # # TLS is NOT implemented yet. Leave this alone or set "none": any other value
 # # is REJECTED at startup rather than silently served as plaintext. If you need

@@ -1,7 +1,17 @@
 # A2A (Agent2Agent) Client + Server Design
 
 Date: 2026-09-16
-Status: Draft — awaiting review
+Status: Server phases 1–3 implemented; Phase 4 streaming and Phase 5 client remain
+
+## Current implementation status
+
+The server-side phases are implemented and covered by unit and live E2E tests:
+`AgentExecutor` drives the RustFox agent loop under the authenticated peer tool
+policy; `SendMessage`, `GetTask`, and `CancelTask` use the SDK router and SQLite
+task store; and `TaskGate` bounds concurrent tasks. The SDK supports
+`returnImmediately`, with `GetTask` available for polling. Remaining work is
+Phase 4 SSE streaming (`SendStreamingMessage`) and Phase 5 outbound client
+support (`client.rs` and the `call_a2a_agent` tool).
 
 ## Goal
 
@@ -355,9 +365,10 @@ completed task with a question instead.
 
 ## Implementation Phases
 
-The full scope is large. Each phase is independently useful and independently
-verifiable; later phases must not be started before the security controls they
-depend on are in place.
+The phase table below records the original delivery plan; the current status is
+summarized above. Each phase was designed to be independently useful and
+verifiable; later phases were not started before the security controls they
+depend on were in place.
 
 | Phase | Content | Depends on | Verifiable by |
 |---|---|---|---|
@@ -367,9 +378,9 @@ depend on are in place.
 | 4 | `SendStreamingMessage` SSE | 3 | streaming interop test |
 | 5 | `client.rs` + `call_a2a_agent` tool | 2 | success criterion 6 |
 
-Phase 1 is deliberately first: it establishes authentication before any path
-exists that can execute an agent turn. Phases 2–5 must not be reordered ahead
-of it.
+Phase 1 established authentication before the executor was introduced. The
+server-side implementation now covers Phases 1–3; Phases 4–5 remain future work
+as noted above.
 
 ## Risks
 
