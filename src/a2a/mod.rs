@@ -3,9 +3,12 @@
 //! Phase 1 covers the Agent Card, authentication and the per-peer tool policy.
 //! See `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md`.
 //!
-//! Each module is declared by the task that creates it: `auth` in Task 4,
-//! `card` in Task 5, `server` in Task 6. Declaring them here now would not
-//! compile, because those files do not exist yet.
+//! - [`card`] builds the public Agent Card served at
+//!   `/.well-known/agent-card.json`.
+//! - [`auth`] authenticates a peer from its bearer token and source address.
+//! - [`policy`] resolves a peer's tool allowlist.
+//! - [`server`] wires those into the axum listener that `main` starts when
+//!   `[a2a].enabled` is set.
 
 pub mod auth;
 pub mod card;

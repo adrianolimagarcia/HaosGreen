@@ -14,6 +14,7 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 /// Shared state for the A2A listener.
@@ -77,12 +78,16 @@ pub fn resolve_endpoint_url(config: &A2aConfig, bound: SocketAddr) -> String {
 /// `/.well-known/agent-card.json` is public by design — A2A clients fetch the
 /// card before authenticating. Every other route requires a valid peer.
 ///
-/// A 2 MB body limit is applied to guard against unbounded payloads.
+/// A 2 MB body limit is applied to guard against unbounded payloads. No
+/// handler reads a request body in Phase 1, so the limit is currently inert:
+/// it binds as soon as a body extractor is added to a handler.
 pub fn router(state: Arc<A2aState>) -> Router {
     Router::new()
         .route("/.well-known/agent-card.json", get(agent_card_handler))
         .route("/jsonrpc", post(jsonrpc_handler))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        // Outermost, so requests rejected by the body limit are traced too.
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -107,10 +112,22 @@ async fn jsonrpc_handler(
 
     match authenticate(&state.config, bearer, addr.ip()) {
         Ok(identity) => {
+            // Log the raw configured policy, not `identity.allowed_tools.len()`.
+            // `authenticate` resolves that list against an EMPTY available-tool
+            // set, so a `["*"]` peer — the most privileged configuration there
+            // is — reports length 0. Logging that number would understate the
+            // peer at the exact moment of the security decision. `None` here
+            // means the conservative default allowlist, not "no tools".
+            let configured_tools = state
+                .config
+                .peers
+                .get(&identity.name)
+                .and_then(|peer| peer.tools.as_deref());
             info!(
                 peer = %identity.name,
-                tools = identity.allowed_tools.len(),
-                "A2A peer authenticated; no executor implemented yet (Phase 2)"
+                configured_tools = ?configured_tools,
+                "A2A peer authenticated; no executor implemented yet (Phase 2). \
+                 Tool policy is provisional: resolve it against the live registry before use"
             );
             (
                 StatusCode::NOT_IMPLEMENTED,
