@@ -23,34 +23,73 @@ Research performed against primary sources before this design:
 - Protocol: [a2aproject/A2A](https://github.com/a2aproject/A2A) — Apache-2.0,
   Linux Foundation. JSON-RPC 2.0 over HTTP, plus REST, gRPC and SLIMRPC
   bindings. Discovery via Agent Card at `/.well-known/agent-card.json`.
-  Streaming uses SSE. Methods include `message/send`, `message/stream`,
-  `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/resubscribe`, and the
-  `tasks/pushNotificationConfig/*` family.
+  Streaming uses SSE.
+
+  **Method names are v1.0 PascalCase, not v0.3.0 slash-paths.** v1.0 renamed
+  every operation ([What's New in v1.0](https://a2a-protocol.org/latest/whats-new-v1/)):
+
+  | v0.3.0 (obsolete) | v1.0 (use these) |
+  |---|---|
+  | `message/send` | `SendMessage` |
+  | `message/stream` | `SendStreamingMessage` |
+  | `tasks/get` | `GetTask` |
+  | `tasks/list` | `ListTasks` |
+  | `tasks/cancel` | `CancelTask` |
+  | `tasks/resubscribe` | `SubscribeToTask` |
+  | `tasks/pushNotificationConfig/*` | `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig` |
+  | `agent/getAuthenticatedExtendedCard` | `GetExtendedAgentCard` |
+
+  The SDK implements the v1.0 names only (`a2a-lf/src/jsonrpc.rs`, `methods`
+  module) and rejects `message/send` with `-32601`. Since the Agent Card
+  advertises `protocolVersion: "1.0"`, v1.0 naming is the consistent choice.
+  A v0.3.0-only client will not interoperate; that is accepted.
 - Official Rust SDK: [a2aproject/a2a-rs](https://github.com/a2aproject/a2a-rs),
   published as `a2a-lf` 0.3.1, `a2a-server-lf` 0.3.1, `a2a-client-lf` 0.2.5,
-  `a2a-pb` 0.2.1. Requires Rust 1.85+ (toolchain here is 1.98.1).
+  `a2a-pb` **0.1.8**. Requires Rust 1.85+ (toolchain here is 1.98.1).
+  `a2a-pb` carries a `build.rs` that generates protobuf + pbjson code, using
+  `protoc_bin_vendored` when `PROTOC` is unset, so **no system protoc is
+  needed**.
 
 Dependency fit verified against this repo's `Cargo.lock`:
 
 | SDK requires | RustFox already has |
 |---|---|
 | `axum ^0.8` | 0.8.9 |
-| `reqwest ^0.13` (client) | 0.13.4 (already in lock) |
-| `reqwest ^0.12` (server) | 0.12.28 |
+| `reqwest ^0.12` | 0.12.28 |
 | `chrono`, `serde`, `serde_json`, `uuid`, `async-trait`, `futures`, `tracing` | all present |
 
-Genuinely new packages introduced by the SDK: `a2a-lf` 0.3.1 and `base64 0.23.1`
-(RustFox already has 0.22; the two coexist as separate majors and cannot be
-deduplicated because `reqwest`, `rmcp` and `teloxide-core` still require 0.22).
-`ipnet` 2.12.1, `subtle` 2.6.1 and `tower-http` 0.6.11 are **already present
-transitively** and are only promoted to direct dependencies. This was verified
-against the lockfile: the only additions are `a2a-lf` and `base64 0.23.1`, with
-zero existing package versions changed. `a2a-client-lf` 0.2.5 requires `a2a-lf ^0.3.1`, so the
-inconsistent workspace versions are compatible.
+Phase 1 added `a2a-lf` 0.3.1 and `base64 0.23.1` (RustFox already has 0.22;
+the two coexist as separate majors and cannot be deduplicated because `reqwest`,
+`rmcp` and `teloxide-core` still require 0.22). `ipnet` 2.12.1, `subtle` 2.6.1
+and `tower-http` 0.6.11 were **already present transitively** and were only
+promoted to direct dependencies.
 
-Server extension points confirmed on docs.rs for `a2a-server-lf` 0.3.1:
-`AgentExecutor`, `TaskStore`, `AgentCardProducer`, `CallInterceptor`,
-`DefaultRequestHandler`, plus `sse`, `jsonrpc` and `rest` modules.
+> **Phase 2 adds a large transitive tree.** `a2a-server-lf` 0.3.1 pulls in
+> `a2a-pb` 0.1.8 → `tonic`, `prost`, `pbjson` and ~224 packages total (measured
+> with `cargo metadata` in a scratch crate). RustFox had ~180. The build also
+> gains a protobuf codegen step. This is the cost of using the SDK rather than
+> hand-rolling the JSON-RPC server, and it was accepted deliberately.
+
+Server extension points confirmed **by reading the crate source** for
+`a2a-server-lf` 0.3.1: `AgentExecutor`, `ExecutorContext`, `TaskStore` +
+`InMemoryTaskStore`, `AgentCardProducer` + `StaticAgentCard`,
+`DefaultRequestHandler`, `RequestHandler`, and the `jsonrpc`, `rest`, `sse`
+modules.
+
+> **`CallInterceptor` is NOT a usable extension point.** `InterceptedHandler`
+> does not implement `RequestHandler`, and `CallInterceptor::before`/`after` are
+> invoked only from the crate's own tests — no transport ever consults them.
+> An earlier revision of this document listed it as the auth mechanism; that was
+> wrong. Phase 1's plain-function `authenticate` plus our own axum route is the
+> correct foundation, and Phase 2 extends it with
+> `axum::middleware::from_fn_with_state` + `route_layer`.
+
+> **The executor's only identity channel is `ctx.service_params`.** The SDK sets
+> `ctx.user` to `None` unconditionally (`handler.rs:558`, `handler.rs:668`).
+> HTTP headers, including `authorization`, arrive via `extract_service_params`
+> (`middleware.rs:17-28`). Phase 2 must re-derive the peer from that, or gate
+> the route before it reaches the SDK handler.
+
 
 Existing RustFox machinery this design reuses (all verified in-tree):
 
@@ -96,7 +135,7 @@ In scope:
 Out of scope for this design (candidates for later):
 
 - gRPC and SLIMRPC bindings.
-- Push notifications (`tasks/pushNotificationConfig/*`). The SDK provides
+- Push notifications (`CreateTaskPushNotificationConfig` and siblings). The SDK provides
   `HttpPushSender` and `PushConfigStore`, but no RustFox use case requires it yet.
 - Public-internet hardening (rate limiting, OAuth2, mTLS).
 - Reworking the `execute_command` sandbox. This design gates access to tools; it
@@ -110,7 +149,7 @@ New module `src/a2a/`:
 |---|---|---|
 | `mod.rs` | facade, config, wiring into `main.rs` | — |
 | `card.rs` | `AgentCardProducer` built from `skills/` + config | `src/skills/loader.rs` |
-| `auth.rs` | `CallInterceptor`: bearer + IP allowlist, fail-closed | — |
+| `auth.rs` | bearer + IP allowlist, fail-closed (plain function + axum middleware) | — |
 | `policy.rs` | resolve peer → `allowed_tools` (`["*"]` = all) | `src/loop_runner.rs:33` |
 | `executor.rs` | `AgentExecutor` → RustFox agentic loop | `src/main.rs:269` |
 | `task_store.rs` | `TaskStore` over the existing SQLite connection | `src/supervisor/store.rs` |
@@ -130,7 +169,7 @@ the live agent, its tool registry, MCP connections and memory store.
 | `input-required` | see §7(a) — multi-turn continuation |
 | `completed` | `LoopOutcome::FinalResponse` |
 | `failed` | loop error, or `LoopOutcome::MaxIterations` |
-| `canceled` | `tasks/cancel` → existing `CancellationToken` |
+| `canceled` | `CancelTask` → existing `CancellationToken` |
 | `rejected` | peer authenticated but not permitted for the requested skill |
 
 `LoopOutcome` is defined in `src/loop_runner.rs:41`.
@@ -138,8 +177,8 @@ the live agent, its tool registry, MCP connections and memory store.
 ## Execution Flow
 
 ```
-POST /jsonrpc   message/send
-  └─ CallInterceptor
+POST /jsonrpc   SendMessage
+  └─ axum auth middleware (bearer + IP)
        ├─ bearer token → peer identity          (401 on no match)
        ├─ source IP against peer allowlist      (403 on no match)
        └─ peer → allowed_tools                  (§6)
@@ -151,13 +190,13 @@ POST /jsonrpc   message/send
                 ├─ AgentExecutor → agentic loop
                 │    ├─ LoopConfig.allowed_tools = peer policy
                 │    ├─ stream_token_tx → SSE artifact/status events
-                │    └─ cancel_token ← tasks/cancel
+                │    └─ cancel_token ← CancelTask
                 └─ terminal state persisted
      └─ respond: Task (long) or Message (fast resolution)
 ```
 
-`message/stream` wires `LoopConfig.stream_token_tx` into the SDK's SSE writer.
-`tasks/cancel` resolves through `cancel_token_registry`, the same mechanism
+`SendStreamingMessage` wires `LoopConfig.stream_token_tx` into the SDK's SSE writer.
+`CancelTask` resolves through `cancel_token_registry`, the same mechanism
 `/stop` uses.
 
 ## Security Model
@@ -315,9 +354,9 @@ depend on are in place.
 | Phase | Content | Depends on | Verifiable by |
 |---|---|---|---|
 | 1 | `card.rs` + `auth.rs` + `policy.rs` + config plumbing; Agent Card served, endpoints reject unauthenticated requests | — | success criteria 1 and 3 |
-| 2 | `task_store.rs` + `executor.rs` + `message/send` synchronous path; task reaches `completed` | 1 | success criteria 2 and 4 |
-| 3 | `tasks/get`, `tasks/cancel`, semaphore; lifecycle fully async | 2 | success criteria 5 |
-| 4 | `message/stream` SSE | 3 | streaming interop test |
+| 2 | `task_store.rs` + `executor.rs` + `SendMessage` synchronous path; task reaches `completed` | 1 | success criteria 2 and 4 |
+| 3 | `GetTask`, `CancelTask`, semaphore; lifecycle fully async | 2 | success criteria 5 |
+| 4 | `SendStreamingMessage` SSE | 3 | streaming interop test |
 | 5 | `client.rs` + `call_a2a_agent` tool | 2 | success criterion 6 |
 
 Phase 1 is deliberately first: it establishes authentication before any path
@@ -338,6 +377,59 @@ of it.
 4. **`AgentExecutor` runs inside the bot process.** A panic in the A2A path must
    not take down the Telegram dispatcher. Executor work belongs in spawned tasks
    with error capture, never unwrapped on the dispatcher task.
+
+### Phase 2 hazards (found by reading the SDK and RustFox source before implementing)
+
+These are not hypotheticals — each was confirmed in the code. They are recorded
+here because getting any of them wrong is either a security failure or a silent
+loss of function.
+
+5. **`Agent::process_message` MUST NOT be used by the executor.** It builds its
+   own `LoopConfig` with `allowed_tools: None` (`src/agent.rs:823`), and per
+   `src/config.rs:313-320` that `None` means **no restriction at all** — every
+   tool, including `execute_command`. Driving a peer's request through it would
+   hand remote shell to any authenticated peer. The executor must construct
+   `AgenticLoop` directly with an explicit `allowed_tools: Some(vec)`, copying
+   the `run_subagent` pattern (`src/agent.rs:1470-1503`).
+
+6. **`PeerIdentity.allowed_tools` is resolved against an EMPTY tool registry.**
+   `authenticate` calls `resolve_allowed_tools(matched_name, peer, &[])`
+   (`src/a2a/auth.rs:91`), so for a `["*"]` peer — the most privileged
+   configuration that exists — it returns an **empty** list. Phase 2 must
+   re-resolve against `agent.all_tool_definitions()` before building
+   `LoopConfig`. Forwarding `PeerIdentity.allowed_tools` verbatim would give
+   every wildcard peer zero tools: fail-closed, but broken.
+
+7. **The cancel-token key space is shared with Telegram.** `cancel_token_registry`
+   is a bare `HashMap<String, CancellationToken>` keyed by Telegram `user_id`
+   (`src/agent.rs:99`), and `/stop` cancels by that key. An A2A task must
+   namespace its key (`"a2a:{task_id}"`) or `/stop` and `CancelTask` will cancel
+   each other's runs.
+
+8. **`DefaultRequestHandler::send_message` blocks until terminal.** It drives the
+   executor stream to a terminal event before responding (`handler.rs:583-619`)
+   and the SDK applies **no timeout**. With `max_iterations` at 25 and a slow
+   provider this is a multi-minute HTTP request holding a connection. Phase 2
+   accepts this deliberately (the spec calls for the synchronous path); the
+   escalation is `configuration.returnImmediately`, which is only *useful* once
+   `GetTask` exists in Phase 3, since otherwise the peer cannot poll.
+
+9. **`spawn` / `build_state` / `router` take no agent.** All three signatures
+   (`src/a2a/server.rs:31, 84, 196`) must gain the executor, and the call site
+   `src/main.rs:457` must change. `agent` is in scope there (built at
+   `src/main.rs:248`).
+
+10. **The SDK's `TaskStore::update` contract is load-bearing.** `save_task`
+    (`handler.rs:201-210`) calls `update` first and only falls back to `create`
+    when the error code is exactly `TASK_NOT_FOUND`. A SQLite store that returns
+    any other error (or `Ok`) for a missing row means tasks are **silently never
+    created**.
+
+11. **`StreamResponse::Task` replaces the stored task; status/artifact updates
+    merge.** Emitting a `Task` with `history: None` (`handler.rs:218`) discards
+    accumulated history. Carry `ctx.stored_task` history forward, as the crate's
+    own `PushEventExecutor` does (`handler.rs:895`).
+
 
 ## Testing Strategy
 
@@ -360,11 +452,11 @@ of it.
 
 1. A remote A2A client can fetch `/.well-known/agent-card.json` and see RustFox's
    skills.
-2. `message/send` from an authenticated, allowlisted peer produces a `completed`
+2. `SendMessage` from an authenticated, allowlisted peer produces a `completed`
    task whose result is the agent's answer.
 3. An unauthenticated or non-allowlisted peer receives 401/403 and no agent work
    is performed.
 4. A peer without `execute_command` in its policy cannot invoke it, even if the
    LLM attempts the call.
-5. `tasks/cancel` stops an in-flight task and the task reaches `canceled`.
+5. `CancelTask` stops an in-flight task and the task reaches `canceled`.
 6. RustFox can discover and call a remote A2A agent through `call_a2a_agent`.
