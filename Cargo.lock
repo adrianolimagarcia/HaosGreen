@@ -2716,6 +2716,7 @@ dependencies = [
  "include_dir",
  "infer",
  "ipnet",
+ "libc",
  "nix",
  "ocrs",
  "pdf-extract",

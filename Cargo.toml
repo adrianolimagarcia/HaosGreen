@@ -94,6 +94,10 @@ dirs = "5"
 
 # Unix process group management (kill child process trees)
 nix = { version = "0.31", features = ["signal"] }
+
+# `O_NOFOLLOW` for the sandbox/home file opens (see `src/builtin_tools.rs`).
+# Only the flag constants are used, so libc's `std` feature is not required.
+libc = { version = "0.2", default-features = false }
 rustc-hash = "2.1.3"
 
 # A2A protocol (Phase 1: Agent Card types only)

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -63,6 +63,140 @@ fn validate_plan_title(title: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Resolve `<sandbox>/.plans/<title>.json` and prove the result is contained.
+///
+/// `validate_plan_title` only proves that `title` is a single path component —
+/// a *name*, not a path. It says nothing about what `.plans` itself resolves
+/// to, so on its own it leaves `<sandbox>/.plans` free to be a symlink to any
+/// directory on the machine. `validate_sandbox_path` canonicalises, so a
+/// `.plans` directory (or a `<title>.json` file) that resolves outside the
+/// sandbox is rejected instead of followed — the same gate `read_file`,
+/// `write_file` and `list_files` already use.
+///
+/// `plan_create` must create `.plans` *before* calling this: for a path that
+/// does not exist yet `validate_sandbox_path` canonicalises the **parent**, and
+/// canonicalising a missing directory is an error, which would break the first
+/// plan in a fresh sandbox.
+fn resolve_plan_path(sandbox_dir: &Path, title: &str) -> anyhow::Result<PathBuf> {
+    validate_sandbox_path(sandbox_dir, &format!(".plans/{title}.json"))
+}
+
+/// `<path>.bak`, `<path>.bak.1`, … — sibling backups in the same directory.
+fn bak_path(p: &Path, suffix: &str) -> PathBuf {
+    format!("{}{}", p.display(), suffix).into()
+}
+
+/// `true` when the kernel refused the open because the final path component is
+/// a symlink and `O_NOFOLLOW` was set (`ELOOP`).
+///
+/// Non-Unix platforms get no `O_NOFOLLOW` here, so this is always `false`
+/// there; see [`open_read_no_follow`] for the portability trade-off.
+#[cfg(unix)]
+fn is_symlink_refusal(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// See the Unix definition; no `O_NOFOLLOW` is applied on this platform.
+#[cfg(not(unix))]
+fn is_symlink_refusal(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// The denial returned when `O_NOFOLLOW` refuses to follow a symlink.
+fn symlink_refusal(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Access denied: '{}' is a symbolic link; refusing to follow it",
+        path.display()
+    )
+}
+
+/// Open `path` for reading, refusing to follow a symlink at the final
+/// component.
+///
+/// Every path in this module is checked *then* used: `validate_sandbox_path` /
+/// `validate_home_path` canonicalise at T1 and the handler re-opens the path by
+/// name at T2. A writer that replaces the validated name with a symlink inside
+/// that window redirects the open, so the check proves nothing about the
+/// resolution that is actually used. `O_NOFOLLOW` moves the refusal into
+/// `open(2)` itself, making the resolution that is checked the resolution that
+/// is used.
+#[cfg(unix)]
+async fn open_read_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+}
+
+/// Non-Unix fallback: no `O_NOFOLLOW` equivalent is wired up, so the open
+/// behaves exactly as `tokio::fs::read_to_string` did before this change and
+/// containment rests on the `validate_*_path` check alone. Gated rather than
+/// assumed so the crate keeps compiling on platforms without `O_NOFOLLOW`.
+#[cfg(not(unix))]
+async fn open_read_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new().read(true).open(path).await
+}
+
+/// Open `path` for writing (create + truncate), refusing to follow a symlink at
+/// the final component. See [`open_read_no_follow`].
+///
+/// This is not only a race fix: `validate_sandbox_path` accepts a *dangling*
+/// symlink, because it only canonicalises when `exists()` is true and `exists()`
+/// follows symlinks. Writing through such a link creates the file at the link
+/// target, outside the sandbox.
+#[cfg(unix)]
+async fn open_write_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+}
+
+/// See the Unix definition; no `O_NOFOLLOW` is applied on this platform.
+#[cfg(not(unix))]
+async fn open_write_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await
+}
+
+/// Read a whole file through [`open_read_no_follow`].
+async fn read_no_follow(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = open_read_no_follow(path).await?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Write a whole file through [`open_write_no_follow`].
+async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = open_write_no_follow(path).await?;
+    file.write_all(content).await?;
+    file.flush().await
+}
+
+/// Best-effort restore of `soul` from `bak`, without following a symlink at
+/// either name.
+///
+/// `tokio::fs::copy` opens the destination by name and follows a symlink there,
+/// so using it on the failure path would re-open the very window the no-follow
+/// open exists to close — a swap that makes the write fail would then be
+/// completed by the restore.
+async fn restore_soul_from_backup(bak: &Path, soul: &Path) {
+    if let Ok(content) = read_no_follow(bak).await {
+        let _ = write_no_follow(soul, content.as_bytes()).await;
+    }
 }
 
 pub struct BuiltinTools {
@@ -287,9 +421,17 @@ impl ToolHandler for BuiltinTools {
             "read_file" => {
                 let path = args["path"].as_str().context("Missing 'path' argument")?;
                 let resolved = validate_sandbox_path(&ctx.sandbox_dir, path)?;
-                let content = tokio::fs::read_to_string(&resolved)
-                    .await
-                    .with_context(|| format!("Failed to read file: {}", resolved.display()))?;
+                // `O_NOFOLLOW`, not `read_to_string`: the containment check
+                // above resolves the path at T1 and this open resolves it again
+                // at T2. See `open_read_no_follow`.
+                let content = read_no_follow(&resolved).await.map_err(|e| {
+                    if is_symlink_refusal(&e) {
+                        symlink_refusal(&resolved)
+                    } else {
+                        anyhow::Error::new(e)
+                            .context(format!("Failed to read file: {}", resolved.display()))
+                    }
+                })?;
                 Ok(content)
             }
             "write_file" => {
@@ -301,7 +443,20 @@ impl ToolHandler for BuiltinTools {
                 if let Some(parent) = resolved.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                tokio::fs::write(&resolved, content).await?;
+                // `validate_sandbox_path` accepts a dangling symlink — it only
+                // canonicalises when `exists()` is true, and `exists()` follows
+                // symlinks — so `tokio::fs::write` here created the file at the
+                // link target, outside the sandbox. `O_NOFOLLOW` refuses.
+                write_no_follow(&resolved, content.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        if is_symlink_refusal(&e) {
+                            symlink_refusal(&resolved)
+                        } else {
+                            anyhow::Error::new(e)
+                                .context(format!("Failed to write file: {}", resolved.display()))
+                        }
+                    })?;
                 Ok(format!(
                     "Wrote {} bytes to {}",
                     content.len(),
@@ -355,8 +510,14 @@ impl ToolHandler for BuiltinTools {
                 let title = args["title"].as_str().context("Missing 'title' argument")?;
                 validate_plan_title(title)?;
                 let plans_dir = ctx.sandbox_dir.join(".plans");
+                // Create `.plans` *before* validating: `validate_sandbox_path`
+                // canonicalises the parent of a path that does not exist yet,
+                // so on a fresh sandbox with no `.plans` the check would fail
+                // on the missing parent. `create_dir_all` is a no-op when
+                // `.plans` already exists — including when it is a symlink,
+                // which `resolve_plan_path` then rejects.
                 tokio::fs::create_dir_all(&plans_dir).await?;
-                let plan_path = plans_dir.join(format!("{}.json", title));
+                let plan_path = resolve_plan_path(&ctx.sandbox_dir, title)?;
                 let steps = args["steps"]
                     .as_array()
                     .context("Missing 'steps' argument")?;
@@ -365,7 +526,17 @@ impl ToolHandler for BuiltinTools {
                     "steps": steps,
                     "statuses": vec![json!("todo"); steps.len()],
                 });
-                tokio::fs::write(&plan_path, serde_json::to_string_pretty(&plan)?).await?;
+                let body = serde_json::to_string_pretty(&plan)?;
+                write_no_follow(&plan_path, body.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        if is_symlink_refusal(&e) {
+                            symlink_refusal(&plan_path)
+                        } else {
+                            anyhow::Error::new(e)
+                                .context(format!("Failed to write plan: {}", plan_path.display()))
+                        }
+                    })?;
                 Ok(format!(
                     "Created plan '{}' with {} steps",
                     title,
@@ -380,11 +551,15 @@ impl ToolHandler for BuiltinTools {
                     .as_str()
                     .context("Missing 'status' argument")?;
                 let _notes = args.get("notes").and_then(|v| v.as_str());
-                let plan_path = ctx
-                    .sandbox_dir
-                    .join(".plans")
-                    .join(format!("{}.json", title));
-                let content = tokio::fs::read_to_string(&plan_path).await?;
+                let plan_path = resolve_plan_path(&ctx.sandbox_dir, title)?;
+                let content = read_no_follow(&plan_path).await.map_err(|e| {
+                    if is_symlink_refusal(&e) {
+                        symlink_refusal(&plan_path)
+                    } else {
+                        anyhow::Error::new(e)
+                            .context(format!("Failed to read plan: {}", plan_path.display()))
+                    }
+                })?;
                 let mut plan: Value = serde_json::from_str(&content)?;
                 if let Some(statuses) = plan.get_mut("statuses").and_then(|s| s.as_array_mut()) {
                     if step_id < statuses.len() {
@@ -400,17 +575,31 @@ impl ToolHandler for BuiltinTools {
                         }
                     }
                 }
-                tokio::fs::write(&plan_path, serde_json::to_string_pretty(&plan)?).await?;
+                let body = serde_json::to_string_pretty(&plan)?;
+                write_no_follow(&plan_path, body.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        if is_symlink_refusal(&e) {
+                            symlink_refusal(&plan_path)
+                        } else {
+                            anyhow::Error::new(e)
+                                .context(format!("Failed to write plan: {}", plan_path.display()))
+                        }
+                    })?;
                 Ok(format!("Updated step {step_id} to '{status}'"))
             }
             "plan_view" => {
                 let title = args["title"].as_str().unwrap_or("default");
                 validate_plan_title(title)?;
-                let plan_path = ctx
-                    .sandbox_dir
-                    .join(".plans")
-                    .join(format!("{}.json", title));
-                let content = tokio::fs::read_to_string(&plan_path).await?;
+                let plan_path = resolve_plan_path(&ctx.sandbox_dir, title)?;
+                let content = read_no_follow(&plan_path).await.map_err(|e| {
+                    if is_symlink_refusal(&e) {
+                        symlink_refusal(&plan_path)
+                    } else {
+                        anyhow::Error::new(e)
+                            .context(format!("Failed to read plan: {}", plan_path.display()))
+                    }
+                })?;
                 Ok(content)
             }
             "try_new_tech" => {
@@ -546,12 +735,21 @@ impl ToolHandler for BuiltinTools {
                 // `validate_sandbox_path(home, file_name).unwrap_or_else(|_| home.join(file_name))`,
                 // which turned the containment check into a no-op — the
                 // rejected `../outside.txt` was then joined onto `home` anyway.
-                let path = validate_home_path(home, file_name)?;
-                match tokio::fs::read_to_string(&path).await {
+                validate_home_path(home, file_name)?;
+                // …but a check is not containment. `validate_home_path`
+                // canonicalises at T1; opening the path it *returned* would
+                // re-resolve it at T2, so a symlink swapped in between was
+                // followed and `SOUL.md` returned the OpenRouter API key out of
+                // `config.toml`. Open the requested name instead — `file_name`
+                // is an allowlisted single component, so `home.join(file_name)`
+                // cannot traverse — and let `O_NOFOLLOW` refuse a symlink at it.
+                let soul = home.join(file_name);
+                match read_no_follow(&soul).await {
                     Ok(content) => Ok(content),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         Ok(format!("Soul file '{}' does not exist yet.", file_name))
                     }
+                    Err(e) if is_symlink_refusal(&e) => Err(symlink_refusal(&soul)),
                     Err(e) => Ok(format!("Error reading soul file: {}", e)),
                 }
             }
@@ -579,9 +777,28 @@ impl ToolHandler for BuiltinTools {
                 // safe; validating the resolved path as well keeps the
                 // containment check in one place and fails closed if the
                 // soul file is a symlink out of the home directory.
-                let path = validate_home_path(home, file_name)?;
+                validate_home_path(home, file_name)?;
+                // …and then never open the path it returned. See
+                // `read_soul_file` and `open_read_no_follow`: re-resolving the
+                // validated name is the check-then-use window, and this handler
+                // *writes*, so a symlink swapped into it redirected the write
+                // out of the home directory.
+                let path = home.join(file_name);
 
-                let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                // Read the current content without following a symlink. Only
+                // `NotFound` may be treated as "no soul file yet" — the old
+                // `unwrap_or_default()` also swallowed the refusal, which would
+                // have turned a symlinked soul file into a blank one and then
+                // overwritten whatever the link pointed at.
+                let (existing, existed) = match read_no_follow(&path).await {
+                    Ok(content) => (content, true),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+                    Err(e) if is_symlink_refusal(&e) => return Err(symlink_refusal(&path)),
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("Failed to read soul file: {}", path.display())))
+                    }
+                };
 
                 let new_content = match mode {
                     "append" => {
@@ -626,9 +843,9 @@ impl ToolHandler for BuiltinTools {
                     );
                 }
 
-                fn bak_path(p: &std::path::Path, suffix: &str) -> PathBuf {
-                    format!("{}{}", p.display(), suffix).into()
-                }
+                // Rotate `.bak.2 -> .bak.3`, `.bak.1 -> .bak.2`, `.bak -> .bak.1`.
+                // `rename` operates on the link itself and never follows it, so
+                // these are safe even if a backup name is a symlink.
                 for (old, new) in [
                     (bak_path(&path, ".bak.2"), bak_path(&path, ".bak.3")),
                     (bak_path(&path, ".bak.1"), bak_path(&path, ".bak.2")),
@@ -638,14 +855,23 @@ impl ToolHandler for BuiltinTools {
                         let _ = tokio::fs::rename(&old, &new).await;
                     }
                 }
-                if path.exists() {
-                    let _ = tokio::fs::copy(&path, &bak_path(&path, ".bak")).await;
+                if existed {
+                    let bak = bak_path(&path, ".bak");
+                    // Back up the bytes just read rather than re-opening the
+                    // name: `tokio::fs::copy` would follow a symlink swapped in
+                    // since the read, and a symlinked backup name would send
+                    // the copy outside the home directory.
+                    if let Err(e) = write_no_follow(&bak, existing.as_bytes()).await {
+                        if is_symlink_refusal(&e) {
+                            return Err(symlink_refusal(&bak));
+                        }
+                    }
                 }
 
-                if let Err(e) = tokio::fs::write(&path, &new_content).await {
-                    let bak = bak_path(&path, ".bak");
-                    if bak.exists() {
-                        let _ = tokio::fs::copy(&bak, &path).await;
+                if let Err(e) = write_no_follow(&path, new_content.as_bytes()).await {
+                    restore_soul_from_backup(&bak_path(&path, ".bak"), &path).await;
+                    if is_symlink_refusal(&e) {
+                        return Err(symlink_refusal(&path));
                     }
                     return Ok(format!(
                         "Failed to write soul file (restored from backup): {}",
@@ -653,7 +879,7 @@ impl ToolHandler for BuiltinTools {
                     ));
                 }
 
-                match tokio::fs::read_to_string(&path).await {
+                match read_no_follow(&path).await {
                     Ok(read_back) if read_back == new_content => {
                         self.soul_updated
                             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -664,20 +890,14 @@ impl ToolHandler for BuiltinTools {
                         ))
                     }
                     Ok(_) => {
-                        let bak = bak_path(&path, ".bak");
-                        if bak.exists() {
-                            let _ = tokio::fs::copy(&bak, &path).await;
-                        }
+                        restore_soul_from_backup(&bak_path(&path, ".bak"), &path).await;
                         Ok(
                             "Write verification failed (content mismatch). Restored from backup."
                                 .to_string(),
                         )
                     }
                     Err(e) => {
-                        let bak = bak_path(&path, ".bak");
-                        if bak.exists() {
-                            let _ = tokio::fs::copy(&bak, &path).await;
-                        }
+                        restore_soul_from_backup(&bak_path(&path, ".bak"), &path).await;
                         Ok(format!(
                             "Write verification error (restored from backup): {}",
                             e
@@ -692,17 +912,24 @@ impl ToolHandler for BuiltinTools {
                     .home_dir
                     .as_ref()
                     .context("No home directory configured")?;
-                let path = validate_home_path(home, file_name)?;
-                let bak = {
-                    let mut s = path.to_string_lossy().to_string();
-                    s.push_str(".bak");
-                    PathBuf::from(s)
+                validate_home_path(home, file_name)?;
+                // Same check-then-use window as `read_soul_file` /
+                // `update_soul_file`, but here the *write* is the restore, so
+                // `tokio::fs::copy` (which opens the destination by name and
+                // follows a symlink there) is replaced by the no-follow pair.
+                let path = home.join(file_name);
+                let bak = bak_path(&path, ".bak");
+                let content = match read_no_follow(&bak).await {
+                    Ok(content) => content,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(format!("No backup found for {}", file_name))
+                    }
+                    Err(e) if is_symlink_refusal(&e) => return Err(symlink_refusal(&bak)),
+                    Err(e) => return Ok(format!("Failed to restore backup: {}", e)),
                 };
-                if !bak.exists() {
-                    return Ok(format!("No backup found for {}", file_name));
-                }
-                match tokio::fs::copy(&bak, &path).await {
-                    Ok(_) => Ok(format!("{} restored from backup.", file_name)),
+                match write_no_follow(&path, content.as_bytes()).await {
+                    Ok(()) => Ok(format!("{} restored from backup.", file_name)),
+                    Err(e) if is_symlink_refusal(&e) => Err(symlink_refusal(&path)),
                     Err(e) => Ok(format!("Failed to restore backup: {}", e)),
                 }
             }
@@ -1245,6 +1472,496 @@ mod tests {
         assert!(
             !dir.path().join("outside.md").exists(),
             "revert_soul_file restored a backup outside the home directory"
+        );
+    }
+
+    // ── plan_* : a valid *name* is not containment ──────────────────────────
+    //
+    // `validate_plan_title` only proves the title is a single path component.
+    // It says nothing about what `.plans` resolves to, so a symlinked `.plans`
+    // directory — or a symlinked `<title>.json` — redirected every plan
+    // operation. These tests drive the real handlers with a real symlink
+    // planted first; before the fix `plan_create` returned
+    // `Ok("Created plan 'pwn' with 1 steps")` and the file landed outside the
+    // sandbox, and `plan_view` returned the contents of an outside file.
+
+    /// Escape A: `.plans` is a symlink to a directory outside the sandbox.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_plan_create_rejects_symlinked_plans_dir() {
+        let (dir, home, sandbox) = fixture();
+        let outside = dir.path().join("outside_plans");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, sandbox.join(".plans")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_create",
+            json!({ "title": "pwn", "steps": ["a"] }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "plan_create must reject a symlinked .plans directory, got: {:?}",
+            result
+        );
+        assert!(
+            !outside.join("pwn.json").exists(),
+            "plan_create wrote a plan outside the sandbox through a symlinked .plans"
+        );
+    }
+
+    /// Escape B: a plan *file* is a symlink to a file outside the sandbox.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_plan_view_rejects_symlinked_plan_file() {
+        let (dir, home, sandbox) = fixture();
+        let plans = sandbox.join(".plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, "OUTSIDE_SECRET_PLAN").unwrap();
+        std::os::unix::fs::symlink(&outside, plans.join("leak.json")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_view",
+            json!({ "title": "leak" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("OUTSIDE_SECRET_PLAN"),
+            "plan_view read outside the sandbox through a symlinked plan file: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "plan_view must reject a symlinked plan file, got: {:?}",
+            result
+        );
+    }
+
+    /// The same for `plan_update`, which writes: the outside file must be
+    /// byte-identical afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_plan_update_rejects_symlinked_plan_file() {
+        let (dir, home, sandbox) = fixture();
+        let plans = sandbox.join(".plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            r#"{"title":"outside","steps":["a"],"statuses":["todo"]}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, plans.join("leak.json")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_update",
+            json!({ "title": "leak", "step_id": 0, "status": "done" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "plan_update must reject a symlinked plan file, got: {:?}",
+            result
+        );
+        let after = std::fs::read_to_string(&outside).unwrap();
+        assert!(
+            after.contains("todo"),
+            "plan_update rewrote a file outside the sandbox: {after}"
+        );
+    }
+
+    /// A *dangling* symlink is the case `validate_sandbox_path` alone does not
+    /// catch: it canonicalises only when `exists()` is true, and `exists()`
+    /// follows symlinks. The containment check therefore accepts the path and
+    /// the write used to create the file at the link target. `O_NOFOLLOW` is
+    /// what closes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_plan_create_rejects_dangling_symlinked_plan_file() {
+        let (dir, home, sandbox) = fixture();
+        let plans = sandbox.join(".plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let outside_dir = dir.path().join("outside_dir");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let target = outside_dir.join("pwn.json");
+        std::os::unix::fs::symlink(&target, plans.join("pwn.json")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_create",
+            json!({ "title": "pwn", "steps": ["a"] }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "plan_create must reject a dangling symlinked plan file, got: {:?}",
+            result
+        );
+        assert!(
+            !target.exists(),
+            "plan_create created a plan outside the sandbox through a dangling symlink"
+        );
+    }
+
+    /// `write_file` is the pattern `plan_*` was asked to copy, and it had the
+    /// same dangling-symlink hole: containment validation is not sufficient
+    /// for a *write*, because the write is a second resolution of the name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_file_rejects_dangling_symlink_out_of_sandbox() {
+        let (dir, home, sandbox) = fixture();
+        let outside_dir = dir.path().join("outside_dir");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let target = outside_dir.join("pwn.txt");
+        std::os::unix::fs::symlink(&target, sandbox.join("pwn.txt")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "write_file",
+            json!({ "path": "pwn.txt", "content": "OUTSIDE_WRITE" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "write_file must reject a dangling symlink, got: {:?}",
+            result
+        );
+        assert!(
+            !target.exists(),
+            "write_file created a file outside the sandbox through a dangling symlink"
+        );
+    }
+
+    /// Regression guard for the fix in the other direction: the containment
+    /// check must not break the ordinary first-run path. On a fresh sandbox
+    /// `.plans` does not exist, and `validate_sandbox_path` canonicalises the
+    /// *parent* of a path that does not exist yet — so `.plans` has to be
+    /// created before the check runs.
+    #[tokio::test]
+    async fn test_plan_create_works_in_fresh_sandbox_without_plans_dir() {
+        let (_dir, home, sandbox) = fixture();
+        assert!(
+            !sandbox.join(".plans").exists(),
+            "fixture must start without a .plans directory"
+        );
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_create",
+            json!({ "title": "fresh", "steps": ["one", "two"] }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "plan_create must work in a fresh sandbox, got: {:?}",
+            result
+        );
+        assert!(
+            sandbox.join(".plans").join("fresh.json").is_file(),
+            "plan_create did not create the plan inside the sandbox"
+        );
+
+        // …and the plan it created is readable through plan_view.
+        let viewed = exec(
+            &tools,
+            "plan_view",
+            json!({ "title": "fresh" }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("plan_view of a freshly created plan must succeed");
+        assert!(viewed.contains("one"), "plan steps missing: {viewed}");
+    }
+
+    /// Titles are free-form names, including spaces, and must keep working
+    /// end-to-end after being routed through containment validation.
+    #[tokio::test]
+    async fn test_plan_title_with_space_round_trips() {
+        let (_dir, home, sandbox) = fixture();
+        let tools = make_tools();
+
+        exec(
+            &tools,
+            "plan_create",
+            json!({ "title": "fix the login bug", "steps": ["repro", "patch"] }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("plan_create with a spaced title must succeed");
+
+        let updated = exec(
+            &tools,
+            "plan_update",
+            json!({ "title": "fix the login bug", "step_id": 0, "status": "done" }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("plan_update with a spaced title must succeed");
+        assert!(updated.contains("done"), "unexpected update: {updated}");
+
+        let viewed = exec(
+            &tools,
+            "plan_view",
+            json!({ "title": "fix the login bug" }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("plan_view with a spaced title must succeed");
+        assert!(viewed.contains("fix the login bug"), "got: {viewed}");
+        assert!(
+            viewed.contains("done"),
+            "update was not persisted: {viewed}"
+        );
+    }
+
+    // ── soul files: refusing a symlink at open time ─────────────────────────
+    //
+    // Escapes C and D are a check-then-use race: `validate_home_path`
+    // canonicalises at T1 and the handler re-opened the name at T2, so a
+    // writer that swapped the file for a symlink in between redirected the
+    // read (`config.toml` came back with the OpenRouter API key) or the write.
+    // The race window itself is not deterministically reachable from a test —
+    // there is no hook between the check and the open — so these tests pin the
+    // property that closes it instead: the open refuses to follow a symlink.
+    //
+    // The symlink target is deliberately *inside* the home directory. A link
+    // pointing outside is already denied by `validate_home_path` (covered
+    // above), which would make these tests pass for the wrong reason; an
+    // inside-pointing link is accepted by that check and was previously
+    // followed, silently mapping `SOUL.md` onto `AGENTS.md`.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_soul_file_refuses_symlink_even_inside_home() {
+        let (_dir, home, sandbox) = fixture();
+        std::fs::write(home.join("AGENTS.md"), "AGENTS_CONTENT").unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), home.join("SOUL.md")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "read_soul_file",
+            json!({ "file_name": "SOUL.md" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("AGENTS_CONTENT"),
+            "read_soul_file followed a symlink: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "read_soul_file must refuse to follow a symlink, got: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_soul_file_refuses_symlink_even_inside_home() {
+        let (_dir, home, sandbox) = fixture();
+        std::fs::write(home.join("AGENTS.md"), "AGENTS_CONTENT").unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), home.join("SOUL.md")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "update_soul_file",
+            json!({
+                "file_name": "SOUL.md",
+                "content": "---\nname: SOUL\nversion: 1\n---\n\nPWNED",
+                "mode": "replace"
+            }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "update_soul_file must refuse to follow a symlink, got: {:?}",
+            result
+        );
+        let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            agents, "AGENTS_CONTENT",
+            "update_soul_file wrote through a symlink into another soul file"
+        );
+    }
+
+    /// `revert_soul_file` restores *into* the soul path, so a symlink there
+    /// must not receive the backup content either. The link target is inside
+    /// home on purpose: a link pointing outside is already refused by
+    /// `validate_home_path`, which would make this pass for the wrong reason.
+    /// Pointing `AGENTS.md` at `USER.md` instead made the old handler derive
+    /// its backup name from the *canonicalised* path (`USER.md.bak`), so it
+    /// never found the backup it was asked to restore.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_revert_soul_file_refuses_symlink_even_inside_home() {
+        let (_dir, home, sandbox) = fixture();
+        std::fs::write(home.join("USER.md"), "USER_ORIGINAL").unwrap();
+        // A backup exists, so the handler gets past the "no backup" branch.
+        std::fs::write(
+            home.join("AGENTS.md.bak"),
+            "---\nname: AGENTS\nversion: 1\n---\n\nBACKUP_BODY",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(home.join("USER.md"), home.join("AGENTS.md")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "revert_soul_file",
+            json!({ "file_name": "AGENTS.md" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "revert_soul_file must refuse to follow a symlink, got: {:?}",
+            result
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("USER.md")).unwrap(),
+            "USER_ORIGINAL",
+            "revert_soul_file wrote the backup through a symlink into another soul file"
+        );
+    }
+
+    /// The `.bak` name is also reachable inside home, so `update_soul_file`
+    /// must not follow a symlink there. The link is left *dangling* on purpose:
+    /// the `.bak -> .bak.1` rotation only moves a link that already resolves,
+    /// so a dangling one survives to the backup write, and `tokio::fs::copy`
+    /// used to create the file at the link target — outside the home directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_update_soul_file_refuses_dangling_symlinked_backup_name() {
+        let (dir, home, sandbox) = fixture();
+        let target = dir.path().join("outside_backup.md");
+        std::fs::write(
+            home.join("SOUL.md"),
+            "---\nname: SOUL\nversion: 1\n---\n\nBASE",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, home.join("SOUL.md.bak")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "update_soul_file",
+            json!({
+                "file_name": "SOUL.md",
+                "content": "---\nname: SOUL\nversion: 1\n---\n\nMORE",
+                "mode": "replace"
+            }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !target.exists(),
+            "update_soul_file wrote its backup outside the home directory through a symlink"
+        );
+        assert!(
+            result.is_err(),
+            "update_soul_file must refuse a symlinked backup name, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression guard: ordinary soul-file updates still work after the
+    /// no-follow open, including the backup the handler advertises.
+    #[tokio::test]
+    async fn test_update_soul_file_still_works_and_writes_backup() {
+        let (_dir, home, sandbox) = fixture();
+        std::fs::write(
+            home.join("SOUL.md"),
+            "---\nname: SOUL\nversion: 1\n---\n\nBASE",
+        )
+        .unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "update_soul_file",
+            json!({
+                "file_name": "SOUL.md",
+                "content": "---\nname: SOUL\nversion: 1\n---\n\nMORE",
+                "mode": "replace"
+            }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "update_soul_file must still succeed for a regular file, got: {:?}",
+            result
+        );
+        let updated = std::fs::read_to_string(home.join("SOUL.md")).unwrap();
+        assert!(updated.contains("MORE"), "update not applied: {updated}");
+
+        let backup = std::fs::read_to_string(home.join("SOUL.md.bak")).unwrap();
+        assert!(
+            backup.contains("BASE"),
+            "the pre-update content must be backed up, got: {backup}"
+        );
+
+        // …and revert_soul_file restores it.
+        let reverted = exec(
+            &tools,
+            "revert_soul_file",
+            json!({ "file_name": "SOUL.md" }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("revert_soul_file must succeed when a backup exists");
+        assert!(reverted.contains("restored"), "got: {reverted}");
+        let restored = std::fs::read_to_string(home.join("SOUL.md")).unwrap();
+        assert!(
+            restored.contains("BASE"),
+            "revert did not restore: {restored}"
         );
     }
 }
