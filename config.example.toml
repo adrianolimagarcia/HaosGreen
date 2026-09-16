@@ -254,3 +254,65 @@ Be concise and helpful."""
 # user_model_update_interval = 10             # Update user model every N user messages
 # user_model_cron = "0 0 3 * * SUN"           # Weekly user model refresh (6-field cron)
 # compaction_model = "qwen/qwen3-8b"          # Cheaper model for compaction summary + USER.md flush (default: current model)
+
+# ── A2A (Agent2Agent) protocol (optional; DISABLED by default) ──────────────
+#
+# Lets other A2A agents on your LAN/VPN discover this bot and send it tasks.
+# Leave `enabled = false` unless you actually need this: turning it on opens a
+# network listener that can drive an agent holding shell access.
+#
+# [a2a]
+# enabled = false                             # Master switch. false = no listener at all.
+# bind = "127.0.0.1:8443"                     # Loopback by default. Use "0.0.0.0:8443"
+#                                             # for LAN/VPN -- but read the note below first.
+# public_url = "http://192.168.1.50:8443"     # What the Agent Card advertises. Needed when
+#                                             # binding 0.0.0.0 or sitting behind a proxy.
+#                                             # Omit to derive it from the bound address.
+#                                             # Must include http:// or https://.
+# max_concurrent_tasks = 4                    # Reserved; enforced from Phase 3.
+#
+# # TLS is NOT implemented yet. Leave this alone or set "none": any other value
+# # is REJECTED at startup rather than silently served as plaintext. If you need
+# # transport encryption today, terminate it at a reverse proxy.
+# # tls = "none"
+# # tls_cert = "/etc/ssl/cert.pem"            # Rejected today; reserved.
+# # tls_key  = "/etc/ssl/key.pem"             # Rejected today; reserved.
+#
+# # Advertised at /.well-known/agent-card.json. This endpoint is PUBLIC: peers
+# # fetch it before they authenticate. Skill names/descriptions are listed;
+# # skill instruction bodies are never included.
+# [a2a.card]
+# name = "RustFox"
+# description = "Self-hosted Telegram AI assistant"
+# version = "1.0.2"
+#
+# # One block per authorised peer. Each peer needs its own token.
+# [a2a.peers.laptop]
+# token = "change-me-to-a-long-random-string"
+# ip = ["127.0.0.1", "192.168.1.0/24"]        # Exact IPs or CIDR blocks. Empty = nobody.
+# # tools is OPTIONAL. Omit it for the safe default allowlist:
+# #   read_file, list_files, read_skill_file, read_agent_file,
+# #   search_memory, recall, remember
+# # That default deliberately EXCLUDES execute_command, write_file, send_file,
+# # self_upgrade, schedule_task, update_soul_file, read_soul_file, plan_view and
+# # everything else. read_soul_file is excluded because it can read
+# # ~/.rustfox/config.toml, which holds your API key and every peer token.
+# #
+# # tools = ["read_file", "search_memory"]    # Explicit list, used verbatim.
+# # tools = []                                # Grant nothing.
+# # tools = ["*"]                             # EVERY tool, INCLUDING shell.
+#                                             # Only as the sole entry, and only
+#                                             # if you truly mean it.
+#
+# # Configuration is validated at startup, and the listener refuses to start if
+# # anything is wrong: duplicate tokens across peers, an empty token, an empty
+# # `ip` list, or an entry that is neither an IP nor a CIDR block. The Telegram
+# # bot still starts; only the A2A listener is skipped, with the reason logged.
+# # Binding to a non-loopback address logs a warning but is allowed, because
+# # raising the bind is meant to be a deliberate act.
+#
+# NOTE ON `bind` AND THE ADVERTISED URL: without `public_url`, the Agent Card
+# advertises the address the listener actually bound. That is correct for
+# loopback, but a remote peer cannot use `http://0.0.0.0:8443` -- it resolves to
+# the *peer's own* loopback. So set `public_url` whenever you bind to 0.0.0.0 or
+# run behind a reverse proxy; startup warns when the derived URL looks unusable.

@@ -213,9 +213,16 @@ this document.**
 
 Note on `["*"]`: the wildcard expands to the tool names the runtime actually
 exposes, derived from the registered tool handlers. `invoke_agent` and
-`spawn_agents` are handled in the agent loop but are not defined as tool
-handlers, so a registry-derived wildcard does **not** grant them. Treat the
-wildcard as "every registered tool", not as an exhaustive escalation path.
+`spawn_agents` are handled in the agent loop but are **not** defined as tool
+handlers — a circular dependency prevents registering them in `ToolRegistry`
+(see the comment at `src/agent.rs:1306`); they are dispatched through a
+`special_tool_handler` closure instead. A registry-derived wildcard therefore
+does **not** grant them. Treat the wildcard as "every registered tool", not as
+an exhaustive escalation path.
+
+This is a property Phase 2 must preserve: whatever set `["*"]` expands to has to
+come from the registry, never from a hand-written list of "everything", or the
+wildcard will silently start granting subagent delegation that Phase 1 does not.
 
 The default is an allowlist, not a denylist: a tool added to RustFox in the
 future is **not** granted to peers until it is added here. This matters because
