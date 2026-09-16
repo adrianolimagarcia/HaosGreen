@@ -214,6 +214,49 @@ mod tests {
     }
 
     #[test]
+    fn security_scheme_uses_the_a2a_v1_oneof_form() {
+        // The emitted shape has no `"type": "http"` discriminator, which looks
+        // wrong against A2A 0.3.x — there `SecurityScheme` is a discriminated
+        // union whose HTTP variant carries `"type": "http"` (0.3.0 spec
+        // §5.5.3, `types/src/types.ts` `HTTPAuthSecurityScheme`), and the
+        // 0.3.0 sample card emits `{"type": "openIdConnect", ...}`.
+        //
+        // It is correct for the version this crate targets. `a2a-lf` 0.3.1 is
+        // "Core Rust types for the A2A v1 protocol" and reports
+        // `VERSION = "1.0"`; in the v1.0 normative proto `SecurityScheme` is a
+        // `oneof` (`specification/a2a.proto`), whose proto3 JSON mapping is a
+        // wrapper key named after the member — `httpAuthSecurityScheme` — with
+        // no discriminator, and v1.0's `HTTPAuthSecurityScheme` has no `type`
+        // field at all. The v1.0 spec's own sample card emits
+        // `{"openIdConnectSecurityScheme": {...}}`.
+        //
+        // The two shapes are therefore coupled to the advertised protocol
+        // version. This test pins both halves of that coupling: if the SDK
+        // ever emits `"type": "http"`, the card must be declaring 0.3.x.
+        let card = build_agent_card(&cfg(), &registry(vec![]), "http://localhost:8443");
+        let json = serde_json::to_value(&card).unwrap();
+        let scheme = &json["securitySchemes"]["bearer"];
+        println!("securitySchemes.bearer = {scheme}");
+
+        assert_eq!(
+            json["supportedInterfaces"][0]["protocolVersion"], "1.0",
+            "the oneof form below is only correct for the version the card declares"
+        );
+        assert!(
+            scheme["httpAuthSecurityScheme"].is_object(),
+            "A2A v1.0 maps the `http_auth_security_scheme` oneof member to a \
+             wrapper key; a2a-lf 0.3.1 implements exactly that"
+        );
+        assert_eq!(scheme["httpAuthSecurityScheme"]["scheme"], "bearer");
+        assert!(
+            scheme.get("type").is_none(),
+            "the v1.0 form has no `type` discriminator; if this assertion \
+             starts failing, the SDK moved to the 0.3.x shape and the \
+             protocolVersion assertion above must move with it"
+        );
+    }
+
+    #[test]
     fn skills_are_sorted_deterministically_by_id() {
         let reg = registry(vec![
             skill("zeta", "z", &[]),
