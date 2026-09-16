@@ -64,11 +64,19 @@ the two coexist as separate majors and cannot be deduplicated because `reqwest`,
 and `tower-http` 0.6.11 were **already present transitively** and were only
 promoted to direct dependencies.
 
-> **Phase 2 adds a large transitive tree.** `a2a-server-lf` 0.3.1 pulls in
-> `a2a-pb` 0.1.8 → `tonic`, `prost`, `pbjson` and ~224 packages total (measured
-> with `cargo metadata` in a scratch crate). RustFox had ~180. The build also
-> gains a protobuf codegen step. This is the cost of using the SDK rather than
-> hand-rolling the JSON-RPC server, and it was accepted deliberately.
+> **Phase 2 adds 38 packages, measured.** `a2a-server-lf` 0.3.1 takes the
+> lockfile from 454 to 492 packages (`grep -c '^\[\[package\]\]' Cargo.lock`
+> before and after). The additions include the protobuf chain (`a2a-pb` 0.1.8
+> → `prost`, `prost-build`, `pbjson`, `tonic`, `petgraph`, `prettyplease`) and
+> `aws-lc-rs`/`aws-lc-sys`, which pull in `cmake`.
+>
+> An earlier revision of this document said ~224. That was wrong: it came from
+> a measurement in a standalone scratch crate, where the SDK's *entire*
+> transitive tree counts as new. Against RustFox's existing 454 packages the
+> true delta is 38. The build also gains a protobuf codegen step; it uses
+> `protoc_bin_vendored`, so no system protoc is required, and `cargo check`
+> completed in 1m01s from cold on this machine.
+
 
 Server extension points confirmed **by reading the crate source** for
 `a2a-server-lf` 0.3.1: `AgentExecutor`, `ExecutorContext`, `TaskStore` +

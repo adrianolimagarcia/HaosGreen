@@ -76,7 +76,7 @@ match the package name, mirroring how `a2a-lf` is already renamed to `a2a`.
 - [ ] **Step 2: Verify it resolves and builds**
 
 Run: `cargo check`
-Expected: succeeds. This pulls ~224 packages including the protobuf chain
+Expected: succeeds. This adds 38 packages (454 -> 492) including the protobuf chain
 (`a2a-pb` 0.1.8 → `tonic`, `prost`, `pbjson`). The first build is slow; it
 vendors `protoc`, so no system protoc is required.
 
