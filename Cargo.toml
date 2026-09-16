@@ -103,6 +103,8 @@ rustc-hash = "2.1.3"
 
 # A2A protocol types (Agent Card, tasks, events)
 a2a = { package = "a2a-lf", version = "0.3.1" }
+# A2A outbound client (Phase 5; compile probe only for now)
+a2a-client = { package = "a2a-client-lf", version = "0.2.5" }
 # A2A server: JSON-RPC router, AgentExecutor and TaskStore traits (Phase 2).
 # Pulls in the protobuf chain (a2a-pb -> tonic/prost/pbjson); vendored protoc,
 # so no system protoc is required.
