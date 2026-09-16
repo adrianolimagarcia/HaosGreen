@@ -1,7 +1,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,7 +12,58 @@ use crate::llm::{FunctionDefinition, ToolDefinition};
 use crate::platform::sender::PlatformSender;
 use crate::skills::SkillRegistry;
 use crate::tool_registry::{ToolContext, ToolHandler, ToolResult};
-use crate::tools::validate_sandbox_path;
+use crate::tools::{validate_home_path, validate_sandbox_path};
+
+/// The soul files the agent may read, update or revert.
+///
+/// This is the single source of truth for the allowlist: the tool schemas
+/// below advertise it as the `enum` for `file_name`, and the handlers check
+/// against it at runtime. A JSON-schema `enum` is only a hint to the model —
+/// tool-call arguments are attacker-influenced data (a prompt injected by an
+/// A2A peer reaches them), so the schema and the runtime check must not be
+/// two independent lists that can drift apart.
+pub const SOUL_FILE_NAMES: [&str; 3] = ["SOUL.md", "AGENTS.md", "USER.md"];
+
+/// Reject a `file_name` that is not one of [`SOUL_FILE_NAMES`].
+///
+/// The allowlist alone is sufficient — none of the three names contains a path
+/// separator, so `home.join(name)` cannot escape `home` — but the check is
+/// exact-match rather than a traversal heuristic on purpose: `config.toml`,
+/// `rustfox.db`, `skills-lock.json` and `user_model.md` live in the same
+/// directory as the soul files and must stay unreadable through this tool.
+fn validate_soul_file_name(file_name: &str) -> anyhow::Result<()> {
+    if !SOUL_FILE_NAMES.contains(&file_name) {
+        anyhow::bail!(
+            "Invalid soul file name '{}'. Allowed: {}",
+            file_name,
+            SOUL_FILE_NAMES.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Reject a plan `title` that is not usable as a single path component.
+///
+/// A title becomes `<sandbox>/.plans/<title>.json`. It is a name, not a path:
+/// an absolute title makes `Path::join` discard the `.plans` prefix entirely,
+/// and a `../` title walks out of the sandbox.
+fn validate_plan_title(title: &str) -> anyhow::Result<()> {
+    let valid = !title.is_empty()
+        && !title.contains('\0')
+        && !title.contains('/')
+        && !title.contains('\\')
+        && std::path::Path::new(title)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    if !valid {
+        anyhow::bail!(
+            "Invalid plan title '{}': a plan title is a name, not a path \
+             (no path separators, no '..', not absolute)",
+            title
+        );
+    }
+    Ok(())
+}
 
 pub struct BuiltinTools {
     skills_dir: PathBuf,
@@ -192,7 +243,7 @@ impl ToolHandler for BuiltinTools {
                     parameters: json!({
                         "type": "object",
                         "properties": {
-                            "file_name": { "type": "string", "enum": ["SOUL.md", "AGENTS.md", "USER.md"], "description": "Which soul file to read" }
+                            "file_name": { "type": "string", "enum": SOUL_FILE_NAMES, "description": "Which soul file to read" }
                         },
                         "required": ["file_name"]
                     }),
@@ -206,7 +257,7 @@ impl ToolHandler for BuiltinTools {
                     parameters: json!({
                         "type": "object",
                         "properties": {
-                            "file_name": { "type": "string", "enum": ["SOUL.md", "AGENTS.md", "USER.md"], "description": "Which soul file to update" },
+                            "file_name": { "type": "string", "enum": SOUL_FILE_NAMES, "description": "Which soul file to update" },
                             "mode": { "type": "string", "enum": ["append", "replace"], "description": "append or replace content" },
                             "content": { "type": "string", "description": "Content to write" }
                         },
@@ -222,7 +273,7 @@ impl ToolHandler for BuiltinTools {
                     parameters: json!({
                         "type": "object",
                         "properties": {
-                            "file_name": { "type": "string", "enum": ["SOUL.md", "AGENTS.md", "USER.md"], "description": "Which soul file to revert" }
+                            "file_name": { "type": "string", "enum": SOUL_FILE_NAMES, "description": "Which soul file to revert" }
                         },
                         "required": ["file_name"]
                     }),
@@ -302,6 +353,7 @@ impl ToolHandler for BuiltinTools {
             }
             "plan_create" => {
                 let title = args["title"].as_str().context("Missing 'title' argument")?;
+                validate_plan_title(title)?;
                 let plans_dir = ctx.sandbox_dir.join(".plans");
                 tokio::fs::create_dir_all(&plans_dir).await?;
                 let plan_path = plans_dir.join(format!("{}.json", title));
@@ -322,6 +374,7 @@ impl ToolHandler for BuiltinTools {
             }
             "plan_update" => {
                 let title = args["title"].as_str().unwrap_or("default");
+                validate_plan_title(title)?;
                 let step_id = args["step_id"].as_u64().context("Missing 'step_id'")? as usize;
                 let status = args["status"]
                     .as_str()
@@ -352,6 +405,7 @@ impl ToolHandler for BuiltinTools {
             }
             "plan_view" => {
                 let title = args["title"].as_str().unwrap_or("default");
+                validate_plan_title(title)?;
                 let plan_path = ctx
                     .sandbox_dir
                     .join(".plans")
@@ -483,12 +537,16 @@ impl ToolHandler for BuiltinTools {
             }
             "read_soul_file" => {
                 let file_name = args["file_name"].as_str().context("Missing 'file_name'")?;
+                validate_soul_file_name(file_name)?;
                 let home = ctx
                     .home_dir
                     .as_ref()
                     .context("No home directory configured")?;
-                let path =
-                    validate_sandbox_path(home, file_name).unwrap_or_else(|_| home.join(file_name));
+                // A denial is a denial: this used to be
+                // `validate_sandbox_path(home, file_name).unwrap_or_else(|_| home.join(file_name))`,
+                // which turned the containment check into a no-op — the
+                // rejected `../outside.txt` was then joined onto `home` anyway.
+                let path = validate_home_path(home, file_name)?;
                 match tokio::fs::read_to_string(&path).await {
                     Ok(content) => Ok(content),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -499,6 +557,7 @@ impl ToolHandler for BuiltinTools {
             }
             "update_soul_file" => {
                 let file_name = args["file_name"].as_str().context("Missing 'file_name'")?;
+                validate_soul_file_name(file_name)?;
                 let content = args["content"].as_str().context("Missing 'content'")?;
                 let mode = args["mode"].as_str().unwrap_or("append");
 
@@ -516,7 +575,11 @@ impl ToolHandler for BuiltinTools {
                     .home_dir
                     .as_ref()
                     .context("No home directory configured")?;
-                let path = home.join(file_name);
+                // The allowlist above already makes `home.join(file_name)`
+                // safe; validating the resolved path as well keeps the
+                // containment check in one place and fails closed if the
+                // soul file is a symlink out of the home directory.
+                let path = validate_home_path(home, file_name)?;
 
                 let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
 
@@ -624,11 +687,12 @@ impl ToolHandler for BuiltinTools {
             }
             "revert_soul_file" => {
                 let file_name = args["file_name"].as_str().context("Missing 'file_name'")?;
+                validate_soul_file_name(file_name)?;
                 let home = ctx
                     .home_dir
                     .as_ref()
                     .context("No home directory configured")?;
-                let path = home.join(file_name);
+                let path = validate_home_path(home, file_name)?;
                 let bak = {
                     let mut s = path.to_string_lossy().to_string();
                     s.push_str(".bak");
@@ -650,6 +714,11 @@ impl ToolHandler for BuiltinTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cancel_registry::CancelRegistry;
+    use crate::platform::sender::{MessageFormat, PlatformMessageId};
+    use crate::tool_registry::ToolUiMode;
+    use std::path::Path;
+    use tempfile::tempdir;
 
     fn make_tools() -> BuiltinTools {
         BuiltinTools::new(
@@ -658,6 +727,95 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// `ToolContext` demands a sender. None of the tools exercised here send
+    /// anything, so every method is a no-op stub.
+    struct NoopSender;
+
+    #[async_trait]
+    impl PlatformSender for NoopSender {
+        async fn send_message(
+            &self,
+            _chat_id: &str,
+            _text: &str,
+            _format: MessageFormat,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("test:1".to_string())
+        }
+        async fn send_file(
+            &self,
+            _chat_id: &str,
+            _path: &Path,
+            _caption: Option<&str>,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("test:1".to_string())
+        }
+        async fn show_cancel_button(
+            &self,
+            _chat_id: &str,
+            _text: &str,
+            _cancel_id: &str,
+        ) -> anyhow::Result<PlatformMessageId> {
+            Ok("test:1".to_string())
+        }
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &PlatformMessageId,
+            _text: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &PlatformMessageId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn notify_shutdown(&self, _chat_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Invoke a real handler the way `loop_runner` does.
+    async fn exec(
+        tools: &BuiltinTools,
+        name: &str,
+        args: Value,
+        home: &Path,
+        sandbox: &Path,
+    ) -> ToolResult {
+        let ctx = ToolContext {
+            sandbox_dir: sandbox.to_path_buf(),
+            home_dir: Some(home.to_path_buf()),
+            sender: Arc::new(NoopSender),
+            cancel_registry: Arc::new(CancelRegistry::new()),
+            user_id: "test".to_string(),
+            chat_id: "0".to_string(),
+            tool_ui_mode: ToolUiMode::Silent,
+        };
+        tools.execute(name, args, ctx).await
+    }
+
+    /// The text the LLM would see for a tool result — `loop_runner` renders an
+    /// `Err` as `Error: {e}`.
+    fn tool_text(result: &ToolResult) -> String {
+        match result {
+            Ok(text) => text.clone(),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// `(home, sandbox)` with both directories created inside one tempdir.
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let sandbox = dir.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        (dir, home, sandbox)
     }
 
     #[test]
@@ -696,5 +854,397 @@ mod tests {
             assert!(allowed_strs.contains(&"AGENTS.md"));
             assert!(allowed_strs.contains(&"USER.md"));
         }
+    }
+
+    // ── read_soul_file: runtime validation of `file_name` ───────────────────
+    //
+    // The JSON-schema `enum` on `file_name` is a hint to the LLM, not a
+    // server-side constraint: the model (or a prompt injected into it by an
+    // A2A peer) can put anything in the tool-call arguments. These tests drive
+    // the real handler with arguments the schema would never allow.
+
+    #[tokio::test]
+    async fn test_read_soul_file_rejects_arbitrary_file_in_home() {
+        let (_dir, home, sandbox) = fixture();
+        std::fs::write(
+            home.join("config.toml"),
+            "[openrouter]\napi_key = \"SUPERSECRET\"\n",
+        )
+        .unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "read_soul_file",
+            json!({ "file_name": "config.toml" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("SUPERSECRET"),
+            "read_soul_file leaked the OpenRouter API key from config.toml: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "read_soul_file must reject a file_name outside the soul-file allowlist, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_soul_file_rejects_traversal_file_name() {
+        let (dir, home, sandbox) = fixture();
+        std::fs::write(dir.path().join("outside.txt"), "OUTSIDE_CONTENT").unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "read_soul_file",
+            json!({ "file_name": "../outside.txt" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("OUTSIDE_CONTENT"),
+            "read_soul_file escaped the home directory: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "read_soul_file must reject a traversing file_name, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_soul_file_rejects_absolute_file_name() {
+        let (dir, home, sandbox) = fixture();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "OUTSIDE_ABSOLUTE_CONTENT").unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "read_soul_file",
+            json!({ "file_name": outside.to_str().unwrap() }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("OUTSIDE_ABSOLUTE_CONTENT"),
+            "read_soul_file accepted an absolute file_name: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "read_soul_file must reject an absolute file_name, got: {:?}",
+            result
+        );
+    }
+
+    /// A legitimate name is still not a licence to follow a symlink out of the
+    /// home directory. Before the fix the containment check *did* deny this
+    /// path — and `unwrap_or_else` then read it anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_soul_file_rejects_symlink_out_of_home() {
+        let (dir, home, sandbox) = fixture();
+        let target = dir.path().join("outside.md");
+        std::fs::write(&target, "OUTSIDE_SYMLINK_CONTENT").unwrap();
+        std::os::unix::fs::symlink(&target, home.join("SOUL.md")).unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "read_soul_file",
+            json!({ "file_name": "SOUL.md" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("OUTSIDE_SYMLINK_CONTENT"),
+            "read_soul_file followed a symlink out of the home directory: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "read_soul_file must deny a soul file that resolves outside home, got: {:?}",
+            result
+        );
+    }
+
+    /// Regression guard against over-fixing: the three declared names must keep
+    /// working, and each must return its *own* content.
+    #[tokio::test]
+    async fn test_read_soul_file_reads_all_three_legitimate_names() {
+        let (_dir, home, sandbox) = fixture();
+        for name in ["SOUL.md", "AGENTS.md", "USER.md"] {
+            std::fs::write(home.join(name), format!("CONTENT_OF_{name}")).unwrap();
+        }
+
+        let tools = make_tools();
+        for name in ["SOUL.md", "AGENTS.md", "USER.md"] {
+            let result = exec(
+                &tools,
+                "read_soul_file",
+                json!({ "file_name": name }),
+                &home,
+                &sandbox,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read_soul_file('{name}') must succeed: {e}"));
+            assert_eq!(
+                result,
+                format!("CONTENT_OF_{name}"),
+                "read_soul_file('{name}') returned the wrong file"
+            );
+        }
+    }
+
+    /// A legitimate name whose file does not exist must report that, not fall
+    /// back to some other file.
+    #[tokio::test]
+    async fn test_read_soul_file_missing_legitimate_name_reports_missing() {
+        let (_dir, home, sandbox) = fixture();
+        std::fs::write(home.join("AGENTS.md"), "AGENTS_CONTENT").unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "read_soul_file",
+            json!({ "file_name": "USER.md" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        let text = tool_text(&result);
+        assert!(
+            !text.contains("AGENTS_CONTENT"),
+            "a missing soul file must not resolve to a different file: {text}"
+        );
+        assert!(
+            text.contains("does not exist"),
+            "expected a not-found message for a missing soul file, got: {text}"
+        );
+    }
+
+    // ── plan_* : the title is a name, not a path ────────────────────────────
+
+    #[tokio::test]
+    async fn test_plan_view_rejects_absolute_title() {
+        let (dir, home, sandbox) = fixture();
+        std::fs::write(dir.path().join("outside.json"), "OUTSIDE_PLAN_CONTENT").unwrap();
+
+        let tools = make_tools();
+        // `title = "/tmp/.../outside"` → `<title>.json`, and `Path::join` with an
+        // absolute path discards the `.plans` prefix entirely.
+        let result = exec(
+            &tools,
+            "plan_view",
+            json!({ "title": dir.path().join("outside").to_str().unwrap() }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("OUTSIDE_PLAN_CONTENT"),
+            "plan_view read outside the sandbox: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "plan_view must reject an absolute title, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_view_rejects_traversal_title() {
+        let (dir, home, sandbox) = fixture();
+        // `.plans` must exist for the kernel to resolve `..` through it —
+        // without it this test passes vacuously on ENOENT instead of on the
+        // containment check.
+        std::fs::create_dir_all(sandbox.join(".plans")).unwrap();
+        // `sandbox/.plans/../../outside.json` == `<dir>/outside.json`.
+        std::fs::write(dir.path().join("outside.json"), "OUTSIDE_PLAN_CONTENT").unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_view",
+            json!({ "title": "../../outside" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            !tool_text(&result).contains("OUTSIDE_PLAN_CONTENT"),
+            "plan_view escaped the sandbox: {:?}",
+            tool_text(&result)
+        );
+        assert!(
+            result.is_err(),
+            "plan_view must reject a traversing title, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_view_reads_plan_created_with_normal_title() {
+        let (_dir, home, sandbox) = fixture();
+        let tools = make_tools();
+
+        exec(
+            &tools,
+            "plan_create",
+            json!({ "title": "fix the login bug", "steps": ["repro", "patch"] }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("plan_create with a normal title must succeed");
+
+        let viewed = exec(
+            &tools,
+            "plan_view",
+            json!({ "title": "fix the login bug" }),
+            &home,
+            &sandbox,
+        )
+        .await
+        .expect("plan_view with a normal title must succeed");
+
+        assert!(
+            viewed.contains("fix the login bug"),
+            "plan_view did not return the created plan: {viewed}"
+        );
+        assert!(viewed.contains("repro"), "plan steps missing: {viewed}");
+    }
+
+    #[tokio::test]
+    async fn test_plan_create_rejects_escaping_title() {
+        let (dir, home, sandbox) = fixture();
+        let tools = make_tools();
+
+        let result = exec(
+            &tools,
+            "plan_create",
+            json!({ "title": "../../evil", "steps": ["x"] }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "plan_create must reject a traversing title, got: {:?}",
+            result
+        );
+        assert!(
+            !dir.path().join("evil.json").exists(),
+            "plan_create wrote a plan outside the sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_update_rejects_escaping_title() {
+        let (dir, home, sandbox) = fixture();
+        std::fs::create_dir_all(sandbox.join(".plans")).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            r#"{"title":"outside","steps":["a"],"statuses":["todo"]}"#,
+        )
+        .unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "plan_update",
+            json!({ "title": "../../outside", "step_id": 0, "status": "done" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "plan_update must reject a traversing title, got: {:?}",
+            result
+        );
+        let after = std::fs::read_to_string(&outside).unwrap();
+        assert!(
+            after.contains("todo"),
+            "plan_update rewrote a file outside the sandbox: {after}"
+        );
+    }
+
+    // ── the sibling soul tools take the same unvalidated `file_name` ────────
+
+    #[tokio::test]
+    async fn test_update_soul_file_rejects_file_name_outside_home() {
+        let (dir, home, sandbox) = fixture();
+        let tools = make_tools();
+
+        let result = exec(
+            &tools,
+            "update_soul_file",
+            json!({
+                "file_name": "../outside.md",
+                "mode": "replace",
+                "content": "---\nname: pwn\nversion: 1\n---\n\npwned\n"
+            }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "update_soul_file must reject a traversing file_name, got: {:?}",
+            result
+        );
+        assert!(
+            !dir.path().join("outside.md").exists(),
+            "update_soul_file wrote outside the home directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revert_soul_file_rejects_file_name_outside_home() {
+        let (dir, home, sandbox) = fixture();
+        std::fs::write(dir.path().join("outside.md.bak"), "BAK_CONTENT").unwrap();
+
+        let tools = make_tools();
+        let result = exec(
+            &tools,
+            "revert_soul_file",
+            json!({ "file_name": "../outside.md" }),
+            &home,
+            &sandbox,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "revert_soul_file must reject a traversing file_name, got: {:?}",
+            result
+        );
+        assert!(
+            !dir.path().join("outside.md").exists(),
+            "revert_soul_file restored a backup outside the home directory"
+        );
     }
 }
