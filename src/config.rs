@@ -70,9 +70,14 @@ impl Default for SupervisorConfig {
 
 /// A2A (Agent2Agent) protocol settings.
 ///
-/// Disabled by default. Enabling this opens a network listener; read
-/// `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md` §2 and §6
-/// before turning it on.
+/// Disabled by default. Enabling this opens a network listener; read the
+/// *Security Context* and *Security Model* sections of
+/// `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md` before
+/// turning it on.
+///
+/// A peer that authenticates here can drive an agent that holds
+/// `execute_command`, which runs `sh -c` with no validation of the command
+/// string. The defaults below are restrictive for that reason.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct A2aConfig {
@@ -128,9 +133,18 @@ pub struct A2aPeerConfig {
     /// (`192.168.1.0/24`). Empty means no address is allowed.
     #[serde(default)]
     pub ip: Vec<String>,
-    /// Tool allowlist for this peer. `None` applies `DEFAULT_PEER_TOOLS`.
-    /// `Some(["*"])` grants every tool, including shell. An explicit list is
-    /// used verbatim.
+    /// Tool allowlist for this peer. `None` applies the conservative default
+    /// list (`src/a2a/policy.rs`); `Some(["*"])` grants every tool, including
+    /// shell; an explicit list is used verbatim.
+    ///
+    /// # Do not forward this `Option` into `LoopConfig.allowed_tools`
+    ///
+    /// The two `None`s mean opposite things. Here, `None` means *the
+    /// conservative default*. In `LoopConfig.allowed_tools`
+    /// (`src/loop_runner.rs:33`) `None` means *no restriction at all* — every
+    /// tool is offered and executable. Always resolve through
+    /// `policy::resolve_allowed_tools` first, which returns a concrete
+    /// `Vec<String>`.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
 }
@@ -1460,5 +1474,82 @@ tools = ["*"]
         let cfg: Config = toml::from_str(raw).unwrap();
         let peer = cfg.a2a.peers.get("buildbox").unwrap();
         assert_eq!(peer.tools.as_ref().unwrap(), &vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn a2a_peer_without_token_is_a_parse_error() {
+        // `A2aPeerConfig` deliberately lacks the struct-level
+        // `#[serde(default)]` its sibling types carry, which is what makes
+        // `token` required. A peer with no token must fail to parse rather
+        // than silently defaulting to an empty token — an empty configured
+        // token would authenticate any client from an allowlisted address.
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a.peers.laptop]
+ip = ["192.168.1.0/24"]
+"#;
+        assert!(
+            toml::from_str::<Config>(raw).is_err(),
+            "a peer with no token must not parse"
+        );
+    }
+
+    #[test]
+    fn a2a_misspelled_section_leaves_peers_empty() {
+        // `[a2a.peer.x]` (singular) is silently ignored — nothing in this
+        // file uses `deny_unknown_fields`. That fails CLOSED: `peers` stays
+        // empty and nobody can authenticate. This test pins that direction so
+        // a future change cannot turn a typo into an unauthenticated peer.
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a.peer.laptop]
+token = "s3cret"
+ip = ["192.168.1.0/24"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.a2a.peers.is_empty());
+    }
+
+    #[test]
+    fn a2a_explicit_values_override_defaults() {
+        // Without this, a `#[serde(rename)]` or `#[serde(skip)]` slip on any
+        // field would leave the default-value tests green.
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a]
+enabled = true
+bind = "0.0.0.0:9999"
+max_concurrent_tasks = 8
+
+[a2a.card]
+name = "Custom"
+description = "Custom agent"
+version = "9.9.9"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.a2a.enabled);
+        assert_eq!(cfg.a2a.bind, "0.0.0.0:9999");
+        assert_eq!(cfg.a2a.max_concurrent_tasks, 8);
+        assert_eq!(cfg.a2a.card.name, "Custom");
+        assert_eq!(cfg.a2a.card.description, "Custom agent");
+        assert_eq!(cfg.a2a.card.version, "9.9.9");
     }
 }

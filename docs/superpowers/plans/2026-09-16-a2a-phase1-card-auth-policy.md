@@ -625,6 +625,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_configured_token_never_authenticates() {
+        // `parse_bearer` trims, so `Authorization: Bearer ` yields `Some("")`.
+        // Were an empty configured token accepted, that would authenticate any
+        // client from an allowlisted address — the guard in `authenticate`
+        // exists precisely to prevent this.
+        let cfg = cfg_with(vec![("laptop", "", vec!["192.168.1.0/24"])]);
+        assert_eq!(
+            authenticate(&cfg, Some(""), ip("192.168.1.10")),
+            Err(AuthError::InvalidToken)
+        );
+    }
+
+    #[test]
+    fn duplicate_tokens_are_rejected_as_ambiguous() {
+        // Two peers sharing a token would make the applied `ip` allowlist and
+        // `tools` policy depend on `HashMap` iteration order, which is
+        // randomized per process. One peer could silently inherit the other's
+        // policy — potentially `["*"]`, which includes shell.
+        let cfg = cfg_with(vec![
+            ("laptop", "shared", vec!["192.168.1.0/24"]),
+            ("buildbox", "shared", vec!["10.0.0.0/8"]),
+        ]);
+        assert_eq!(
+            authenticate(&cfg, Some("shared"), ip("192.168.1.10")),
+            Err(AuthError::AmbiguousToken)
+        );
+    }
+
+    #[test]
     fn unparseable_ip_entry_does_not_grant_access() {
         let cfg = cfg_with(vec![("laptop", "s3cret", vec!["not-an-ip"])]);
         assert_eq!(
@@ -694,8 +723,17 @@ use subtle::ConstantTimeEq;
 pub enum AuthError {
     /// No `Authorization: Bearer <token>` header was present.
     MissingToken,
-    /// The token matched no configured peer.
+    /// The token matched no configured peer, or matched a peer whose
+    /// configured token is empty.
     InvalidToken,
+    /// More than one peer entry carries the same token.
+    ///
+    /// `peers` is a `HashMap`, whose iteration order is randomized per
+    /// process. With a duplicate token, which peer's `ip` allowlist and
+    /// `tools` policy apply would vary between runs — so one peer could
+    /// silently inherit another's policy, potentially `["*"]`. Denying is the
+    /// only safe response.
+    AmbiguousToken,
     /// The token matched a peer, but the source address is not in that peer's
     /// allowlist.
     IpNotAllowed,
@@ -726,16 +764,28 @@ pub fn authenticate(
 
     // Compare against every peer without early exit so the number of
     // comparisons does not reveal which peer matched.
-    let mut matched: Option<&crate::config::A2aPeerConfig> = None;
-    let mut matched_name = String::new();
+    //
+    // An empty configured token is never accepted. `parse_bearer` trims, so
+    // `Authorization: Bearer ` reduces to `Some("")`; without this guard an
+    // empty configured token would authenticate any client from an
+    // allowlisted address.
+    let mut matched: Option<(&str, &crate::config::A2aPeerConfig)> = None;
+    let mut matches = 0usize;
     for (name, peer) in &cfg.peers {
-        if constant_time_eq(token, &peer.token) {
-            matched = Some(peer);
-            matched_name = name.clone();
+        if !peer.token.is_empty() && constant_time_eq(token, &peer.token) {
+            matches += 1;
+            matched = Some((name.as_str(), peer));
         }
     }
 
-    let peer = matched.ok_or(AuthError::InvalidToken)?;
+    // Two peers sharing a token would make the applied `ip` allowlist and
+    // `tools` policy depend on `HashMap` iteration order, which is randomized
+    // per process. Refuse rather than pick one arbitrarily.
+    if matches > 1 {
+        return Err(AuthError::AmbiguousToken);
+    }
+
+    let (matched_name, peer) = matched.ok_or(AuthError::InvalidToken)?;
 
     if !ip_allowed(source_ip, &peer.ip) {
         return Err(AuthError::IpNotAllowed);
@@ -747,7 +797,7 @@ pub fn authenticate(
     let allowed_tools = crate::a2a::policy::resolve_allowed_tools(peer, &[]);
 
     Ok(PeerIdentity {
-        name: matched_name,
+        name: matched_name.to_string(),
         allowed_tools,
     })
 }
@@ -787,7 +837,7 @@ fn ip_allowed(ip: IpAddr, patterns: &[String]) -> bool {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test --lib a2a::auth 2>&1 | tail -20`
-Expected: PASS, 11 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1210,6 +1260,16 @@ async fn jsonrpc_handler(
         Err(AuthError::InvalidToken) => {
             warn!(peer_ip = %addr.ip(), "A2A request with an unknown token");
             (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        }
+        Err(AuthError::AmbiguousToken) => {
+            // Misconfiguration, not a client error: two peers share a token.
+            // 500 is deliberate so it shows up as a server-side fault rather
+            // than being mistaken for a bad credential.
+            warn!(
+                peer_ip = %addr.ip(),
+                "A2A request refused: two peers share the same token"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({})))
         }
         Err(AuthError::IpNotAllowed) => {
             warn!(peer_ip = %addr.ip(), "A2A peer authenticated from a disallowed address");
