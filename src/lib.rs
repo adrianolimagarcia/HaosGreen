@@ -1,5 +1,6 @@
 #![deny(dead_code)]
 
+pub mod a2a;
 pub mod agent;
 pub mod agent_prompt;
 pub mod builtin_tools;
