@@ -6,7 +6,7 @@ use crate::config::A2aConfig;
 use crate::skills::SkillRegistry;
 use anyhow::{Context, Result};
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -36,10 +36,13 @@ pub fn build_state(config: A2aConfig, skills: SkillRegistry, endpoint_url: &str)
 ///
 /// `/.well-known/agent-card.json` is public by design — A2A clients fetch the
 /// card before authenticating. Every other route requires a valid peer.
+///
+/// A 2 MB body limit is applied to guard against unbounded payloads.
 pub fn router(state: Arc<A2aState>) -> Router {
     Router::new()
         .route("/.well-known/agent-card.json", get(agent_card_handler))
         .route("/jsonrpc", post(jsonrpc_handler))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -110,7 +113,7 @@ async fn jsonrpc_handler(
 
 /// Extract the token from an `Authorization: Bearer <token>` header value.
 fn parse_bearer(header: Option<&str>) -> Option<&str> {
-    let value = header?;
+    let value = header?.trim_start();
     let (scheme, token) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {
         return None;
@@ -211,6 +214,7 @@ mod tests {
     #[test]
     fn parse_bearer_trims_surrounding_whitespace() {
         assert_eq!(parse_bearer(Some("Bearer  s3cret ")), Some("s3cret"));
+        assert_eq!(parse_bearer(Some("  Bearer s3cret")), Some("s3cret"));
     }
 
     #[test]
