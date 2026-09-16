@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use ipnet::IpNet;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -101,6 +103,16 @@ pub struct A2aConfig {
     pub public_url: Option<String>,
     /// Maximum A2A tasks executing concurrently. Excess tasks queue.
     pub max_concurrent_tasks: usize,
+    /// Transport security. Only `"none"` (or an absent key) is accepted:
+    /// TLS is not implemented yet, and anything else is rejected at startup
+    /// rather than silently served as plaintext. Reserved for the TLS phase.
+    pub tls: String,
+    /// Certificate path for TLS. Reserved for the TLS phase; setting it is an
+    /// error today, because the listener would otherwise serve plaintext to an
+    /// operator who believes TLS is on.
+    pub tls_cert: Option<String>,
+    /// Private-key path for TLS. Reserved for the TLS phase; see `tls_cert`.
+    pub tls_key: Option<String>,
     /// Agent Card metadata.
     pub card: A2aCardConfig,
     /// Known peers, keyed by peer name. A request whose token matches no entry
@@ -115,8 +127,131 @@ impl Default for A2aConfig {
             bind: "127.0.0.1:8443".to_string(),
             public_url: None,
             max_concurrent_tasks: 4,
+            tls: "none".to_string(),
+            tls_cert: None,
+            tls_key: None,
             card: A2aCardConfig::default(),
             peers: HashMap::new(),
+        }
+    }
+}
+
+impl A2aConfig {
+    /// Validate the security-relevant parts of the `[a2a]` block.
+    ///
+    /// Every condition checked here already fails closed at request time; the
+    /// point of validating up front is that the failure is *loud* and happens
+    /// once at startup instead of silently on every request. Callers must not
+    /// start the listener when this returns `Err`, but must keep running the
+    /// Telegram bot: an A2A misconfiguration is not a reason to lose the bot.
+    ///
+    /// Peers are visited in name order so that the error reported for a config
+    /// with several problems is stable across runs (`peers` is a `HashMap`,
+    /// whose iteration order is randomized per process).
+    ///
+    /// A non-loopback `bind` is only warned about, never rejected: the design
+    /// allows raising the bind, it just must be a deliberate act.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_tls()?;
+        self.validate_peers()?;
+        self.warn_on_non_loopback_bind();
+        Ok(())
+    }
+
+    /// TLS is documented in the design spec but not implemented. Accepting
+    /// `tls = "rustls"` and then serving plaintext HTTP would be a silent
+    /// downgrade, so any request for it is refused instead.
+    fn validate_tls(&self) -> Result<()> {
+        let mode = self.tls.trim();
+        if !mode.is_empty() && !mode.eq_ignore_ascii_case("none") {
+            bail!(
+                "[a2a].tls = {mode:?} is not supported: TLS is not implemented yet, and \
+                 starting the listener anyway would serve plaintext to a peer that expects \
+                 TLS. Set `tls = \"none\"` (or remove the key) and terminate TLS at a reverse \
+                 proxy in front of this listener."
+            );
+        }
+        if self
+            .tls_cert
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+            || self
+                .tls_key
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+        {
+            bail!(
+                "[a2a].tls_cert / [a2a].tls_key are set but TLS is not implemented yet; the \
+                 listener would serve plaintext. Remove them (or set `tls = \"none\"`) and \
+                 terminate TLS at a reverse proxy in front of this listener."
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_peers(&self) -> Result<()> {
+        let mut names: Vec<&String> = self.peers.keys().collect();
+        names.sort();
+
+        // token -> peer that already claimed it.
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for name in names {
+            let peer = &self.peers[name];
+
+            if peer.token.trim().is_empty() {
+                bail!(
+                    "A2A peer '{name}' has an empty token: it can never authenticate, because \
+                     an empty configured token is refused by design. Give the peer a token or \
+                     remove the block."
+                );
+            }
+            if let Some(other) = seen.insert(peer.token.as_str(), name.as_str()) {
+                bail!(
+                    "A2A peers '{other}' and '{name}' share the same token: a request carrying \
+                     it matches both, so which peer's ip allowlist and tools policy applies \
+                     would depend on HashMap iteration order. Every request is refused with \
+                     500 until one of the two tokens is changed."
+                );
+            }
+            if peer.ip.is_empty() {
+                bail!(
+                    "A2A peer '{name}' has an empty `ip` list: every request from it is refused \
+                     with 403. List at least one IP or CIDR block, or remove the block."
+                );
+            }
+            for entry in &peer.ip {
+                if entry.parse::<IpNet>().is_err() && entry.parse::<IpAddr>().is_err() {
+                    bail!(
+                        "A2A peer '{name}' has an `ip` entry {entry:?} that is neither an IP \
+                         address nor a CIDR block: it is ignored, so it can never match. \
+                         Expected e.g. \"10.0.0.5\" or \"192.168.1.0/24\"."
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn warn_on_non_loopback_bind(&self) {
+        match self.bind.parse::<SocketAddr>() {
+            Ok(addr) if !addr.ip().is_loopback() => {
+                tracing::warn!(
+                    bind = %addr,
+                    "A2A: binding to a non-loopback address exposes the listener beyond this \
+                     host. This is a deliberate act per the design's Security Model: every \
+                     peer must still present a valid token from an allowlisted address."
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    bind = %self.bind,
+                    error = %e,
+                    "A2A: [a2a].bind is not a literal `host:port`; the non-loopback check was \
+                     skipped. Prefer a literal address so this check and the advertised URL are \
+                     exact."
+                );
+            }
         }
     }
 }
@@ -1565,6 +1700,204 @@ version = "9.9.9"
         assert_eq!(cfg.a2a.card.name, "Custom");
         assert_eq!(cfg.a2a.card.description, "Custom agent");
         assert_eq!(cfg.a2a.card.version, "9.9.9");
+    }
+
+    // ---------------------------------------------------------------------
+    // A2A startup validation
+    // ---------------------------------------------------------------------
+
+    /// A2A config with one well-formed peer, as a base for validation tests.
+    fn a2a_cfg() -> A2aConfig {
+        let mut peers = HashMap::new();
+        peers.insert(
+            "laptop".to_string(),
+            A2aPeerConfig {
+                token: "s3cret".to_string(),
+                ip: vec!["192.168.1.0/24".to_string()],
+                tools: None,
+            },
+        );
+        A2aConfig {
+            enabled: true,
+            peers,
+            ..A2aConfig::default()
+        }
+    }
+
+    fn add_peer(cfg: &mut A2aConfig, name: &str, token: &str, ip: &[&str]) {
+        cfg.peers.insert(
+            name.to_string(),
+            A2aPeerConfig {
+                token: token.to_string(),
+                ip: ip.iter().map(|s| s.to_string()).collect(),
+                tools: None,
+            },
+        );
+    }
+
+    #[test]
+    fn a2a_validate_accepts_a_well_formed_config() {
+        a2a_cfg()
+            .validate()
+            .expect("a default-bind config with one valid peer must validate");
+    }
+
+    #[test]
+    fn a2a_validate_accepts_an_empty_peer_map() {
+        // Deny-all is a legitimate configuration (the listener is up, nobody
+        // may connect), so it must not be an error.
+        A2aConfig::default()
+            .validate()
+            .expect("no peers is deny-all, not a misconfiguration");
+    }
+
+    #[test]
+    fn a2a_validate_rejects_duplicate_tokens_naming_both_peers() {
+        let mut cfg = a2a_cfg();
+        add_peer(&mut cfg, "buildbox", "s3cret", &["10.0.0.0/8"]);
+        let err = cfg
+            .validate()
+            .expect_err("two peers sharing a token must not validate")
+            .to_string();
+        assert!(
+            err.contains("buildbox") && err.contains("laptop"),
+            "the error must name both offending peers, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a2a_validate_rejects_an_empty_token() {
+        let mut cfg = a2a_cfg();
+        add_peer(&mut cfg, "typo", "", &["10.0.0.0/8"]);
+        let err = cfg
+            .validate()
+            .expect_err("an empty token can never authenticate")
+            .to_string();
+        assert!(err.contains("typo"), "the error must name the peer: {err}");
+    }
+
+    #[test]
+    fn a2a_validate_treats_a_whitespace_only_token_as_empty() {
+        let mut cfg = a2a_cfg();
+        add_peer(&mut cfg, "typo", "   ", &["10.0.0.0/8"]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn a2a_validate_rejects_an_empty_ip_list() {
+        let mut cfg = a2a_cfg();
+        add_peer(&mut cfg, "noip", "t", &[]);
+        let err = cfg
+            .validate()
+            .expect_err("an empty ip list denies every request silently")
+            .to_string();
+        assert!(err.contains("noip"), "the error must name the peer: {err}");
+    }
+
+    #[test]
+    fn a2a_validate_rejects_an_unparseable_ip_entry() {
+        let mut cfg = a2a_cfg();
+        add_peer(
+            &mut cfg,
+            "laptop",
+            "s3cret",
+            &["192.168.1.0/24", "not-an-ip"],
+        );
+        let err = cfg
+            .validate()
+            .expect_err("an entry that is neither IpNet nor IpAddr is silently ignored")
+            .to_string();
+        assert!(
+            err.contains("not-an-ip") && err.contains("laptop"),
+            "the error must name the peer and the offending entry: {err}"
+        );
+    }
+
+    #[test]
+    fn a2a_validate_accepts_both_ip_and_cidr_entries() {
+        let mut cfg = a2a_cfg();
+        add_peer(&mut cfg, "laptop", "s3cret", &["10.8.0.4", "fd00::/8"]);
+        cfg.validate()
+            .expect("exact IPs and CIDR blocks are both valid entries");
+    }
+
+    #[test]
+    fn a2a_validate_warns_but_accepts_a_non_loopback_bind() {
+        // The design allows raising the bind; it must be deliberate, not
+        // forbidden. Validation therefore returns Ok and only warns.
+        let mut cfg = a2a_cfg();
+        cfg.bind = "0.0.0.0:8443".to_string();
+        cfg.validate()
+            .expect("a non-loopback bind is allowed, it is only warned about");
+    }
+
+    #[test]
+    fn a2a_validate_accepts_a_hostname_bind_it_cannot_check() {
+        // `localhost:8443` binds fine; validation must not reject what
+        // `TcpListener::bind` accepts just because it is not a literal addr.
+        let mut cfg = a2a_cfg();
+        cfg.bind = "localhost:8443".to_string();
+        cfg.validate()
+            .expect("a resolvable hostname bind must validate");
+    }
+
+    #[test]
+    fn a2a_tls_defaults_to_none() {
+        let cfg = minimal_config();
+        assert_eq!(cfg.a2a.tls, "none");
+        assert!(cfg.a2a.tls_cert.is_none());
+        assert!(cfg.a2a.tls_key.is_none());
+    }
+
+    #[test]
+    fn a2a_validate_rejects_a_tls_mode_it_cannot_implement() {
+        // `tls = "rustls"` used to parse cleanly and be discarded, leaving the
+        // listener serving plaintext HTTP to an operator who believed TLS was
+        // on. It must now fail loudly at startup.
+        let raw = r#"
+[telegram]
+bot_token = "x"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "x"
+
+[a2a]
+enabled = true
+tls = "rustls"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.a2a.tls, "rustls",
+            "the key must be captured, not dropped"
+        );
+        let err = cfg
+            .a2a
+            .validate()
+            .expect_err("TLS is not implemented, so requesting it must fail")
+            .to_string();
+        assert!(
+            err.contains("rustls") && err.contains("TLS is not implemented"),
+            "the error must say TLS is not implemented and quote the value: {err}"
+        );
+    }
+
+    #[test]
+    fn a2a_validate_accepts_an_explicit_none_tls_mode() {
+        let mut cfg = a2a_cfg();
+        cfg.tls = "none".to_string();
+        cfg.validate()
+            .expect("`tls = \"none\"` is the documented value");
+    }
+
+    #[test]
+    fn a2a_validate_rejects_cert_and_key_without_a_tls_mode() {
+        // The other silent-downgrade path: cert/key paths present, `tls` left
+        // at its default. The operator believes TLS is on; it is not.
+        let mut cfg = a2a_cfg();
+        cfg.tls_cert = Some("/etc/ssl/cert.pem".to_string());
+        cfg.tls_key = Some("/etc/ssl/key.pem".to_string());
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

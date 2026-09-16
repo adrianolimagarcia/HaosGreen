@@ -444,13 +444,26 @@ async fn main() -> Result<()> {
 
     // A2A listener (Phase 1: Agent Card + authentication only).
     if config.a2a.enabled {
-        // `spawn` binds, then derives the advertised URL from the address it
-        // actually bound, so the Agent Card never advertises port 0 for an
-        // ephemeral bind.
-        if let Err(e) = rustfox::a2a::server::spawn(config.a2a.clone(), a2a_skills).await {
-            // A misconfigured A2A listener must not prevent the Telegram bot
-            // from starting; log loudly and continue.
-            tracing::error!(error = %e, "A2A listener failed to start");
+        // Validate first. Every rule checked here already fails closed at
+        // request time; validating up front turns a silent per-request denial
+        // (or a 500 from duplicate tokens) into one loud startup error. The
+        // listener is not started on failure — but the Telegram bot still is,
+        // because an A2A misconfiguration must not take the bot down.
+        match config.a2a.validate() {
+            Ok(()) => {
+                // `spawn` binds, then derives the advertised URL from the
+                // address it actually bound, so the Agent Card never
+                // advertises port 0 for an ephemeral bind.
+                if let Err(e) = rustfox::a2a::server::spawn(config.a2a.clone(), a2a_skills).await {
+                    tracing::error!(error = %e, "A2A listener failed to start");
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "A2A configuration is invalid; the A2A listener was NOT started"
+                );
+            }
         }
     } else {
         tracing::debug!("A2A disabled");
