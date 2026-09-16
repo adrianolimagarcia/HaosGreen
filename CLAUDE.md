@@ -2,36 +2,32 @@
 
 ## Project Overview
 
-RustFox is a Telegram AI assistant written in Rust. It connects to Telegram as a bot, uses OpenRouter LLM for inference (default model: `qwen/qwen3-235b-a22b`), provides built-in sandboxed tools (file I/O, command execution), and supports MCP (Model Context Protocol) servers for extensible tool integration. It implements an agentic loop that iterates tool calls until a final text response is produced (max iterations configurable, default 25).
+RustFox is a Telegram AI assistant written in Rust. It connects to Telegram as a
+bot, uses OpenRouter for inference (default model `moonshotai/kimi-k2.6`, see
+`default_model()` in `src/config.rs`), provides built-in sandboxed tools plus
+MCP (Model Context Protocol) servers for extensible tool integration, and runs
+an agentic loop that iterates tool calls until a final text response is produced
+(`[agent] max_iterations`, default **25**).
+
+It also carries an autonomous supervisor (see [Supervisor](#supervisor-autopilot-v2))
+and an optional Agent2Agent listener (see [A2A](#a2a-agent2agent-protocol)).
 
 ## Build & Run
 
 ```bash
-# Build (debug)
-cargo build
-
-# Build (release)
+cargo build                 # debug
 cargo build --release
-
-# Run (uses ./config.toml by default)
-cargo run
-
-# Run with custom config path
+cargo run                   # uses ./config.toml
 cargo run -- /path/to/config.toml
-
-# Check without building
 cargo check
-
-# Format code
 cargo fmt
-
-# Lint
 cargo clippy
 ```
 
 ### Configuration
 
-Copy `config.example.toml` to `config.toml` and fill in credentials. The `config.toml` file is gitignored and must never be committed. Required fields:
+Copy `config.example.toml` to `config.toml` and fill in credentials.
+`config.toml` is gitignored and must never be committed. Required fields:
 
 - `telegram.bot_token` - Telegram Bot API token
 - `telegram.allowed_user_ids` - Whitelist of Telegram user IDs
@@ -53,63 +49,128 @@ them using `<home>/skills-lock.json`.
 
 ## Architecture
 
+The crate is both a library (`src/lib.rs`) and a binary (`src/main.rs`).
+`src/lib.rs` carries `#![deny(dead_code)]`, so anything you add must be reachable.
+
 ```
 src/
-├── main.rs      # Entry point: logging init, config loading, MCP setup, bot launch
-├── config.rs    # TOML config parsing (Config, TelegramConfig, OpenRouterConfig, SandboxConfig, McpServerConfig)
-├── llm.rs       # OpenRouter API client (ChatMessage, ToolCall, ToolDefinition, LlmClient)
-├── tools.rs     # Built-in tool definitions and execution with sandbox path validation
-├── mcp.rs       # MCP client manager (McpManager, McpConnection) for external tool servers
-└── bot.rs       # Telegram bot handler: message routing, agentic loop, conversation state
+├── main.rs             # Entry: logging, config load, home resolution, MCP setup,
+│                       #   supervisor wiring, optional A2A listener, Telegram dispatch
+├── lib.rs              # Library root; `#![deny(dead_code)]`
+├── config.rs           # TOML config types (Config, TelegramConfig, OpenRouterConfig,
+│                       #   SandboxConfig, McpServerConfig, A2aConfig, ...) + resolve
+├── home.rs             # Home-directory resolution
+├── llm.rs              # OpenRouter client (ChatMessage, ToolCall, ToolDefinition)
+├── provider.rs         # Provider abstraction over the LLM client
+├── agent.rs            # Agent: system-prompt assembly, loop entry, subagent dispatch
+│                       #   (invoke_agent / spawn_agents), cancel-token registry
+├── agent_prompt.rs     # System-prompt construction
+├── loop_runner.rs      # The agentic loop: tool offering + execution; LoopConfig
+│                       #   (`allowed_tools` filtering lives here)
+├── loop_detector.rs    # Repeated-tool-call detection
+├── conversation.rs     # Per-user conversation state
+├── tool_registry.rs    # Tool registry: handlers, define() -> ToolDefinition
+├── builtin_tools.rs    # Built-in tool definitions AND execution (the real tool impls)
+├── tools.rs            # ONLY path validation: validate_sandbox_path, validate_home_path
+├── command_tool.rs     # Shell-command tool
+├── memory_tools.rs     # search_memory / recall / remember
+├── skill_tools.rs      # read_skill_file / write_skill_file / patch_skill
+├── scheduling_tools.rs # schedule_task and friends
+├── mcp.rs              # MCP client manager; tools namespaced mcp_{server}_{tool}
+├── langsmith.rs        # Optional LangSmith tracing
+├── learning.rs         # Self-learning: skill extraction, user model
+├── memory/             # SQLite store (FTS5 + sqlite-vec), migrations, WAL
+├── skills/             # SkillRegistry: markdown skills with YAML frontmatter
+├── scheduler/          # Cron-style scheduled tasks
+├── setup/              # Setup wizard (includes an axum OAuth callback server)
+├── platform/           # Platform abstraction
+│   ├── mod.rs
+│   ├── sender.rs       # PlatformSender trait
+│   ├── telegram.rs     # teloxide bot: dispatch, handle_message, all bot commands
+│   └── tool_notifier.rs# Friendly per-tool progress messages
+├── a2a/                # Agent2Agent protocol (Phase 1: card + auth + policy)
+│   ├── mod.rs
+│   ├── card.rs         # Agent Card generation (/.well-known/agent-card.json)
+│   ├── auth.rs         # Bearer + IP authentication -> PeerIdentity
+│   ├── policy.rs       # Per-peer tool allowlist (DEFAULT_PEER_TOOLS)
+│   └── server.rs       # axum listener: card route + JSON-RPC endpoint
+├── supervisor/         # Autonomous task runner (see below)
+└── utils/
 ```
 
 ### Data Flow
 
-1. User sends a Telegram message
-2. `bot.rs` filters by `allowed_user_ids`, routes commands (`/start`, `/clear`, `/tools`)
-3. Non-command messages enter `process_with_llm()` which runs the agentic loop
-4. `llm.rs` sends conversation history + tool definitions to OpenRouter
-5. If LLM returns tool calls, `execute_tool()` dispatches to built-in tools or MCP tools
-6. Tool results are appended to conversation and the loop repeats (up to 10 iterations)
-7. Final text response is split into <=4000 char chunks and sent back via Telegram
+1. User sends a Telegram message.
+2. `platform/telegram.rs` filters by `allowed_user_ids` and routes commands
+   (`/start`, `/clear`, `/tools`, `/update-skills`, ...) inside `handle_message`
+   (`src/platform/telegram.rs:669`).
+3. Non-command messages enter the agentic loop (`loop_runner.rs`).
+4. `llm.rs` sends conversation history + tool definitions to OpenRouter.
+5. Tool calls dispatch through `tool_registry.rs` to `builtin_tools.rs` or MCP.
+6. Tool results are appended and the loop repeats (up to `max_iterations`, default 25).
+7. The final text is split into <=4000-char chunks and sent back via Telegram.
 
 ### Key Components
 
-- **AppState** (`bot.rs`): Shared state holding `LlmClient`, `Config`, `McpManager`, and per-user `Conversation` map behind a `Mutex`
-- **LlmClient** (`llm.rs`): Stateless HTTP client for OpenRouter's `/chat/completions` endpoint with tool-calling support
-- **McpManager** (`mcp.rs`): Manages stdio-based MCP server child processes. Tools are namespaced as `mcp_{server_name}_{tool_name}`
-- **Sandbox validation** (`tools.rs`): All file/command operations are restricted to the configured sandbox directory via path canonicalization
+- **Agent** (`agent.rs`): holds the LLM client, config, skill/agent registries and
+  the cancel-token registry; assembles the system prompt and drives the loop.
+- **LlmClient** (`llm.rs`): HTTP client for OpenRouter's `/chat/completions` with
+  tool-calling support.
+- **ToolRegistry** (`tool_registry.rs`): maps tool names to handlers; each handler
+  exposes a `define()` producing the `ToolDefinition` offered to the model.
+- **McpManager** (`mcp.rs`): stdio and streamable-HTTP MCP servers.
+- **Sandbox validation** (`tools.rs`): `validate_sandbox_path` canonicalises the
+  sandbox root and the requested path, then checks containment.
 
 ## Code Conventions
 
 ### Rust Patterns
 
 - **Edition**: 2021
-- **Async runtime**: Tokio with `full` features
-- **Error handling**: `anyhow::Result` throughout, with `.context()` / `.with_context()` for error messages
-- **Logging**: `tracing` crate with `tracing-subscriber` (env filter: `RUST_LOG`, default `info,rustfox=debug`)
-- **Serialization**: `serde` derive macros with `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields
-- **Shared state**: `Arc<AppState>` passed via teloxide's dependency injection (`dptree::deps!`)
-- **Concurrency**: `tokio::sync::Mutex` for per-user conversation map (not `std::sync::Mutex`)
+- **Async runtime**: Tokio (`full` features)
+- **Error handling**: `anyhow::Result` throughout, with `.context()` /
+  `.with_context()` for error messages
+- **Logging**: `tracing` (`RUST_LOG`, default `info,rustfox=debug`)
+- **Serialization**: `serde` derive with
+  `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields
+- **Shared state**: `Arc<Agent>` and friends, passed via teloxide's `dptree`
+  dependency injection
+- **Concurrency**: `tokio::sync::Mutex` / `RwLock`, not the `std::sync` variants
 
 ### Naming
 
-- Module names are single words (`bot`, `config`, `llm`, `mcp`, `tools`)
+- Module names are single words where practical (`config`, `llm`, `mcp`)
 - Struct fields use `snake_case`
-- JSON field renames use `#[serde(rename = "type")]` where the Rust field name differs from the API field
+- JSON field renames use `#[serde(rename = "type")]` where the Rust name differs
 
 ### Error Handling Style
 
-- Use `anyhow::bail!()` for early returns with error messages
-- Use `.context("message")` on `Result` chains for context propagation
-- MCP connection failures are logged but do not abort startup (`connect_all` catches errors)
+- `anyhow::bail!()` for early returns with messages
+- `.context("message")` on `Result` chains
+- MCP connection failures are logged but do not abort startup
 - Tool execution errors return error strings to the LLM rather than crashing
 
-### Security
+## Security
 
-- All file and command operations go through `validate_sandbox_path()` which canonicalizes both the sandbox root and the requested path, then verifies the requested path starts with the sandbox root
-- The bot only responds to user IDs in `allowed_user_ids`
-- `config.toml` (containing secrets) is gitignored
+- File and command operations are contained by `validate_sandbox_path()`
+  (`src/tools.rs`). It canonicalises when the target exists, and otherwise
+  canonicalises the **parent** and re-joins the file name.
+- Tools that read relative to the **home** (not the sandbox) use
+  `validate_home_path()` plus an explicit name allowlist. `read_soul_file`,
+  `update_soul_file` and `revert_soul_file` are restricted to `SOUL_FILE_NAMES`
+  and open with `O_NOFOLLOW`.
+- `plan_create` / `plan_update` / `plan_view` validate the LLM-supplied title and
+  re-establish containment on the resolved path.
+- The bot only responds to user IDs in `telegram.allowed_user_ids`. On the
+  Telegram side this is the **only** access control.
+- `config.toml` (containing secrets) is gitignored.
+
+> **Do not treat "read-only" as "safe".** Two of the worst bugs found in this
+> codebase were read-only tools that reached outside their sandbox:
+> `read_soul_file` could return `~/.rustfox/config.toml` (API key + every peer
+> token) because its JSON-schema `enum` was only an LLM hint, never enforced at
+> runtime. Validate at runtime, on the **resolved path**, and fail closed —
+> never `unwrap_or_else` a validation error into a default path.
 
 ## Dependencies
 
@@ -117,59 +178,83 @@ src/
 |-------|---------|
 | `tokio` | Async runtime |
 | `teloxide` | Telegram bot framework |
-| `reqwest` | HTTP client for OpenRouter API |
+| `reqwest` | HTTP client (OpenRouter, MCP HTTP, integration tests) |
 | `serde` / `serde_json` | Serialization |
-| `toml` | Config file parsing |
-| `rmcp` | Official MCP Rust SDK (stdio transport) |
+| `toml` | Config parsing |
+| `rmcp` | Official MCP Rust SDK |
+| `axum` / `tower-http` | A2A listener; setup wizard's OAuth callback |
+| `a2a` (`a2a-lf`) | A2A protocol types |
+| `ipnet` | CIDR matching for the A2A peer IP allowlist |
+| `subtle` | Constant-time bearer-token comparison |
+| `rusqlite` + `sqlite-vec` | Memory store |
 | `tracing` / `tracing-subscriber` | Structured logging |
 | `anyhow` | Error handling |
 | `futures` | Async utilities |
 
 ## CI (GitHub Actions)
 
-CI runs on every push to `main` and on pull requests targeting `main`. The pipeline is defined in `.github/workflows/ci.yml` and runs five parallel jobs:
+CI runs on every push to `main` and on PRs targeting `main`, defined in
+`.github/workflows/ci.yml`, five parallel jobs:
 
-| Job | Command | Purpose |
-|-----|---------|---------|
-| **Check** | `cargo check` | Fast compilation check |
-| **Format** | `cargo fmt --all -- --check` | Enforces consistent formatting |
-| **Clippy** | `cargo clippy -- -D warnings` | Lint — all warnings are errors |
-| **Test** | `cargo test` | Runs all unit and integration tests |
-| **Build** | `cargo build --release` | Release build (runs after all other jobs pass) |
+| Job | Command |
+|-----|---------|
+| **Check** | `cargo check` |
+| **Format** | `cargo fmt --all -- --check` |
+| **Clippy** | `cargo clippy -- -D warnings` |
+| **Test** | `cargo test` |
+| **Build** | `cargo build --release` (after the others pass) |
 
-All jobs use `dtolnay/rust-toolchain@stable` and `Swatinem/rust-cache@v2` for caching. Before opening a PR, ensure `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` pass locally.
+Before opening a PR, make `cargo fmt`, `cargo clippy --all-targets -- -D warnings`
+and `cargo test` pass locally.
 
 ## Testing
 
-No automated tests exist yet. When adding tests:
+The suite is large and must stay green (~560 unit tests in `src/**` plus 11
+integration files in `tests/`). When adding tests:
 
-- Place unit tests in `#[cfg(test)] mod tests` blocks within each source file
-- Integration tests go in a top-level `tests/` directory
-- The sandbox path validation logic in `tools.rs` and message splitting in `bot.rs` are good candidates for unit tests
+- Unit tests go in `#[cfg(test)] mod tests` blocks in the file under test.
+- Integration tests go in `tests/`.
+- Prefer testing through the public API. For HTTP surfaces, bind an ephemeral
+  port (`127.0.0.1:0`) and make real requests — see `tests/a2a_endpoint.rs`.
+- A test that passes for the wrong reason is worse than no test. When a test
+  guards a security property, **prove it has teeth** by mutating the
+  implementation and confirming the test fails.
 
 ## Common Tasks
 
 ### Adding a new built-in tool
 
-1. Add a `ToolDefinition` entry in `builtin_tool_definitions()` in `src/tools.rs`
-2. Add a match arm in `execute_builtin_tool()` in `src/tools.rs`
-3. Use `validate_sandbox_path()` if the tool accesses the filesystem
+1. Add a `ToolDefinition` in `src/builtin_tools.rs` (the `define()` site).
+2. Add the matching dispatch arm in the same file.
+3. Use `validate_sandbox_path()` (sandbox-relative) or `validate_home_path()`
+   (home-relative) if the tool touches the filesystem. Validate the **resolved**
+   path, not just the supplied name.
+4. Register it in `src/tool_registry.rs`.
+5. **If the tool can read or write outside the sandbox, do not add it to
+   `DEFAULT_PEER_TOOLS` in `src/a2a/policy.rs`.** That list is the A2A default
+   allowlist; adding to it widens what a remote peer can reach.
 
 ### Adding a new bot command
 
-1. Add a new `if text == "/command"` block in `handle_message()` in `src/bot.rs` (before the LLM processing section)
+Add a branch inside `handle_message` in `src/platform/telegram.rs` (the existing
+`/clear`, `/start`, `/tools` branches are the pattern), before the LLM
+processing section.
 
 ### Changing the default LLM model
 
-Update `default_model()` in `src/config.rs`. Users can also override this in their `config.toml`.
+Update `default_model()` in `src/config.rs`. Users can override it in
+`config.toml`.
 
 ### Adding a new MCP server
 
-Add a `[[mcp_servers]]` block to `config.toml` with `name`, `command`, `args`, and optional `env` fields. See `config.example.toml` for examples.
+Add a `[[mcp_servers]]` block to `config.toml` with `name` and either `command`
++ `args` (stdio) or `url` (streamable HTTP), plus optional `env` / `auth_token`.
+See `config.example.toml`.
 
 ### Adding a new bot skill
 
-Bot skills are natural-language instructions loaded at startup and injected into the LLM's system prompt. Each skill must be in its own folder following the Claude agent skills format:
+Skills are natural-language instructions loaded at startup and injected into the
+system prompt. Each lives in its own folder:
 
 ```
 skills/
@@ -178,30 +263,75 @@ skills/
     supporting-file.*  # Optional: templates, examples, reference docs
 ```
 
-**SKILL.md frontmatter:**
 ```yaml
 ---
 name: skill-name       # lowercase letters, numbers, hyphens only
 description: Brief description of what this skill does
-tags: [tag1, tag2]     # optional: for organization
+tags: [tag1, tag2]     # optional
 ---
 ```
 
-1. Create `skills/<skill-name>/SKILL.md` with frontmatter and instruction body
-2. The skill is auto-loaded at startup — no code changes needed
-3. Configure the skills directory in `config.toml`: `[skills] directory = "skills"`
+1. Create `skills/<skill-name>/SKILL.md`.
+2. It is auto-loaded at startup — no code changes needed.
+3. Configure the directory with `[skills] directory` in `config.toml`.
 
-All skills are represented in the system prompt by **metadata only** (name + description). **Instruction skills** (no `model` in frontmatter) have their full content loaded by the agent via `read_skill_file(skill_name="...", relative_path="SKILL.md")` when relevant. **Subagent skills** (`model` set) are invoked via `invoke_agent(agent="name", prompt="...")`. The orchestration skill teaches the agent when to call which subagent and when to override the model (e.g. `model="anthropic/claude-sonnet-4-6"` for thread-writer-hk).
+Skills appear in the system prompt as **metadata only** (name + description).
+**Instruction skills** (no `model` in frontmatter) have their content loaded via
+`read_skill_file(skill_name="...", relative_path="SKILL.md")` when relevant.
+**Subagent skills** (`model` set) are invoked via
+`invoke_agent(agent="name", prompt="...")`.
 
-**Subagent tool whitelist:** For subagent skills, the frontmatter `tools:` list must use the **exact** tool names as seen by the agent. MCP tools are named `mcp_{server_name}_{tool_name}` (e.g. `mcp_google-workspace_query_gmail_emails`). These names are logged at startup when MCP servers connect (`MCP server 'X' provides N tools`). A mismatch (e.g. declaring `search_gmail_messages` when the server exposes `query_gmail_emails`) causes the subagent to have no access to that tool.
+**Subagent tool whitelist:** the frontmatter `tools:` list must use the **exact**
+tool names as seen by the agent. MCP tools are named
+`mcp_{server_name}_{tool_name}`. Names are logged at startup when MCP servers
+connect. A mismatch (e.g. `search_gmail_messages` when the server exposes
+`query_gmail_emails`) silently leaves the subagent without that tool.
 
-**Daily News to Threads flow:** The `daily-news-to-threads` orchestration skill (instruction) directs the main agent to: (1) call the `news-fetcher` subagent (default model) to get AI news from Gmail Google 快訊, (2) call the `thread-writer-hk` subagent with model override to write a HK-style Threads thread with verified links, (3) post the thread via Threads MCP and report success. Requires Gmail (google-workspace), fetch, and threads MCP servers in config.
+**Note:** `invoke_agent` and `spawn_agents` are **not** registry tools — a
+circular dependency prevents registering them (see `src/agent.rs:1306`); they
+dispatch through a `special_tool_handler` closure instead.
+
+## A2A (Agent2Agent) protocol
+
+Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs`
+starts an axum listener alongside the Telegram bot. Phase 1 implements the Agent
+Card, authentication and the per-peer tool policy; there is **no task executor
+yet**, so `/jsonrpc` authenticates and then returns **501**.
+
+- `GET /.well-known/agent-card.json` — **public**, no auth. Lists skills by
+  name/description/tags only; instruction bodies are never included.
+- `POST /jsonrpc` — requires a per-peer bearer token **and** a source IP matching
+  the same peer. 401 (bad/absent token), 403 (IP not allowed), 500 (duplicate
+  tokens), 501 (Phase 1 stub).
+
+Config lives in `[a2a]`, `[a2a.card]` and `[a2a.peers.<name>]`; see
+`config.example.toml`. `A2aConfig::validate()` runs at startup and refuses to
+start the listener on duplicate tokens, an empty token, an empty `ip` list, an
+unparseable IP/CIDR, or any request for TLS (not implemented — rejected rather
+than silently served as plaintext). A listener failure never prevents the
+Telegram bot from starting.
+
+Design spec: `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md`.
+Phase 1 plan: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-policy.md`.
+
+> **Security invariants — do not weaken without a written reason:**
+> - `DEFAULT_PEER_TOOLS` (`src/a2a/policy.rs`) is an **allowlist**. A tool added
+>   to RustFox is *not* granted to peers until it is named there.
+> - `read_soul_file` and `plan_view` are deliberately excluded: `read_soul_file`
+>   can reach `~/.rustfox/config.toml`, which holds the API key and every peer
+>   token. Do not add them back.
+> - `["*"]` expands to the **registry's** tool set, never a hand-written list.
+> - An empty configured token never authenticates, and duplicate tokens are
+>   refused rather than resolved by `HashMap` iteration order.
+> - The card's advertised URL must come from the address actually bound (or
+>   `public_url`), never the raw `bind` string.
 
 ## Files Not to Commit
 
 - `config.toml` - Contains API keys and tokens
 - `.env` - Environment variables
 - `/target/` - Build artifacts
+- `.measure/` - Local benchmark artifacts
 
 ## Supervisor (Autopilot v2)
 
