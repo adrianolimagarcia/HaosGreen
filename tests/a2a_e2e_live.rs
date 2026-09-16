@@ -43,8 +43,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
+
+use a2a::errors::A2AError;
+use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
+use a2a::types::{Task, TaskState, TaskStatus};
+use a2a_server::{AgentExecutor, ExecutorContext};
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use rustfox::a2a::server::{build_state, router};
 use rustfox::a2a::{A2aExecutor, SqliteTaskStore};
 use rustfox::agent::Agent;
@@ -136,7 +144,72 @@ impl PlatformSender for NoopSender {
     }
 }
 
-/// Write a self-contained config into `dir` and return its path.
+struct ServerGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct SlowExecutor {
+    cancel: CancellationToken,
+    observed_cancel: Arc<tokio::sync::Notify>,
+}
+
+impl AgentExecutor for SlowExecutor {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        let cancel = self.cancel.clone();
+        let observed_cancel = Arc::clone(&self.observed_cancel);
+        let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: ctx.task_id.clone(),
+            context_id: ctx.context_id.clone(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        let canceled = Task {
+            id: ctx.task_id,
+            context_id: ctx.context_id,
+            status: TaskStatus {
+                state: TaskState::Canceled,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: ctx.stored_task.and_then(|task| task.history),
+            metadata: None,
+        };
+        Box::pin(
+            futures::stream::once(async move { Ok(working) }).chain(futures::stream::once(
+                async move {
+                    cancel.cancelled().await;
+                    // The terminal event belongs to execute, and this ack proves
+                    // execution—not cancel—observed the cancellation signal.
+                    observed_cancel.notify_one();
+                    Ok(StreamResponse::Task(canceled))
+                },
+            )),
+        )
+    }
+
+    fn cancel(
+        &self,
+        _ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+        // Do not emit a terminal task here: doing so could make CancelTask pass
+        // even if execute never observes cancellation or persists its result.
+        self.cancel.cancel();
+        Box::pin(futures::stream::empty())
+    }
+}
+
 ///
 /// `[general].home` is an absolute path inside `dir`, so `Config::resolve`
 /// materializes the whole home tree under the temp directory and no global
@@ -332,14 +405,14 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
         .await
         .expect("bind an ephemeral loopback port");
     let addr = listener.local_addr().expect("read the bound address");
-    let server = tokio::spawn(async move {
+    let _server = ServerGuard(tokio::spawn(async move {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .expect("the A2A listener must not fail");
-    });
+    }));
     println!("A2A listener: http://{addr}/jsonrpc");
 
     // The model can take ~20s, and `DefaultRequestHandler::send_message` blocks
@@ -441,7 +514,138 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
          empty-response fallback: {agent_reply:?}"
     );
     println!("agent reply: {agent_reply:?}");
-    println!("task id: {}", task["id"]);
+    let task_id = task["id"]
+        .as_str()
+        .expect("the result task must have an id")
+        .to_string();
+    let get = client
+        .post(format!("http://{addr}/jsonrpc"))
+        .bearer_auth(PEER_TOKEN)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "GetTask",
+            "params": {"id": task_id}
+        }))
+        .send()
+        .await
+        .expect("GetTask must complete");
+    let get_body: serde_json::Value = get.json().await.expect("GetTask must be JSON");
+    assert_eq!(get_body["result"]["id"], task_id);
+    assert_eq!(get_body["result"]["status"]["state"], TASK_STATE_COMPLETED);
 
-    server.abort();
+    let bogus = client
+        .post(format!("http://{addr}/jsonrpc"))
+        .bearer_auth(PEER_TOKEN)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "GetTask",
+            "params": {"id": "bogus-task-id"}
+        }))
+        .send()
+        .await
+        .expect("bogus GetTask must complete");
+    let bogus_body: serde_json::Value = bogus.json().await.expect("error must be JSON");
+    assert_eq!(bogus_body["error"]["code"], -32001);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires RUSTFOX_A2A_LIVE=1"]
+async fn an_in_progress_task_can_be_canceled() {
+    if std::env::var("RUSTFOX_A2A_LIVE").as_deref() != Ok("1") {
+        println!("SKIP: RUSTFOX_A2A_LIVE is not set to 1");
+        return;
+    }
+    let cancel = CancellationToken::new();
+    let observed_cancel = Arc::new(tokio::sync::Notify::new());
+    let observed_cancel_for_test = Arc::clone(&observed_cancel);
+    let state = build_state(
+        a2a_config(),
+        SkillRegistry::new(),
+        "http://placeholder",
+        SlowExecutor {
+            cancel: cancel.clone(),
+            observed_cancel,
+        },
+        a2a_server::InMemoryTaskStore::new(),
+    );
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener address");
+    let _server = ServerGuard(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("A2A listener must not fail");
+    }));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build the HTTP client");
+    let endpoint = format!("http://{addr}/jsonrpc");
+    let start = client.post(&endpoint).bearer_auth(PEER_TOKEN).json(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 10, "method": "SendMessage",
+        "params": {"message": {"messageId": "cancel-m1", "role": "ROLE_USER", "parts": [{"text": "wait"}]}, "configuration": {"returnImmediately": true}}
+    })).send().await.expect("SendMessage must return");
+    let body: serde_json::Value = start.json().await.expect("JSON response");
+    let task_id = body["result"]["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    assert_eq!(
+        body["result"]["task"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+    let cancel = client
+        .post(&endpoint)
+        .bearer_auth(PEER_TOKEN)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 11, "method": "CancelTask", "params": {"id": task_id}
+        }))
+        .send()
+        .await
+        .expect("CancelTask must return");
+    let cancel_status = cancel.status();
+    let cancelled: serde_json::Value = cancel.json().await.expect("JSON response");
+    assert_eq!(cancel_status, reqwest::StatusCode::OK);
+    assert!(
+        cancelled.get("error").is_none() || cancelled["error"].is_null(),
+        "CancelTask must return successfully: {cancelled}"
+    );
+    assert_eq!(cancelled["result"]["id"], task_id);
+
+    // The cancel response is not the proof of cancellation: execute owns the
+    // terminal event. Wait for its acknowledgement before checking persistence.
+    tokio::time::timeout(Duration::from_secs(5), observed_cancel_for_test.notified())
+        .await
+        .expect("execute must observe the cancellation signal");
+
+    // Poll until execute's terminal event has been persisted. The CancelTask
+    // response can still report WORKING because SlowExecutor::cancel is empty.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let task = loop {
+        let get = client
+            .post(&endpoint)
+            .bearer_auth(PEER_TOKEN)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 12, "method": "GetTask", "params": {"id": task_id}
+            }))
+            .send()
+            .await
+            .expect("GetTask after CancelTask must return");
+        let get_status = get.status();
+        let task: serde_json::Value = get.json().await.expect("GetTask response must be JSON");
+        assert_eq!(get_status, reqwest::StatusCode::OK);
+        assert_eq!(task["result"]["id"], task_id);
+        if task["result"]["status"]["state"] == "TASK_STATE_CANCELED" {
+            break task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "persisted task did not reach TASK_STATE_CANCELED: {task}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(task["result"]["status"]["state"], "TASK_STATE_CANCELED");
 }
