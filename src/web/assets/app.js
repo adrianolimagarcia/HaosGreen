@@ -1,13 +1,14 @@
 /*
- * HaosGreen dashboard client (shell, design system, settings, chat).
+ * HaosGreen dashboard client (shell, design system, settings, chat, supervisor).
  *
  * Two rules hold everywhere in this file.
  *
  *  * No dynamic string is ever parsed as markup. Elements are built with
  *    `createElement`, values from the server and from the operator are written
- *    with `textContent`, and `innerHTML` does not appear in this file at all —
- *    not even for the icons, which are `<symbol>`s in index.html instantiated
- *    by cloning a `<template>`.
+ *    with `textContent`, and no markup is ever assigned from a string — not
+ *    even for the icons, which are `<symbol>`s in index.html instantiated by
+ *    cloning a `<template>`. The invariant is grep-checkable: the assignment
+ *    that would break it does not occur in this file.
  *  * Nothing leaves this origin. `api()` is the only network entry point and it
  *    only ever fetches a path on the server that served this page, so the
  *    dashboard renders identically with networking disabled.
@@ -15,8 +16,10 @@
  * Chat streams a real agent run over SSE. `EventSource` cannot be used for it
  * — the request is a POST with a JSON body — so the response is read through
  * `fetch`'s `ReadableStream` and the SSE frames are reassembled by hand; see
- * the decoder below. Supervisor, Logs and A2A are still deliberate empty
- * states: a stub that invented rows would be worse than an honest "not yet".
+ * the decoder below. The supervisor view lists real tasks and drives their
+ * lifecycle through `/api/supervisor/*`. Logs and A2A are still deliberate
+ * empty states: a stub that invented rows would be worse than an honest "not
+ * yet".
  */
 
 (function () {
@@ -45,7 +48,8 @@
     "/supervisor": {
       title: "Supervisor",
       icon: "i-shield",
-      body: "Supervisor will list the most recent autonomous tasks and let you pause, resume, cancel or approve them."
+      // Implemented: the supervisor view is built by `renderSupervisor`.
+      body: ""
     },
     "/logs": {
       title: "Logs",
@@ -248,8 +252,11 @@
     state.allowDraft = [];
     // The chat transcript belongs to the session that just ended: the server's
     // session store is keyed per web session, so keeping it on screen would
-    // show the next operator a conversation they cannot reach.
+    // show the next operator a conversation they cannot reach. The supervisor
+    // view is torn down for the same reason — its poll timer must not keep
+    // reading the task list for a signed-out browser.
     resetChat();
+    supervisorUnmount();
     renderBanner();
     byId("app").hidden = true;
     byId("login-overlay").hidden = false;
@@ -385,13 +392,17 @@
     const host = byId("view");
     // Every view owns the whole panel, so the previous one is torn down first —
     // including the chat view's DOM references, which a run that outlives the
-    // view would otherwise keep writing into.
+    // view would otherwise keep writing into, and the supervisor view's poll
+    // timer, which must not survive a route change.
     chatUnmount();
+    supervisorUnmount();
     clear(host);
     if (route === "/settings") {
       renderSettings(host);
     } else if (route === "/chat") {
       renderChat(host);
+    } else if (route === "/supervisor") {
+      renderSupervisor(host);
     } else {
       renderStub(host, route);
     }
@@ -2367,6 +2378,1361 @@
     chat.follow = true;
     chat.loadToken += 1;
     chatUnmount();
+  }
+
+  /* ── Supervisor ────────────────────────────────────────────────────────── */
+
+  /*
+   * The supervisor surface (design spec §5.2, plan Task 16).
+   *
+   * Four properties here are deliberate, and each is a consequence of what the
+   * server actually does rather than of what would look best:
+   *
+   *  * The listing is polled every five seconds only while this view is mounted
+   *    and the document is visible. `supervisorUnmount` clears the timer on
+   *    every route change and `visibilitychange` clears it for a background
+   *    tab, so a dashboard left open elsewhere is not a permanent reader of the
+   *    supervisor's store.
+   *  * The four action buttons mirror the server's state machine exactly
+   *    (`LIFECYCLE_ACTIONS`), so the operator cannot click an action that is
+   *    certain to be refused. That is a convenience, not a guarantee: the state
+   *    can move between the render and the click, so a refusal is still handled
+   *    and the server's own 409 sentence is shown inline — never via `alert()`.
+   *  * `submit` classifies, routes and returns. Nothing runs. The copy in the
+   *    submit card and in the outcome panel says so, because from the outside a
+   *    task parked in `ROUTE` looks exactly like a queued one.
+   *  * `cancel` records `state -> Cancelled` and nothing else: the route holds
+   *    no cancellation token for work already in flight. The note next to the
+   *    button says that instead of implying the job stops.
+   */
+
+  /** How often the task list is re-read while this view is on screen. */
+  const SUPERVISOR_POLL_MS = 5000;
+
+  /**
+   * The lifecycle actions, in the order they are offered.
+   *
+   * `from` is copied from `Action::permitted_from` in
+   * `src/web/routes/supervisor.rs`, which is `transition_allowed` from
+   * `src/supervisor/state.rs` — plus a stricter `resume`, which the supervisor
+   * itself limits to a `PAUSED` task. Two consequences are deliberate rather
+   * than oversights: `approve` is offered on a `PAUSED` task (`Paused ->
+   * Execute` is a legal edge and the server accepts it), and `cancel` is
+   * refused from `VERIFY`, `REPORT`, `ARCHIVE`, `DONE`, `FAILED` and
+   * `CLASSIFY`, none of which has an edge to `CANCELLED`.
+   */
+  const LIFECYCLE_ACTIONS = [
+    {
+      key: "approve",
+      label: "Approve",
+      past: "approved",
+      icon: "i-check",
+      className: "btn btn-accent",
+      from: ["ROUTE", "CLARIFY", "PAUSED"]
+    },
+    {
+      key: "resume",
+      label: "Resume",
+      past: "resumed",
+      icon: "i-play",
+      className: "btn",
+      from: ["PAUSED"]
+    },
+    {
+      key: "pause",
+      label: "Pause",
+      past: "paused",
+      icon: "i-pause",
+      className: "btn",
+      from: ["ROUTE", "PLAN", "PREPAREWORKSPACE", "EXECUTE"]
+    },
+    {
+      key: "cancel",
+      label: "Cancel",
+      past: "cancelled",
+      icon: "i-stop",
+      className: "btn btn-stop",
+      from: [
+        "INTAKE",
+        "ROUTE",
+        "CLARIFY",
+        "PLAN",
+        "PREPAREWORKSPACE",
+        "EXECUTE",
+        "REVIEW",
+        "PAUSED"
+      ]
+    }
+  ];
+
+  /** The chip colour bucket per state. The chip's text always names the state. */
+  const STATE_BUCKETS = {
+    INTAKE: "running",
+    CLASSIFY: "running",
+    PLAN: "running",
+    PREPAREWORKSPACE: "running",
+    EXECUTE: "running",
+    REVIEW: "running",
+    VERIFY: "running",
+    REPORT: "running",
+    ARCHIVE: "running",
+    ROUTE: "attention",
+    CLARIFY: "attention",
+    PAUSED: "paused",
+    DONE: "done",
+    FAILED: "failed",
+    CANCELLED: "cancelled"
+  };
+
+  /** `JobStatus`, which serialises lowercase and is a different enum. */
+  const JOB_STATUS_BUCKETS = {
+    pending: "running",
+    running: "running",
+    succeeded: "done",
+    failed: "failed",
+    cancelled: "cancelled"
+  };
+
+  /**
+   * The supervisor view's model.
+   *
+   * `dom` is null whenever the view is unmounted, and every DOM write is
+   * guarded on it: a listing that arrives after the operator navigated away
+   * must not write into a panel that is gone. `selectedId` survives a route
+   * change so returning to the view restores the open task.
+   */
+  const supervisor = {
+    /** `{ id, title, state, taskType, risk, priority }` rows, as the server orders them. */
+    tasks: [],
+    selectedId: null,
+    /** The last detail body, or null while it is loading or unread. */
+    detail: null,
+    /** The last submit result, or null before the first submit. */
+    outcome: null,
+    dom: null,
+    /** The poll interval handle, or null when polling is stopped. */
+    timer: null,
+    listBusy: false,
+    /** What the list currently renders, so an unchanged poll does not rebuild it. */
+    listSignature: null,
+    /** Bumped per detail read so a slow response cannot overwrite a newer one. */
+    detailToken: 0,
+    actionBusy: false,
+    /** True once the server has answered 503: polling a missing supervisor is pointless. */
+    unavailable: false
+  };
+
+  /* ── Supervisor: small helpers ─────────────────────────────────────────── */
+
+  function numberOr(value, fallback) {
+    return typeof value === "number" && isFinite(value) ? value : fallback;
+  }
+
+  /**
+   * A state as a lookup key.
+   *
+   * `TaskStatus` serialises with serde's `rename_all = "UPPERCASE"`, which
+   * upper-cases the variant name without inserting separators — so
+   * `PrepareWorkspace` reaches the browser as `PREPAREWORKSPACE`, not
+   * `PREPARE_WORKSPACE`. Punctuation is stripped here so either spelling lands
+   * on the same key. A state this build does not know still renders: it gets
+   * the neutral chip and no enabled action rather than a crash.
+   */
+  function stateKey(value) {
+    return typeof value === "string" ? value.replace(/[^A-Za-z0-9]/g, "").toUpperCase() : "";
+  }
+
+  function stateText(value) {
+    return typeof value === "string" && value !== "" ? value : "UNKNOWN";
+  }
+
+  function stateBucket(value) {
+    return STATE_BUCKETS[stateKey(value)] || "unknown";
+  }
+
+  function chipClass(bucket, extraClass) {
+    return "chip chip-" + bucket + (extraClass ? " " + extraClass : "");
+  }
+
+  function chipFor(bucket, text, extraClass) {
+    return make("span", chipClass(bucket, extraClass), text);
+  }
+
+  function stateChip(value, extraClass) {
+    return chipFor(stateBucket(value), stateText(value), extraClass);
+  }
+
+  function jobStatusChip(value) {
+    const key = typeof value === "string" ? value.toLowerCase() : "";
+    const text = typeof value === "string" && value !== "" ? value.toUpperCase() : "UNKNOWN";
+    return chipFor(JOB_STATUS_BUCKETS[key] || "unknown", text);
+  }
+
+  /** A small unemphasised pill, used for the non-state facts on a row. */
+  function metaChip(text, extraClass) {
+    return make("span", "tag" + (extraClass ? " " + extraClass : ""), text);
+  }
+
+  /** `code_change` -> `Code Change`; an unknown token is shown as it arrived. */
+  function humanizeToken(value) {
+    if (typeof value !== "string" || value === "") {
+      return "unknown";
+    }
+    const words = value.split(/[^A-Za-z0-9]+/);
+    const out = [];
+    for (let i = 0; i < words.length; i += 1) {
+      if (words[i] === "") {
+        continue;
+      }
+      out.push(words[i].charAt(0).toUpperCase() + words[i].slice(1));
+    }
+    return out.length > 0 ? out.join(" ") : "unknown";
+  }
+
+  function buttonWithIcon(label, className, iconName) {
+    const node = button(label, className, "button");
+    node.insertBefore(icon(iconName), node.firstChild);
+    return node;
+  }
+
+  function clockTime() {
+    const now = new Date();
+    const pad = function (value) {
+      return value < 10 ? "0" + value : String(value);
+    };
+    return pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
+  }
+
+  /** A bounded, never-throwing rendering of a JSON value from the server. */
+  function compactJson(value, limit) {
+    if (value === null || value === undefined) {
+      return "";
+    }
+    let text;
+    try {
+      text = JSON.stringify(value);
+    } catch (ignored) {
+      return "";
+    }
+    if (typeof text !== "string" || text === "" || text === "null") {
+      return "";
+    }
+    return text.length > limit ? text.slice(0, limit) + "…" : text;
+  }
+
+  /* ── Supervisor: wire types ────────────────────────────────────────────── */
+
+  /** The `{ tasks: [...] }` body, as renderable rows. */
+  function normalizeTasks(body) {
+    const raw = Array.isArray(body) ? body : body && Array.isArray(body.tasks) ? body.tasks : [];
+    const tasks = [];
+    for (let i = 0; i < raw.length; i += 1) {
+      const entry = raw[i];
+      if (!entry || typeof entry.id !== "string" || entry.id === "") {
+        continue;
+      }
+      tasks.push({
+        id: entry.id,
+        title: stringOr(entry.title, "(untitled task)"),
+        state: stateText(entry.state),
+        taskType: stringOr(entry.task_type, "unknown"),
+        risk: stringOr(entry.risk_level, "unknown"),
+        priority: numberOr(entry.priority, null)
+      });
+    }
+    return tasks;
+  }
+
+  /** The detail body. Each part is read defensively: one bad field must not blank the panel. */
+  function normalizeDetail(body) {
+    const value = body && typeof body === "object" ? body : {};
+    return {
+      task: value.task && typeof value.task === "object" ? value.task : null,
+      jobs: Array.isArray(value.jobs) ? value.jobs : [],
+      transitions: Array.isArray(value.transitions) ? value.transitions : [],
+      artifacts: Array.isArray(value.artifacts) ? value.artifacts : []
+    };
+  }
+
+  function normalizeOutcome(body) {
+    const value = body && typeof body === "object" ? body : {};
+    return {
+      taskId: stringOr(value.task_id, ""),
+      outcome: stringOr(value.outcome, ""),
+      state: typeof value.state === "string" ? value.state : "",
+      question: stringOr(value.question, ""),
+      reason: stringOr(value.reason, "")
+    };
+  }
+
+  /* ── Supervisor: submit ────────────────────────────────────────────────── */
+
+  function submitCard() {
+    const card = make("section", "card");
+    card.appendChild(cardHead("i-shield", "Submit a task"));
+
+    const note = make("p", "card-note");
+    note.appendChild(
+      document.createTextNode(
+        "The supervisor classifies the request, picks a plan and stops there. "
+      )
+    );
+    note.appendChild(make("strong", null, "Nothing runs until you approve the plan."));
+    card.appendChild(note);
+
+    const form = make("form", "stack sup-form");
+    form.noValidate = true;
+
+    const label = make("label", "field-label", "What should the supervisor do?");
+    label.setAttribute("for", "sup-input");
+    form.appendChild(label);
+
+    const input = document.createElement("textarea");
+    input.className = "sup-input";
+    input.id = "sup-input";
+    input.name = "sup-input";
+    input.rows = 3;
+    input.placeholder = "e.g. summarise CHANGELOG.md into a release note";
+    input.spellcheck = false;
+    form.appendChild(input);
+
+    const actions = make("div", "actions");
+    const send = button("Submit", "btn btn-accent", "submit");
+    actions.appendChild(send);
+    form.appendChild(actions);
+
+    const status = make("p", "status");
+    status.setAttribute("role", "status");
+    status.hidden = true;
+    form.appendChild(status);
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      submitSupervisorTask(input.value);
+    });
+
+    // Ctrl/Cmd+Enter submits from inside the textarea. Plain Enter is left
+    // alone: a request is often more than one line.
+    input.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey)) {
+        return;
+      }
+      event.preventDefault();
+      submitSupervisorTask(input.value);
+    });
+
+    card.appendChild(form);
+
+    const outcome = make("div", "sup-outcome");
+    card.appendChild(outcome);
+
+    return { card: card, form: form, input: input, send: send, status: status, outcome: outcome };
+  }
+
+  async function submitSupervisorTask(raw) {
+    const dom = supervisor.dom;
+    if (!dom || dom.submit.send.disabled) {
+      return;
+    }
+    const text = typeof raw === "string" ? raw.trim() : "";
+    if (text === "") {
+      // The server answers 400 for this; refusing here saves a round trip and
+      // keeps the message next to the field either way.
+      setStatus(dom.submit.status, "error", "Enter the request before submitting.");
+      return;
+    }
+
+    setStatus(dom.submit.status, null, "");
+    dom.submit.send.disabled = true;
+    dom.submit.send.textContent = "Submitting…";
+    try {
+      const body = await api("/api/supervisor/tasks", {
+        method: "POST",
+        body: { text: text }
+      });
+      dom.submit.input.value = "";
+      supervisor.outcome = normalizeOutcome(body);
+      paintOutcome();
+      await refreshTasks();
+    } catch (error) {
+      if (error && error.status === 401) {
+        handleFailure(error, dom.submit.status, "");
+        return;
+      }
+      setStatus(dom.submit.status, "error", submitFailureMessage(error));
+    } finally {
+      dom.submit.send.disabled = false;
+      dom.submit.send.textContent = "Submit";
+    }
+  }
+
+  function submitFailureMessage(error) {
+    if (!error) {
+      return "The task could not be submitted.";
+    }
+    if (error.status === 503) {
+      return "This dashboard was started without a supervisor, so nothing can be submitted.";
+    }
+    if (error.status === 400) {
+      return error.message || "The task text must not be empty.";
+    }
+    return error.message || "The task could not be submitted.";
+  }
+
+  function outcomeTitle(result) {
+    if (result.outcome === "needs_approval") {
+      return "Parked — this task needs your approval";
+    }
+    if (result.outcome === "needs_clarification") {
+      return "Parked — the supervisor needs an answer";
+    }
+    if (result.outcome === "auto_execute_planned") {
+      return "Plan ready — nothing has run yet";
+    }
+    return "Submitted";
+  }
+
+  function outcomeBody(result) {
+    if (result.outcome === "needs_approval") {
+      return (
+        "The task is not queued and is not running. It is held in state " +
+        stateText(result.state) +
+        " until you approve it, and it will not start on its own."
+      );
+    }
+    if (result.outcome === "needs_clarification") {
+      return (
+        "The task is not queued and is not running. It is held in state " +
+        stateText(result.state) +
+        " waiting for an answer. This dashboard has no way to answer a " +
+        "clarification, so the task stays here until it is cancelled."
+      );
+    }
+    if (result.outcome === "auto_execute_planned") {
+      return (
+        "The request was classified and a plan was picked. Submitting does not " +
+        "execute anything: the task is parked in state " +
+        stateText(result.state) +
+        " and runs only when you press Approve."
+      );
+    }
+    return "The task was created in state " + stateText(result.state) + ".";
+  }
+
+  function paintOutcome() {
+    const dom = supervisor.dom;
+    if (!dom) {
+      return;
+    }
+    clear(dom.submit.outcome);
+
+    const result = supervisor.outcome;
+    if (!result) {
+      return;
+    }
+
+    const block = make("div", "parked");
+    block.setAttribute("role", "status");
+
+    const head = make("div", "parked-head");
+    head.appendChild(icon("i-shield", "icon-lg"));
+    head.appendChild(make("h3", "parked-title", outcomeTitle(result)));
+    head.appendChild(stateChip(result.state));
+    block.appendChild(head);
+
+    block.appendChild(make("p", "parked-body", outcomeBody(result)));
+
+    if (result.reason !== "") {
+      const reason = make("p", "parked-detail");
+      reason.appendChild(make("strong", null, "Reason: "));
+      reason.appendChild(document.createTextNode(result.reason));
+      block.appendChild(reason);
+    }
+    if (result.question !== "") {
+      const question = make("p", "parked-detail");
+      question.appendChild(make("strong", null, "Question: "));
+      question.appendChild(document.createTextNode(result.question));
+      block.appendChild(question);
+    }
+
+    if (result.taskId !== "") {
+      const actions = make("div", "actions");
+      const open = button("Open this task", "btn", "button");
+      open.addEventListener("click", function () {
+        selectTask(result.taskId);
+      });
+      actions.appendChild(open);
+      block.appendChild(actions);
+    }
+
+    dom.submit.outcome.appendChild(block);
+  }
+
+  /* ── Supervisor: the task list ─────────────────────────────────────────── */
+
+  function listCard() {
+    const card = make("section", "card");
+
+    const head = cardHead("i-bars", "Recent tasks");
+    const state = make("span", "sup-list-state", "");
+    state.setAttribute("role", "status");
+    head.appendChild(state);
+    card.appendChild(head);
+
+    const note = make(
+      "p",
+      "card-note",
+      "The twenty most recent tasks, newest first. The list is re-read every five seconds while this view is open."
+    );
+    card.appendChild(note);
+
+    const listStatus = make("p", "status");
+    listStatus.setAttribute("role", "status");
+    listStatus.hidden = true;
+    card.appendChild(listStatus);
+
+    const list = make("div", "task-list");
+    card.appendChild(list);
+
+    return { card: card, list: list, listStatus: listStatus, state: state };
+  }
+
+  /** A centred, tasteful "nothing here" block — never a blank panel. */
+  function supervisorNotice(iconName, titleText, bodyText) {
+    const box = make("div", "empty-state sup-notice");
+    const mark = make("div", "empty-mark");
+    mark.appendChild(icon(iconName, "icon-lg"));
+    box.appendChild(mark);
+    box.appendChild(make("h3", "empty-title", titleText));
+    box.appendChild(make("p", "empty-body", bodyText));
+    return box;
+  }
+
+  function taskRow(task) {
+    const selected = task.id === supervisor.selectedId;
+    const row = make("button", "task-row" + (selected ? " is-selected" : ""));
+    row.type = "button";
+    row.setAttribute("data-task-id", task.id);
+    row.setAttribute("aria-pressed", selected ? "true" : "false");
+
+    const top = make("div", "task-row-top");
+    top.appendChild(make("span", "task-title", task.title));
+    top.appendChild(stateChip(task.state));
+    row.appendChild(top);
+
+    const meta = make("div", "task-meta");
+    meta.appendChild(metaChip(humanizeToken(task.taskType)));
+    const riskKey = task.risk.toLowerCase();
+    meta.appendChild(
+      metaChip(
+        humanizeToken(task.risk) + " risk",
+        riskKey === "high" ? "tag-danger" : riskKey === "medium" ? "tag-attention" : ""
+      )
+    );
+    if (task.priority !== null) {
+      meta.appendChild(metaChip("Priority " + task.priority));
+    }
+    meta.appendChild(metaChip("id " + shortId(task.id)));
+    row.appendChild(meta);
+
+    row.addEventListener("click", function () {
+      selectTask(task.id);
+    });
+    return row;
+  }
+
+  /**
+   * What the list currently renders.
+   *
+   * A poll that finds nothing new must not rebuild the rows: a rebuild would
+   * drop the operator's focus and any text they had selected, every five
+   * seconds. The signature is compared before the rebuild, not after.
+   */
+  function listSignature() {
+    const parts = [supervisor.unavailable ? "down" : "up", supervisor.selectedId || "-"];
+    for (let i = 0; i < supervisor.tasks.length; i += 1) {
+      const task = supervisor.tasks[i];
+      parts.push(
+        [task.id, task.title, task.state, task.taskType, task.risk, task.priority].join("~")
+      );
+    }
+    return parts.join("|");
+  }
+
+  function focusedTaskId() {
+    const active = document.activeElement;
+    if (active && active.classList && active.classList.contains("task-row")) {
+      return active.getAttribute("data-task-id");
+    }
+    return null;
+  }
+
+  function restoreTaskFocus(id) {
+    const dom = supervisor.dom;
+    if (!dom || !id) {
+      return;
+    }
+    const rows = dom.list.children;
+    for (let i = 0; i < rows.length; i += 1) {
+      if (rows[i].getAttribute && rows[i].getAttribute("data-task-id") === id) {
+        rows[i].focus();
+        return;
+      }
+    }
+  }
+
+  function paintTaskList() {
+    const dom = supervisor.dom;
+    if (!dom) {
+      return;
+    }
+    const signature = listSignature();
+    if (signature === supervisor.listSignature) {
+      return;
+    }
+    supervisor.listSignature = signature;
+
+    const focused = focusedTaskId();
+    clear(dom.list);
+
+    if (supervisor.unavailable) {
+      dom.list.appendChild(
+        supervisorNotice(
+          "i-shield",
+          "The supervisor is not wired into this dashboard",
+          "Every /api/supervisor route answers 503 when HaosGreen is started without a supervisor, so no task can be listed or driven from here."
+        )
+      );
+      return;
+    }
+
+    if (supervisor.tasks.length === 0) {
+      dom.list.appendChild(
+        supervisorNotice(
+          "i-shield",
+          "No tasks yet",
+          "Submit a request above. It is classified and routed first; nothing runs until the plan is approved."
+        )
+      );
+      return;
+    }
+
+    for (let i = 0; i < supervisor.tasks.length; i += 1) {
+      dom.list.appendChild(taskRow(supervisor.tasks[i]));
+    }
+
+    if (supervisor.selectedId === null) {
+      dom.list.appendChild(
+        make("p", "sup-note", "Select a task to see its jobs, timeline and artifacts.")
+      );
+    }
+    restoreTaskFocus(focused);
+  }
+
+  /* ── Supervisor: polling ───────────────────────────────────────────────── */
+
+  function supervisorStartPolling() {
+    if (supervisor.timer !== null || !supervisor.dom || supervisor.unavailable) {
+      return;
+    }
+    supervisor.timer = window.setInterval(function () {
+      refreshTasks();
+    }, SUPERVISOR_POLL_MS);
+  }
+
+  function supervisorStopPolling() {
+    if (supervisor.timer !== null) {
+      window.clearInterval(supervisor.timer);
+      supervisor.timer = null;
+    }
+  }
+
+  function onSupervisorVisibility() {
+    if (!supervisor.dom) {
+      return;
+    }
+    if (document.hidden) {
+      supervisorStopPolling();
+      return;
+    }
+    refreshTasks();
+    supervisorStartPolling();
+  }
+
+  async function refreshTasks() {
+    const dom = supervisor.dom;
+    if (!dom || supervisor.listBusy) {
+      return;
+    }
+    supervisor.listBusy = true;
+    try {
+      const body = await api("/api/supervisor/tasks");
+      if (!supervisor.dom) {
+        return;
+      }
+      supervisor.unavailable = false;
+      supervisor.tasks = normalizeTasks(body);
+      setStatus(supervisor.dom.listStatus, null, "");
+      paintTaskList();
+      supervisor.dom.listState.textContent = "Updated " + clockTime();
+      if (supervisor.selectedId !== null) {
+        refreshDetail(supervisor.selectedId);
+      }
+    } catch (error) {
+      if (!supervisor.dom) {
+        return;
+      }
+      if (error && error.status === 401) {
+        handleFailure(error, null, "");
+        return;
+      }
+      if (error && error.status === 503) {
+        // Nothing to retry against: stop the timer and say so once.
+        supervisor.unavailable = true;
+        supervisor.tasks = [];
+        supervisor.selectedId = null;
+        supervisor.detail = null;
+        supervisorStopPolling();
+        removeDetailCard();
+        supervisor.dom.listState.textContent = "Unavailable";
+        paintTaskList();
+        return;
+      }
+      setStatus(
+        supervisor.dom.listStatus,
+        "error",
+        ((error && error.message) || "The task list could not be read.") +
+          " The dashboard will try again in five seconds."
+      );
+    } finally {
+      supervisor.listBusy = false;
+    }
+  }
+
+  /* ── Supervisor: the detail panel ──────────────────────────────────────── */
+
+  function selectTask(id) {
+    const dom = supervisor.dom;
+    if (!dom || typeof id !== "string" || id === "") {
+      return;
+    }
+    supervisor.selectedId = id;
+    supervisor.detail = null;
+    // The submit panel describes one task's outcome in the present tense. Once
+    // the operator opens that task the panel is stale, so it goes.
+    supervisor.outcome = null;
+    paintOutcome();
+    mountDetailCard();
+    paintTaskList();
+
+    if (dom.detail) {
+      clear(dom.detail.body);
+      clear(dom.detail.facts);
+      dom.detail.title.textContent = "Loading…";
+      dom.detail.chip.className = chipClass("unknown", "sup-detail-chip");
+      dom.detail.chip.textContent = "…";
+      dom.detail.request.textContent = "";
+      dom.detail.capsWrap.hidden = true;
+      setStatus(dom.detail.actionStatus, null, "");
+      setDetailActions("");
+    }
+    refreshDetail(id);
+    scrollToDetail();
+  }
+
+  function clearSelection() {
+    const dom = supervisor.dom;
+    supervisor.selectedId = null;
+    supervisor.detail = null;
+    supervisor.detailToken += 1;
+    removeDetailCard();
+    paintTaskList();
+    if (dom) {
+      setStatus(dom.listStatus, null, "");
+    }
+  }
+
+  function removeDetailCard() {
+    const dom = supervisor.dom;
+    if (dom && dom.detail) {
+      if (dom.detail.card.parentNode === dom.host) {
+        dom.host.removeChild(dom.detail.card);
+      }
+      dom.detail = null;
+    }
+  }
+
+  function mountDetailCard() {
+    const dom = supervisor.dom;
+    if (!dom || dom.detail) {
+      return;
+    }
+    dom.detail = detailCard();
+    dom.host.appendChild(dom.detail.card);
+  }
+
+  function detailCard() {
+    const card = make("section", "card sup-detail");
+
+    const head = make("div", "card-head");
+    const mark = make("span", "card-mark");
+    mark.appendChild(icon("i-shield"));
+    head.appendChild(mark);
+    head.appendChild(make("h2", "card-title", "Task detail"));
+    const chip = stateChip("", "sup-detail-chip");
+    head.appendChild(chip);
+    const close = button("Close", "btn btn-ghost", "button");
+    close.addEventListener("click", clearSelection);
+    head.appendChild(close);
+    card.appendChild(head);
+
+    const title = make("h3", "sup-title");
+    card.appendChild(title);
+
+    const facts = make("dl", "facts sup-facts");
+    card.appendChild(facts);
+
+    const requestWrap = make("div", "sup-section");
+    requestWrap.appendChild(make("h3", "sup-section-title", "Request"));
+    const request = make("p", "well");
+    requestWrap.appendChild(request);
+    card.appendChild(requestWrap);
+
+    const capsWrap = make("div", "sup-section");
+    capsWrap.appendChild(make("h3", "sup-section-title", "Required capabilities"));
+    const caps = make("div", "tags");
+    capsWrap.appendChild(caps);
+    card.appendChild(capsWrap);
+
+    const actionsWrap = make("div", "sup-section");
+    actionsWrap.appendChild(make("h3", "sup-section-title", "Lifecycle"));
+    const actions = make("div", "actions sup-actions");
+    const buttons = {};
+    for (let i = 0; i < LIFECYCLE_ACTIONS.length; i += 1) {
+      const spec = LIFECYCLE_ACTIONS[i];
+      const node = buttonWithIcon(spec.label, spec.className, spec.icon);
+      node.disabled = true;
+      node.setAttribute("data-action", spec.key);
+      node.addEventListener("click", function () {
+        runSupervisorAction(spec.key);
+      });
+      buttons[spec.key] = node;
+      actions.appendChild(node);
+    }
+    actionsWrap.appendChild(actions);
+    actionsWrap.appendChild(
+      make(
+        "p",
+        "card-note sup-cancel-note",
+        "Cancel marks the task CANCELLED. It does not stop a job that is already running — the supervisor holds no cancellation token for work in flight."
+      )
+    );
+    const actionStatus = make("p", "status");
+    actionStatus.setAttribute("role", "status");
+    actionStatus.hidden = true;
+    actionsWrap.appendChild(actionStatus);
+    card.appendChild(actionsWrap);
+
+    const body = make("div", "sup-detail-body");
+    card.appendChild(body);
+
+    return {
+      card: card,
+      chip: chip,
+      title: title,
+      facts: facts,
+      request: request,
+      capsWrap: capsWrap,
+      caps: caps,
+      buttons: buttons,
+      actionStatus: actionStatus,
+      body: body,
+      /** The state the last paint saw; the buttons are derived from it. */
+      state: ""
+    };
+  }
+
+  function setDetailActions(state) {
+    const dom = supervisor.dom;
+    const detail = dom && dom.detail;
+    if (!detail) {
+      return;
+    }
+    const key = stateKey(state);
+    for (let i = 0; i < LIFECYCLE_ACTIONS.length; i += 1) {
+      const spec = LIFECYCLE_ACTIONS[i];
+      const node = detail.buttons[spec.key];
+      const permitted = key !== "" && spec.from.indexOf(key) !== -1;
+      node.disabled = !permitted || supervisor.actionBusy;
+      node.title = permitted
+        ? ""
+        : "A task in state " + stateText(state) + " cannot be " + spec.past + ".";
+    }
+  }
+
+  async function refreshDetail(id) {
+    if (!supervisor.dom || typeof id !== "string" || id === "") {
+      return;
+    }
+    supervisor.detailToken += 1;
+    const token = supervisor.detailToken;
+    try {
+      const body = await api("/api/supervisor/tasks/" + encodeURIComponent(id));
+      if (token !== supervisor.detailToken || !supervisor.dom || supervisor.selectedId !== id) {
+        return;
+      }
+      supervisor.detail = normalizeDetail(body);
+      paintDetail();
+    } catch (error) {
+      if (token !== supervisor.detailToken || !supervisor.dom || supervisor.selectedId !== id) {
+        return;
+      }
+      if (error && error.status === 401) {
+        handleFailure(error, null, "");
+        return;
+      }
+      if (error && error.status === 404) {
+        clearSelection();
+        setStatus(
+          supervisor.dom.listStatus,
+          "error",
+          "That task is not in the supervisor's store any more."
+        );
+        return;
+      }
+      setStatus(
+        supervisor.dom.listStatus,
+        "error",
+        (error && error.message) || "The task could not be read."
+      );
+    }
+  }
+
+  function paintDetail() {
+    const dom = supervisor.dom;
+    const detail = dom && dom.detail;
+    if (!detail) {
+      return;
+    }
+    const data = supervisor.detail || { task: null, jobs: [], transitions: [], artifacts: [] };
+    const task = data.task;
+
+    clear(detail.facts);
+    clear(detail.body);
+    clear(detail.caps);
+
+    if (!task) {
+      detail.chip.className = chipClass("unknown", "sup-detail-chip");
+      detail.chip.textContent = "UNKNOWN";
+      detail.title.textContent = "This task could not be read";
+      detail.request.textContent = "The supervisor did not return a task for this id.";
+      detail.capsWrap.hidden = true;
+      detail.state = "";
+      setDetailActions("");
+      detail.body.appendChild(
+        supervisorNotice(
+          "i-shield",
+          "Nothing to show",
+          "The detail response did not carry a task object, so no jobs, timeline or artifacts can be listed."
+        )
+      );
+      return;
+    }
+
+    detail.state = typeof task.state === "string" ? task.state : "";
+    detail.chip.className = chipClass(stateBucket(task.state), "sup-detail-chip");
+    detail.chip.textContent = stateText(task.state);
+    detail.title.textContent = stringOr(task.title, "(untitled task)");
+    detail.request.textContent = stringOr(task.user_request, "(no request text was stored)");
+
+    addFact(detail.facts, "Type", humanizeToken(stringOr(task.task_type, "unknown")));
+    addFact(detail.facts, "Risk", humanizeToken(stringOr(task.risk_level, "unknown")));
+    addFact(
+      detail.facts,
+      "Priority",
+      task.priority === undefined || task.priority === null
+        ? "unknown"
+        : String(numberOr(task.priority, "unknown"))
+    );
+    addFact(
+      detail.facts,
+      "Execution mode",
+      humanizeToken(stringOr(task.execution_mode, "unknown"))
+    );
+    addFact(detail.facts, "Task id", stringOr(task.id, "(no id)"));
+
+    const caps = Array.isArray(task.required_capabilities) ? task.required_capabilities : [];
+    detail.capsWrap.hidden = false;
+    if (caps.length === 0) {
+      detail.caps.appendChild(make("span", "sup-empty", "None recorded."));
+    } else {
+      for (let i = 0; i < caps.length; i += 1) {
+        detail.caps.appendChild(metaChip(String(caps[i])));
+      }
+    }
+
+    setDetailActions(detail.state);
+    detail.body.appendChild(jobsSection(data.jobs));
+    detail.body.appendChild(transitionsSection(data.transitions));
+    detail.body.appendChild(artifactsSection(data.artifacts));
+  }
+
+  function sectionWrap(titleText) {
+    const wrap = make("div", "sup-section");
+    wrap.appendChild(make("h3", "sup-section-title", titleText));
+    return wrap;
+  }
+
+  function jobsSection(jobs) {
+    const wrap = sectionWrap("Jobs");
+    if (jobs.length === 0) {
+      wrap.appendChild(
+        make("p", "sup-empty", "No jobs have been dispatched for this task yet.")
+      );
+      return wrap;
+    }
+    const list = make("div", "job-list");
+    for (let i = 0; i < jobs.length; i += 1) {
+      list.appendChild(jobCard(jobs[i]));
+    }
+    wrap.appendChild(list);
+    return wrap;
+  }
+
+  function evidenceText(evidence) {
+    if (!evidence || typeof evidence !== "object") {
+      return "Evidence recorded.";
+    }
+    const kind = typeof evidence.kind === "string" ? evidence.kind : "";
+    if (kind === "exit_code") {
+      return "Exit code " + String(numberOr(evidence.code, "unknown"));
+    }
+    if (kind === "file_created") {
+      return "File created: " + stringOr(evidence.path, "(no path)");
+    }
+    if (kind === "test_passed") {
+      return "Test passed: " + stringOr(evidence.name, "(unnamed)");
+    }
+    if (kind === "output_validated") {
+      return "Output validated: " + stringOr(evidence.description, "(no description)");
+    }
+    if (kind === "log_stored") {
+      return "Log stored: " + stringOr(evidence.path, "(no path)");
+    }
+    // An evidence kind this build does not know is named, not dropped.
+    return kind === "" ? "Evidence recorded." : "Evidence (" + humanizeToken(kind) + ")";
+  }
+
+  function jobCard(raw) {
+    const job = raw && typeof raw === "object" ? raw : {};
+    const item = make("article", "job");
+
+    const head = make("div", "job-head");
+    head.appendChild(make("span", "job-type", humanizeToken(stringOr(job.job_type, "unknown"))));
+    head.appendChild(metaChip(stringOr(job.backend, "unknown backend")));
+    head.appendChild(jobStatusChip(job.status));
+    item.appendChild(head);
+
+    item.appendChild(make("p", "job-goal", stringOr(job.goal, "(no goal recorded)")));
+
+    const meta = make("div", "job-meta");
+    meta.appendChild(metaChip("id " + shortId(stringOr(job.id, "?"))));
+    meta.appendChild(metaChip("timeout " + String(numberOr(job.timeout_secs, "?")) + "s"));
+    meta.appendChild(
+      metaChip(
+        "retries " + String(numberOr(job.retry_count, 0)) + "/" + String(numberOr(job.retry_max, 0))
+      )
+    );
+    if (typeof job.parent_job_id === "string" && job.parent_job_id !== "") {
+      meta.appendChild(metaChip("parent " + shortId(job.parent_job_id)));
+    }
+    if (typeof job.workspace === "string" && job.workspace !== "") {
+      meta.appendChild(metaChip("workspace " + job.workspace));
+    }
+    item.appendChild(meta);
+
+    const tools = Array.isArray(job.allow_tools) ? job.allow_tools : [];
+    if (tools.length > 0) {
+      const row = make("div", "job-meta");
+      for (let i = 0; i < tools.length; i += 1) {
+        row.appendChild(metaChip(String(tools[i])));
+      }
+      item.appendChild(row);
+    }
+
+    const result = job.result && typeof job.result === "object" ? job.result : null;
+    if (result) {
+      const box = make("div", "job-result");
+      box.appendChild(make("p", "job-summary", stringOr(result.summary, "(no summary recorded)")));
+
+      const evidence = Array.isArray(result.evidence) ? result.evidence : [];
+      if (evidence.length > 0) {
+        box.appendChild(make("p", "job-label", "Evidence"));
+        const list = make("ul", "evidence");
+        for (let i = 0; i < evidence.length; i += 1) {
+          list.appendChild(make("li", "evidence-item", evidenceText(evidence[i])));
+        }
+        box.appendChild(list);
+      }
+
+      const changed = Array.isArray(result.changed_files) ? result.changed_files : [];
+      if (changed.length > 0) {
+        box.appendChild(make("p", "job-label", "Changed files"));
+        const list = make("ul", "evidence");
+        for (let i = 0; i < changed.length; i += 1) {
+          list.appendChild(make("li", "evidence-item", String(changed[i])));
+        }
+        box.appendChild(list);
+      }
+
+      const errors = Array.isArray(result.errors) ? result.errors : [];
+      if (errors.length > 0) {
+        box.appendChild(make("p", "job-label", "Errors"));
+        const list = make("ul", "evidence");
+        for (let i = 0; i < errors.length; i += 1) {
+          list.appendChild(make("li", "job-error", String(errors[i])));
+        }
+        box.appendChild(list);
+      }
+
+      if (typeof result.next_step === "string" && result.next_step !== "") {
+        box.appendChild(make("p", "job-next", "Next step: " + result.next_step));
+      }
+      item.appendChild(box);
+    }
+
+    if (typeof job.error === "string" && job.error !== "") {
+      item.appendChild(make("p", "job-error", job.error));
+    }
+
+    if (typeof job.prompt === "string" && job.prompt !== "") {
+      const details = document.createElement("details");
+      details.className = "job-details";
+      details.appendChild(make("summary", null, "Prompt"));
+      details.appendChild(make("p", "well", job.prompt));
+      item.appendChild(details);
+    }
+
+    const context = compactJson(job.input_context, 400);
+    if (context !== "") {
+      const details = document.createElement("details");
+      details.className = "job-details";
+      details.appendChild(make("summary", null, "Input context"));
+      details.appendChild(make("p", "well", context));
+      item.appendChild(details);
+    }
+
+    return item;
+  }
+
+  function transitionsSection(transitions) {
+    const wrap = sectionWrap("Timeline");
+    if (transitions.length === 0) {
+      wrap.appendChild(make("p", "sup-empty", "No state transitions have been recorded for this task."));
+      return wrap;
+    }
+    const list = make("ol", "timeline");
+    for (let i = 0; i < transitions.length; i += 1) {
+      const raw = transitions[i];
+      const entry = raw && typeof raw === "object" ? raw : {};
+      const item = make("li", "timeline-item");
+
+      const head = make("div", "timeline-head");
+      head.appendChild(stateChip(entry.from));
+      head.appendChild(make("span", "timeline-arrow", "→"));
+      head.appendChild(stateChip(entry.to));
+      item.appendChild(head);
+
+      const meta = make("div", "timeline-meta");
+      meta.appendChild(metaChip("actor " + stringOr(entry.actor, "unknown")));
+      if (typeof entry.occurred_at === "string" && entry.occurred_at !== "") {
+        meta.appendChild(metaChip(entry.occurred_at));
+      }
+      item.appendChild(meta);
+
+      if (typeof entry.reason === "string" && entry.reason !== "") {
+        item.appendChild(make("p", "timeline-reason", entry.reason));
+      }
+      list.appendChild(item);
+    }
+    wrap.appendChild(list);
+    wrap.appendChild(make("p", "sup-note", "Timestamps are the supervisor's UTC clock."));
+    return wrap;
+  }
+
+  function artifactsSection(artifacts) {
+    const wrap = sectionWrap("Artifacts");
+    if (artifacts.length === 0) {
+      wrap.appendChild(make("p", "sup-empty", "No artifacts have been written for this task yet."));
+      return wrap;
+    }
+    const list = make("ul", "artifact-list");
+    for (let i = 0; i < artifacts.length; i += 1) {
+      const raw = artifacts[i];
+      const entry = raw && typeof raw === "object" ? raw : {};
+      const item = make("li", "artifact");
+      item.appendChild(metaChip(stringOr(entry.kind, "artifact")));
+      item.appendChild(make("code", "artifact-path", stringOr(entry.path, "(no path)")));
+      list.appendChild(item);
+    }
+    wrap.appendChild(list);
+    wrap.appendChild(
+      make(
+        "p",
+        "sup-note",
+        "Paths are relative to the supervisor's artifacts directory. The dashboard does not serve artifact contents."
+      )
+    );
+    return wrap;
+  }
+
+  /* ── Supervisor: lifecycle actions ─────────────────────────────────────── */
+
+  function actionSuccessMessage(key, state) {
+    const now = stateText(state);
+    if (key === "cancel") {
+      return (
+        "Cancelled. The task is now " + now + ". Work already in flight is not stopped by this."
+      );
+    }
+    const label = key.charAt(0).toUpperCase() + key.slice(1);
+    return label + " accepted. The task is now " + now + ".";
+  }
+
+  function actionFailureMessage(key, error) {
+    const label = key.charAt(0).toUpperCase() + key.slice(1);
+    if (!error) {
+      return label + " could not be completed.";
+    }
+    if (error.status === 409) {
+      // The server's own sentence names the state that refused it.
+      return (
+        "The supervisor refused that: " +
+        (error.message || "the task is no longer in a state that allows it.")
+      );
+    }
+    if (error.status === 503) {
+      return "This dashboard was started without a supervisor.";
+    }
+    return error.message || label + " could not be completed.";
+  }
+
+  async function runSupervisorAction(key) {
+    const dom = supervisor.dom;
+    const detail = dom && dom.detail;
+    const id = supervisor.selectedId;
+    if (!detail || !id || supervisor.actionBusy) {
+      return;
+    }
+
+    supervisor.actionBusy = true;
+    setDetailActions(detail.state);
+    setStatus(detail.actionStatus, null, "");
+
+    try {
+      const body = await api(
+        "/api/supervisor/tasks/" + encodeURIComponent(id) + "/" + encodeURIComponent(key),
+        { method: "POST" }
+      );
+      const state = body && typeof body.state === "string" ? body.state : "";
+      setStatus(detail.actionStatus, "ok", actionSuccessMessage(key, state));
+    } catch (error) {
+      if (error && error.status === 401) {
+        handleFailure(error, detail.actionStatus, "");
+        return;
+      }
+      if (error && error.status === 404) {
+        // The task is gone from the store, so the panel goes with it. The
+        // message moves to the list, which is the panel that survives.
+        clearSelection();
+        setStatus(
+          supervisor.dom ? supervisor.dom.listStatus : null,
+          "error",
+          "The supervisor does not know that task any more."
+        );
+        return;
+      }
+      setStatus(detail.actionStatus, "error", actionFailureMessage(key, error));
+    } finally {
+      supervisor.actionBusy = false;
+    }
+
+    // Whether it succeeded or was refused, the state may have moved: re-read
+    // both surfaces so the buttons and the chips match the server again. The
+    // action status line is a sibling of the repainted regions, so a refusal
+    // message survives this refresh.
+    await refreshDetail(id);
+    await refreshTasks();
+    if (supervisor.dom && supervisor.dom.detail) {
+      setDetailActions(supervisor.dom.detail.state);
+    }
+  }
+
+  /* ── Supervisor: view ──────────────────────────────────────────────────── */
+
+  function scrollToDetail() {
+    const dom = supervisor.dom;
+    if (!dom || !dom.detail || typeof dom.detail.card.scrollIntoView !== "function") {
+      return;
+    }
+    const reduce =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    dom.detail.card.scrollIntoView({ block: "start", behavior: reduce ? "auto" : "smooth" });
+  }
+
+  function renderSupervisor(host) {
+    const submit = submitCard();
+    const list = listCard();
+    host.appendChild(submit.card);
+    host.appendChild(list.card);
+
+    supervisor.dom = {
+      host: host,
+      list: list.list,
+      listStatus: list.listStatus,
+      listState: list.state,
+      submit: submit,
+      detail: null
+    };
+    supervisor.listSignature = null;
+    supervisor.tasks = [];
+    supervisor.unavailable = false;
+
+    // `removeEventListener` first: it is idempotent, and it keeps a re-entry
+    // from registering the visibility handler twice.
+    document.removeEventListener("visibilitychange", onSupervisorVisibility);
+    document.addEventListener("visibilitychange", onSupervisorVisibility);
+
+    paintOutcome();
+    paintTaskList();
+    refreshTasks();
+    supervisorStartPolling();
+
+    if (supervisor.selectedId !== null) {
+      // Coming back to the view reopens the task the operator was reading.
+      mountDetailCard();
+      refreshDetail(supervisor.selectedId);
+    }
+  }
+
+  /**
+   * Drop every reference to the supervisor view's DOM and stop its timer.
+   *
+   * `navigate()` calls this before rendering the next route, and `showLogin`
+   * calls it when the session ends: a listing that arrives after the operator
+   * left must not write into a panel that is gone, and the poll must not
+   * outlive the view.
+   */
+  function supervisorUnmount() {
+    supervisorStopPolling();
+    document.removeEventListener("visibilitychange", onSupervisorVisibility);
+    supervisor.dom = null;
+    supervisor.detail = null;
+    supervisor.detailToken += 1;
+    supervisor.listSignature = null;
+    supervisor.listBusy = false;
+    supervisor.actionBusy = false;
   }
 
   /* ── Boot ──────────────────────────────────────────────────────────────── */

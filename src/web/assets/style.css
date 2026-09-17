@@ -1181,6 +1181,503 @@ input:disabled {
 
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 
+/* ── Supervisor ──────────────────────────────────────────────────────────── */
+
+/*
+ * The task surface (design spec §5.2).
+ *
+ * The list is a column of sunken rows that raise on hover, the detail panel is
+ * the same card language as Settings, and a task's state is carried by a pill
+ * whose text always names the state — the colour is a second signal, never the
+ * only one. Every value below is a custom property declared in `:root`; no new
+ * colour is introduced here, and no rule draws a border.
+ */
+
+.sup-form {
+  margin-top: 16px;
+}
+
+.sup-input {
+  width: 100%;
+  min-height: 88px;
+  padding: 12px 15px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.45;
+  resize: vertical;
+  transition: var(--ease);
+}
+
+.sup-input::placeholder {
+  color: var(--text-muted);
+}
+
+.sup-input:focus {
+  outline: none;
+  box-shadow: var(--shadow-in-deep), var(--ring);
+}
+
+.sup-input:disabled {
+  opacity: 0.6;
+}
+
+.sup-outcome:empty {
+  display: none;
+}
+
+/* The submit outcome, in the accent tint: attention, not alarm. */
+.parked {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 18px 20px;
+  border-radius: var(--radius);
+  background: var(--accent-tint);
+  box-shadow: var(--shadow-in);
+}
+
+.parked-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.parked .icon {
+  color: var(--text);
+}
+
+.parked-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.parked-body,
+.parked-detail {
+  font-size: 0.94rem;
+  overflow-wrap: anywhere;
+}
+
+.parked-detail strong {
+  font-weight: 600;
+}
+
+.sup-list-state {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+}
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.task-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: var(--ease);
+}
+
+.task-row:hover {
+  background: var(--surface);
+  box-shadow: var(--shadow-out-sm);
+}
+
+.task-row:active {
+  box-shadow: var(--shadow-in-deep);
+}
+
+.task-row:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-in), var(--ring-strong);
+}
+
+/* The open task is pressed into the panel and ringed, not merely tinted. */
+.task-row.is-selected {
+  background: var(--surface);
+  box-shadow: var(--shadow-in-deep), var(--ring-strong);
+}
+
+.task-row-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.task-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* A small pill for the non-state facts. Flatter than a state chip on purpose. */
+.tag {
+  padding: 3px 11px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.tag-attention {
+  background: var(--accent-tint);
+  color: var(--text);
+}
+
+.tag-danger {
+  background: var(--danger-tint);
+  color: var(--text);
+}
+
+/* ── State chips ─────────────────────────────────────────────────────────── */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+.chip::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+/* Parked and waiting on the operator. */
+.chip-attention {
+  background: var(--accent-tint);
+}
+
+.chip-attention::before {
+  background: var(--accent);
+}
+
+.chip-running::before {
+  background: var(--accent);
+}
+
+.chip-paused::before {
+  background: var(--text-muted);
+}
+
+/* Finished work is the one filled chip, matching the active nav pill. */
+.chip-done {
+  background-image: linear-gradient(145deg, var(--accent-bright), var(--accent));
+  box-shadow: var(--shadow-out-sm);
+}
+
+.chip-done::before {
+  background: var(--text);
+}
+
+.chip-failed {
+  background: var(--danger-tint);
+}
+
+.chip-failed::before {
+  background: var(--danger);
+}
+
+.chip-cancelled,
+.chip-unknown {
+  color: var(--text-muted);
+}
+
+/* ── Task detail ─────────────────────────────────────────────────────────── */
+
+.sup-detail .card-head {
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.sup-detail-chip {
+  margin-left: auto;
+}
+
+.sup-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.sup-facts {
+  margin-top: 16px;
+}
+
+.sup-section {
+  margin-top: 22px;
+}
+
+.sup-section-title {
+  font-size: 0.98rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.sup-section-title + * {
+  margin-top: 12px;
+}
+
+.sup-empty {
+  color: var(--text-muted);
+  font-size: 0.92rem;
+}
+
+.sup-note {
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 0.84rem;
+}
+
+.sup-notice {
+  padding: 30px 16px;
+}
+
+.sup-actions {
+  margin-top: 12px;
+}
+
+.sup-cancel-note {
+  margin-top: 12px;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* A sunken well for text the operator has to read verbatim. */
+.well {
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  font-size: 0.94rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── Jobs ────────────────────────────────────────────────────────────────── */
+
+.job-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.job {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  box-shadow: var(--shadow-out-sm);
+}
+
+.job-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.job-type {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.job-goal {
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+
+.job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.job-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+}
+
+.job-summary {
+  font-size: 0.94rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.job-label {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.job-next {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.job-error {
+  padding: 11px 15px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-tint);
+  color: var(--text);
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.evidence-item {
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.job-details summary {
+  color: var(--text-muted);
+  font-size: 0.86rem;
+  cursor: pointer;
+}
+
+.job-details .well {
+  margin-top: 8px;
+  font-size: 0.88rem;
+}
+
+/* ── Transition timeline ─────────────────────────────────────────────────── */
+
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+}
+
+.timeline-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.timeline-arrow {
+  color: var(--text-muted);
+}
+
+.timeline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.timeline-reason {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+/* ── Artifacts ───────────────────────────────────────────────────────────── */
+
+.artifact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.artifact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 15px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+}
+
+.artifact-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+/*
+ * A disabled button's icon must fade with its label: `.icon` sets the accent
+ * colour, which would otherwise stay lit on a button that cannot be pressed.
+ */
+.btn:disabled .icon {
+  color: var(--text-muted);
+}
+
 @media (max-width: 720px) {
   .app {
     grid-template-columns: minmax(0, 1fr);
@@ -1272,6 +1769,15 @@ input:disabled {
   .msg {
     max-width: 92%;
   }
+
+  /* The lifecycle buttons share a row instead of stacking. */
+  .sup-actions .btn {
+    flex: 1 1 150px;
+  }
+
+  .sup-detail-chip {
+    margin-left: 0;
+  }
 }
 
 @media (max-width: 420px) {
@@ -1332,6 +1838,25 @@ input:disabled {
 
   .chat-input-row {
     gap: 8px;
+  }
+
+  /* At 380px a task's title and its state chip each get their own line, and
+     every lifecycle button is full width rather than a cramped stub. */
+  .task-row-top {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .sup-actions .btn {
+    width: 100%;
+  }
+
+  .parked {
+    padding: 15px 16px;
+  }
+
+  .job {
+    padding: 14px 15px;
   }
 }
 
