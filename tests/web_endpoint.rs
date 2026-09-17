@@ -218,7 +218,7 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
     // header is sent on all of them so the request reaches the authentication
     // check rather than being stopped by the CSRF gate first: this test is
     // about authentication.
-    let cases: [(&str, &str, Option<serde_json::Value>); 10] = [
+    let cases: [(&str, &str, Option<serde_json::Value>); 17] = [
         ("GET", "/api/settings", None),
         (
             "POST",
@@ -248,6 +248,20 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
             Some(serde_json::json!({"message": "hi"})),
         ),
         ("POST", "/api/chat/sessions/nope/cancel", None),
+        // The supervisor surface (Phase 3). `POST /api/supervisor/tasks` starts
+        // work on the operator's behalf, so it is the third route where a
+        // missing guard would be a real hole rather than an information leak.
+        ("GET", "/api/supervisor/tasks", None),
+        ("GET", "/api/supervisor/tasks/nope", None),
+        (
+            "POST",
+            "/api/supervisor/tasks",
+            Some(serde_json::json!({"text": "summarize the readme"})),
+        ),
+        ("POST", "/api/supervisor/tasks/nope/pause", None),
+        ("POST", "/api/supervisor/tasks/nope/resume", None),
+        ("POST", "/api/supervisor/tasks/nope/cancel", None),
+        ("POST", "/api/supervisor/tasks/nope/approve", None),
     ];
 
     for (method, path, body) in cases {
@@ -1387,6 +1401,569 @@ async fn an_empty_chat_message_is_rejected() {
         400,
         "a whitespace-only message must be refused before the agent is consulted"
     );
+}
+
+// ── Supervisor ──────────────────────────────────────────────────────────────
+//
+// Unlike the chat tests, these run against a dashboard whose `supervisor` handle
+// is `Some`: every supervisor route answers 503 without one, so a test that
+// never wires a supervisor would prove nothing about the task surface.
+//
+// The supervisor is built here rather than stubbed. `Supervisor::new_for_test`
+// needs only an in-memory SQLite store and an artifacts directory, and
+// `register_test_reasoning_backend` supplies the one backend the plan needs — so
+// a real `submit`, a real transition, and a real `execute_now` all run.
+
+/// A supervisor over an in-memory store, with a reasoning backend registered.
+///
+/// Without the backend `execute_now` would have nothing to run and every
+/// lifecycle test would end up asserting on an internal error. The store is
+/// passed in rather than created here so a test can reach the same connection
+/// and break it.
+fn test_supervisor(
+    artifacts: &std::path::Path,
+    memory: &haos_green::memory::MemoryStore,
+) -> std::sync::Arc<haos_green::supervisor::Supervisor> {
+    let mut supervisor = haos_green::supervisor::Supervisor::new_for_test(
+        artifacts.to_path_buf(),
+        memory.connection(),
+    );
+    supervisor.register_test_reasoning_backend(|prompt| async move { Ok(format!("ran:{prompt}")) });
+    std::sync::Arc::new(supervisor)
+}
+
+/// Start the dashboard with a live supervisor attached, and hand back the
+/// handle so a test can seed tasks and assert on the persisted state.
+async fn spawn_test_server_with_supervisor() -> (
+    String,
+    tempfile::TempDir,
+    std::sync::Arc<haos_green::supervisor::Supervisor>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    // The store itself can be dropped here: `connection()` hands out an owned
+    // `Arc<Mutex<Connection>>`, and that is what the supervisor keeps.
+    let memory = haos_green::memory::MemoryStore::open_in_memory().expect("open a memory store");
+    let supervisor = test_supervisor(&dir.path().join("artifacts"), &memory);
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_supervisor(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        Some(supervisor.clone()),
+    )
+    .await
+    .expect("the dashboard should start with a supervisor");
+    (format!("http://{addr}"), dir, supervisor)
+}
+
+/// Every supervisor route, as `(method, path, body)`.
+///
+/// One list, used by both the 401 and the 503 sweep, so a route added to the
+/// module and forgotten here is a route that is not covered by either.
+fn supervisor_routes() -> Vec<(&'static str, &'static str, Option<serde_json::Value>)> {
+    vec![
+        ("GET", "/api/supervisor/tasks", None),
+        ("GET", "/api/supervisor/tasks/nope", None),
+        (
+            "POST",
+            "/api/supervisor/tasks",
+            Some(serde_json::json!({"text": "summarize the readme"})),
+        ),
+        ("POST", "/api/supervisor/tasks/nope/pause", None),
+        ("POST", "/api/supervisor/tasks/nope/resume", None),
+        ("POST", "/api/supervisor/tasks/nope/cancel", None),
+        ("POST", "/api/supervisor/tasks/nope/approve", None),
+    ]
+}
+
+/// Submit a task through the API and return its id.
+async fn submit_supervisor_task(base: &str, cookie: &str, text: &str) -> String {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/supervisor/tasks"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, cookie)
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "submitting a task should succeed");
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a submit must return a task id: {body}"))
+        .to_string()
+}
+
+/// POST a lifecycle action on a supervisor task.
+async fn supervisor_action(base: &str, cookie: &str, id: &str, action: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/api/supervisor/tasks/{id}/{action}"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn every_supervisor_route_returns_503_without_a_supervisor() {
+    // The default harness wires no supervisor, which is the Phase 1 contract:
+    // the dashboard must degrade to a named 503, never panic.
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    for (method, path, body) in supervisor_routes() {
+        let mut request = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{base}{path}"),
+            )
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::COOKIE, &cookie);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "{method} {path} without a supervisor must be 503, got {}",
+            response.status()
+        );
+        let message = response.text().await.unwrap();
+        assert!(
+            message.contains("supervisor"),
+            "{method} {path} must name the missing wiring, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_supervisor_task_id_is_not_found() {
+    let (base, _dir, _supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    let detail = client
+        .get(format!("{base}/api/supervisor/tasks/nope"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), 404, "an unknown id must be a 404");
+    let body = detail.text().await.unwrap();
+    // The body is asserted, not just the status: an unregistered route answers
+    // 404 with an empty body too, so a status-only assertion would pass on a
+    // dashboard where the route does not exist at all.
+    assert!(
+        body.contains("unknown supervisor task"),
+        "a 404 must say the task is unknown, got {body:?}"
+    );
+    assert!(
+        !body.contains("\"task\""),
+        "a 404 must not be an empty task object, got {body:?}"
+    );
+
+    for action in ["pause", "resume", "cancel", "approve"] {
+        let response = supervisor_action(&base, &cookie, "nope", action).await;
+        assert_eq!(
+            response.status(),
+            404,
+            "POST .../nope/{action} on an unknown id must be 404, got {}",
+            response.status()
+        );
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("unknown supervisor task"),
+            "POST .../nope/{action} must say the task is unknown, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn submitting_a_blank_supervisor_task_is_rejected() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    for text in ["", "   ", "\n\t "] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/api/supervisor/tasks"))
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&serde_json::json!({ "text": text }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            400,
+            "a blank task text ({text:?}) must be a 400, got {}",
+            response.status()
+        );
+    }
+
+    // A body with no `text` field never reaches the handler: axum's `Json`
+    // extractor rejects it first, with 422. Pinned so that rejection is a
+    // decision rather than a surprise.
+    let malformed = reqwest::Client::new()
+        .post(format!("{base}/api/supervisor/tasks"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "nope": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        malformed.status(),
+        422,
+        "a body with no `text` field is rejected by the extractor"
+    );
+
+    // Refused before the supervisor was reached: a 400 that still created a
+    // task would be a 400 in name only.
+    assert!(
+        supervisor.store().list_recent(20).await.unwrap().is_empty(),
+        "a rejected submit must not create a task"
+    );
+}
+
+#[tokio::test]
+async fn supervisor_mutations_require_the_csrf_header() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+
+    let mut paths = vec!["/api/supervisor/tasks".to_string()];
+    for action in ["pause", "resume", "cancel", "approve"] {
+        paths.push(format!("/api/supervisor/tasks/{id}/{action}"));
+    }
+
+    for path in paths {
+        let response = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&serde_json::json!({ "text": "summarize the readme" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "POST {path} without the CSRF header must be refused, got {}",
+            response.status()
+        );
+    }
+
+    // Nothing was submitted and no lifecycle action ran.
+    assert_eq!(supervisor.store().list_recent(20).await.unwrap().len(), 1);
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Route
+    );
+}
+
+#[tokio::test]
+async fn a_supervisor_task_can_be_submitted_listed_read_and_driven() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    // Submit. `submit` classifies, routes and stops, so the task is parked in
+    // ROUTE rather than executed — the response has to say so.
+    let submitted = client
+        .post(format!("{base}/api/supervisor/tasks"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "text": "summarize the readme" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), 200);
+    let submitted: serde_json::Value = submitted.json().await.unwrap();
+    assert_eq!(
+        submitted["outcome"],
+        serde_json::json!("auto_execute_planned")
+    );
+    assert_eq!(submitted["state"], serde_json::json!("ROUTE"));
+    let id = submitted["task_id"]
+        .as_str()
+        .expect("a task id")
+        .to_string();
+
+    // Listed.
+    let listed = client
+        .get(format!("{base}/api/supervisor/tasks"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    let listed: serde_json::Value = listed.json().await.unwrap();
+    let tasks = listed["tasks"].as_array().expect("a tasks array");
+    assert_eq!(tasks.len(), 1, "got {listed}");
+    assert_eq!(tasks[0]["id"], serde_json::json!(id));
+    assert_eq!(tasks[0]["state"], serde_json::json!("ROUTE"));
+    assert!(tasks[0]["title"].is_string(), "got {listed}");
+    assert!(tasks[0]["task_type"].is_string(), "got {listed}");
+    assert!(tasks[0]["risk_level"].is_string(), "got {listed}");
+    assert!(tasks[0]["priority"].is_number(), "got {listed}");
+
+    // Detail: the task plus its jobs, transitions and artifacts.
+    let detail = client
+        .get(format!("{base}/api/supervisor/tasks/{id}"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["task"]["id"], serde_json::json!(id));
+    assert_eq!(detail["task"]["state"], serde_json::json!("ROUTE"));
+    assert_eq!(
+        detail["task"]["user_request"],
+        serde_json::json!("summarize the readme")
+    );
+    assert!(detail["jobs"].is_array(), "got {detail}");
+    let transitions = detail["transitions"]
+        .as_array()
+        .expect("a transitions array");
+    assert_eq!(
+        transitions.len(),
+        2,
+        "submit records exactly Intake -> Classify -> Route for an auto-executed task, got {detail}"
+    );
+    assert_eq!(transitions[0]["from"], serde_json::json!("INTAKE"));
+    assert_eq!(transitions[0]["to"], serde_json::json!("CLASSIFY"));
+    assert_eq!(transitions[1]["from"], serde_json::json!("CLASSIFY"));
+    assert_eq!(transitions[1]["to"], serde_json::json!("ROUTE"));
+    let artifacts = detail["artifacts"].as_array().expect("an artifacts array");
+    assert!(
+        artifacts
+            .iter()
+            .any(|a| a["kind"] == serde_json::json!("intake")),
+        "the intake artifact must be listed, got {detail}"
+    );
+
+    // Pause.
+    let paused = supervisor_action(&base, &cookie, &id, "pause").await;
+    assert_eq!(paused.status(), 200);
+    let paused: serde_json::Value = paused.json().await.unwrap();
+    assert_eq!(paused["state"], serde_json::json!("PAUSED"));
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Paused
+    );
+
+    // Pausing twice is a conflict with the task's current state.
+    let again = supervisor_action(&base, &cookie, &id, "pause").await;
+    assert_eq!(again.status(), 409);
+    let message = again.text().await.unwrap();
+    assert!(
+        message.contains("Paused"),
+        "the conflict must name the state: {message:?}"
+    );
+
+    // Resume runs the plan to completion.
+    let resumed = supervisor_action(&base, &cookie, &id, "resume").await;
+    assert_eq!(resumed.status(), 200);
+    let resumed: serde_json::Value = resumed.json().await.unwrap();
+    assert_eq!(resumed["state"], serde_json::json!("DONE"));
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Done
+    );
+}
+
+/// A state refusal is a conflict with the task's current state, not a server
+/// fault. This is the test that would catch a blanket `500` on the lifecycle
+/// routes — and, equally, a blanket `409` on a genuine internal failure.
+#[tokio::test]
+async fn a_refused_supervisor_lifecycle_action_is_409_not_500() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    // `submit` leaves the task in ROUTE. `resume` only accepts a PAUSED task,
+    // so this is refused even though ROUTE -> Execute is a legal edge.
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+    let response = supervisor_action(&base, &cookie, &id, "resume").await;
+    assert_eq!(
+        response.status(),
+        409,
+        "resuming a task that is not paused must be a conflict"
+    );
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("Route"),
+        "the conflict must name the current state: {message:?}"
+    );
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Route,
+        "a refused action must not change the state"
+    );
+
+    // A finished task accepts none of the three lifecycle actions.
+    supervisor.execute_now(&id).await.unwrap();
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Done
+    );
+    for action in ["pause", "cancel", "approve"] {
+        let response = supervisor_action(&base, &cookie, &id, action).await;
+        assert_eq!(
+            response.status(),
+            409,
+            "{action} on a DONE task must be a conflict, got {}",
+            response.status()
+        );
+        let message = response.text().await.unwrap();
+        assert!(
+            message.contains("Done"),
+            "{action} must name the current state, got {message:?}"
+        );
+    }
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn the_supervisor_listing_is_capped_at_twenty() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+
+    for i in 0..25 {
+        let task = haos_green::supervisor::task::Task::new(&format!("task {i}"), "req");
+        supervisor
+            .store()
+            .create(&task, "web", "dashboard", None)
+            .await
+            .unwrap();
+    }
+
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let listed = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    let listed: serde_json::Value = listed.json().await.unwrap();
+    assert_eq!(
+        listed["tasks"].as_array().unwrap().len(),
+        20,
+        "the dashboard must never be handed more than 20 tasks: {listed}"
+    );
+}
+
+/// The other half of the 409/500 distinction: a genuine internal failure must
+/// be a 500, on every supervisor route, and its body must not carry the error
+/// chain. This is the test that fails if the routes blanket-map every error to
+/// a conflict.
+#[tokio::test]
+async fn a_supervisor_database_failure_is_500_not_409() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().expect("open a memory store");
+    let supervisor = test_supervisor(&dir.path().join("artifacts"), &memory);
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_supervisor(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        Some(supervisor.clone()),
+    )
+    .await
+    .expect("the dashboard should start with a supervisor");
+    let base = format!("http://{addr}");
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    // A real task, submitted while the store still works. It lands in ROUTE,
+    // which permits pause, cancel and approve.
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+
+    // Break only the audit table. `sup_tasks` is intact, so the task is still
+    // readable and its state still permits the actions below — which is what
+    // makes the fault reachable *after* the 409 pre-check has passed. Dropping
+    // `sup_tasks` instead would fail the pre-check first and prove nothing
+    // about this branch.
+    memory
+        .connection()
+        .lock()
+        .await
+        .execute("DROP TABLE sup_transitions", [])
+        .unwrap();
+
+    // The listing does not touch that table, so it still works: the fault is
+    // targeted, not a blanket failure.
+    let listed = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200, "the listing must still work");
+
+    for action in ["pause", "cancel", "approve"] {
+        let response = supervisor_action(&base, &cookie, &id, action).await;
+        assert_eq!(
+            response.status(),
+            500,
+            "{action} on a permitted task whose audit write fails must be a server fault, got {}",
+            response.status()
+        );
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("sup_transitions") && !body.contains("INSERT"),
+            "the response must not carry the SQL error chain: {body:?}"
+        );
+    }
+    assert_eq!(
+        supervisor.state(&id).await.unwrap(),
+        haos_green::supervisor::task::TaskStatus::Route,
+        "a failed action must not change the state"
+    );
+
+    // Now break the table every supervisor read goes through. The body of that
+    // error carries the SQL statement, so the response must not.
+    //
+    // The children go first: `sup_transitions` and friends carry a foreign key
+    // to `sup_tasks`, and SQLite refuses to drop a parent that still has
+    // referencing rows.
+    {
+        let conn = memory.connection();
+        let conn = conn.lock().await;
+        for table in ["sup_jobs", "sup_artifacts", "sup_transitions"] {
+            let _ = conn.execute(&format!("DROP TABLE {table}"), []);
+        }
+        conn.execute("DROP TABLE sup_tasks", []).unwrap();
+    }
+
+    let listed = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.status(),
+        500,
+        "a broken store must be a server fault"
+    );
+    let body = listed.text().await.unwrap();
+    assert!(
+        !body.contains("sup_tasks") && !body.contains("SELECT"),
+        "the response must not carry the SQL error chain: {body:?}"
+    );
+
+    // With the task table gone the pre-check itself fails, so every lifecycle
+    // route answers 500 — and must not blame the task's state for it.
+    for action in ["pause", "resume", "cancel", "approve"] {
+        let response = supervisor_action(&base, &cookie, "whatever", action).await;
+        assert_eq!(
+            response.status(),
+            500,
+            "{action} on a broken store must be a server fault, got {}",
+            response.status()
+        );
+    }
 }
 
 // ── Live chat streaming (opt-in) ────────────────────────────────────────────

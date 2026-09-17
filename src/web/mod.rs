@@ -241,14 +241,41 @@ pub async fn spawn_for_test_with(home: PathBuf, config: WebConfig) -> Result<(So
 /// route answers 503 without one, so a test that never wires an agent would
 /// prove nothing about streaming. `Supervisor` stays `None` — no chat route
 /// touches it.
+/// [`spawn_for_test_with_agent`] with a supervisor attached.
+///
+/// The supervisor routes answer 503 without one, so a test that never wires a
+/// supervisor would prove nothing about the task surface — the same reason
+/// `spawn_for_test_with_agent` exists for the chat stream. `Supervisor` needs
+/// only an in-memory store and an artifacts directory (`new_for_test`), so the
+/// integration harness can build a real one. The `agent` handle stays `None`:
+/// no supervisor route touches it.
+#[doc(hidden)]
+pub async fn spawn_for_test_with_supervisor(
+    home: PathBuf,
+    config: WebConfig,
+    supervisor: Option<Arc<Supervisor>>,
+) -> Result<(SocketAddr, ())> {
+    spawn_for_test_with_handles(home, config, None, supervisor).await
+}
+
 #[doc(hidden)]
 pub async fn spawn_for_test_with_agent(
     home: PathBuf,
-    mut config: WebConfig,
+    config: WebConfig,
     agent: Option<Arc<Agent>>,
 ) -> Result<(SocketAddr, ())> {
+    spawn_for_test_with_handles(home, config, agent, None).await
+}
+
+/// The shared body of the three `spawn_for_test_with_*` entry points.
+async fn spawn_for_test_with_handles(
+    home: PathBuf,
+    mut config: WebConfig,
+    agent: Option<Arc<Agent>>,
+    supervisor: Option<Arc<Supervisor>>,
+) -> Result<(SocketAddr, ())> {
     config.enabled = true;
-    let state = build_state(config, home, agent, None)?;
+    let state = build_state(config, home, agent, supervisor)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {

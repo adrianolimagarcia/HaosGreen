@@ -20,6 +20,7 @@
 pub mod auth_routes;
 pub mod chat;
 pub mod settings;
+pub mod supervisor;
 
 use axum::Router;
 
@@ -31,11 +32,16 @@ use crate::web::state::WebState;
 /// The `/api/ping` placeholder from Task 6 is gone: `/api/settings` is a real
 /// protected route, and the guard is covered by the integration tests against
 /// it.
+///
+/// The supervisor routes belong here and not on [`public_router`]: submitting a
+/// task starts work on the operator's behalf, and every lifecycle route changes
+/// persisted state.
 pub fn router() -> Router<WebState> {
     Router::new()
         .merge(auth_routes::router())
         .merge(chat::router())
         .merge(settings::router())
+        .merge(supervisor::router())
 }
 
 /// Routes reachable without a session, already wrapped in the IP and CSRF
