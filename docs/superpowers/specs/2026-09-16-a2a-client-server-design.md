@@ -1,12 +1,12 @@
 # A2A (Agent2Agent) Client + Server Design
 
 Date: 2026-09-16
-Status: Server phases 1–4 implemented; Phase 5 outbound client remains
+Status: Fully implemented (Phases 1–5: Server phases 1–4 and Phase 5 outbound client & tool)
 
 ## Current implementation status
 
-The server-side phases are implemented and covered by unit and live E2E tests:
-`AgentExecutor` drives the RustFox agent loop under the authenticated peer tool
+Both server-side and client-side phases are implemented and covered by unit and live E2E tests:
+- Server: `AgentExecutor` drives the RustFox agent loop under the authenticated peer tool
 policy; `SendMessage`, `SendStreamingMessage`, `GetTask`, and `CancelTask` use
 the SDK router and SQLite task store; and `TaskGate` bounds concurrent tasks.
 The SDK JSON-RPC router is mounted at `/jsonrpc`; its streaming method returns
@@ -16,9 +16,12 @@ these are not emitted as A2A Message events; SSE currently streams lifecycle
 transitions. The production `A2aExecutor` emits `TASK_STATE_WORKING`, then emits
 a terminal task whose state reflects the agent outcome (`TASK_STATE_COMPLETED`,
 `TASK_STATE_FAILED`, or `TASK_STATE_CANCELED`) and whose history includes the
-terminal reply. The
-remaining work is Phase 5 outbound client support (`client.rs` and the
-`call_a2a_agent` tool).
+terminal reply.
+- Client: Phase 5 outbound client support (`client.rs` and the `call_a2a_agent` tool in
+`tool.rs`) is implemented. RustFox can discover remote agent cards via authenticated
+GET requests, construct an `A2AClient` with Bearer auth, send tasks, and poll for
+completion with bounded timeouts. Anti-recursion is enforced by keeping `call_a2a_agent`
+strictly out of `DEFAULT_PEER_TOOLS`.
 
 ## Goal
 
@@ -379,15 +382,29 @@ depend on were in place.
 
 | Phase | Content | Depends on | Verifiable by |
 |---|---|---|---|
-| 1 | `card.rs` + `auth.rs` + `policy.rs` + config plumbing; Agent Card served, endpoints reject unauthenticated requests | — | success criteria 1 and 3 |
-| 2 | `task_store.rs` + `executor.rs` + `SendMessage` synchronous path; task reaches `completed` | 1 | success criteria 2 and 4 |
-| 3 | `GetTask`, `CancelTask`, semaphore; lifecycle fully async | 2 | success criteria 5 |
+| 1 | `card.rs` + `auth.rs` + `policy.rs` + config plumbing; Agent Card served, endpoints reject unauthenticated requests | — | success criteria 1 and 3 (implemented) |
+| 2 | `task_store.rs` + `executor.rs` + `SendMessage` synchronous path; task reaches `completed` | 1 | success criteria 2 and 4 (implemented) |
+| 3 | `GetTask`, `CancelTask`, semaphore; lifecycle fully async | 2 | success criteria 5 (implemented) |
 | 4 | `SendStreamingMessage` SSE | 3 | streaming interop test (implemented) |
-| 5 | `client.rs` + `call_a2a_agent` tool | 2 | success criterion 6 |
+| 5 | `client.rs` + `call_a2a_agent` tool | 2 | success criterion 6 (implemented) |
 
-Phase 1 established authentication before the executor was introduced. The
-server-side implementation now covers Phases 1–4; Phase 5 remains future work
-as noted above.
+Phase 1 established authentication before the executor was introduced. Server phases
+1–4 and Phase 5 outbound client support are all fully implemented and tested.
+
+### Outbound Client and `call_a2a_agent` Architecture (Phase 5)
+
+- **Discovery & Client Construction (`src/a2a/client.rs`)**:
+  - `A2aClient::discover`: Validates outbound peer config and fetches `/.well-known/agent-card.json` with an explicit `reqwest` timeout and `Authorization: Bearer <token>`. Validates that the remote card advertises a supported JSON-RPC 1.0 interface.
+  - `A2aClient::from_card`: Uses official `a2a-client-lf` `A2AClientFactory` configured with `AuthInterceptor::bearer(token)` and JSON-RPC transport to construct `A2AClient`.
+  - Bounded Execution: `send_text` / `send_message` creates a valid A2A v1 request (role `User`, UUID message id). If the remote peer responds synchronously with a terminal task or message, the text is extracted. If the task is non-terminal, `poll_task` repeatedly calls `get_task` at intervals of `poll_interval_ms` until a terminal state (`Completed`, `Failed`, `Canceled`) or `poll_timeout_secs` deadline is reached.
+  - **No automatic POST retries**: Outbound `SendMessage` requests are not automatically retried if they fail or time out, preventing unintended duplicate task execution on the remote agent.
+
+- **Tool Integration & Anti-Recursion (`src/a2a/tool.rs`)**:
+  - Exposes the `call_a2a_agent` tool taking arguments `{"peer": "<name>", "prompt": "<text>"}`.
+  - If no outbound peers are configured in `config.toml` (`[a2a.outbound.peers]`), the tool definition is empty and not advertised to the LLM.
+  - Peer lookup is strict: unknown peer names fail closed immediately without making network calls.
+  - **Anti-Recursion Invariant**: `call_a2a_agent` is strictly forbidden from `DEFAULT_PEER_TOOLS` in `src/a2a/policy.rs`. Remote peers calling into RustFox cannot invoke `call_a2a_agent` unless explicitly and deliberately granted via wildcard or explicit operator configuration, preventing unconstrained remote agent call amplification loops.
+  - **Secret Redaction**: Configured tokens are never serialized in debug outputs (`A2aOutboundPeerConfig::fmt` uses `[REDACTED]`). Tool outputs and error messages are filtered through `sanitize_text` to scrub any configured peer tokens and generic `Bearer <token>` / `token: ...` patterns before returning to the model or logging.
 
 ## Risks
 

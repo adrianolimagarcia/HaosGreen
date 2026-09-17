@@ -88,16 +88,18 @@ src/
 │   ├── sender.rs       # PlatformSender trait
 │   ├── telegram.rs     # teloxide bot: dispatch, handle_message, all bot commands
 │   └── tool_notifier.rs# Friendly per-tool progress messages
-├── a2a/                # Agent2Agent protocol (server phases 1–3: card, auth,
+├── a2a/                # Agent2Agent protocol (server phases 1–4: card, auth,
 │                       #   policy, executor, task store, GetTask/CancelTask,
-│                       #   and concurrency gate; streaming/client remain)
+│                       #   concurrency gate, SSE streaming; Phase 5 client & tool)
 │   ├── mod.rs
 │   ├── card.rs         # Agent Card generation (/.well-known/agent-card.json)
 │   ├── auth.rs         # Bearer + IP authentication -> PeerIdentity
 │   ├── policy.rs       # Per-peer tool allowlist (DEFAULT_PEER_TOOLS)
 │   ├── executor.rs     # AgentExecutor and TaskGate concurrency control
 │   ├── task_store.rs   # SQLite-backed A2A task persistence
-│   └── server.rs       # axum listener: card + authenticated JSON-RPC routes
+│   ├── server.rs       # axum listener: card + authenticated JSON-RPC routes
+│   ├── client.rs       # Outbound A2A client: card discovery, auth, message/poll
+│   └── tool.rs         # `call_a2a_agent` tool implementation and secret redaction
 ├── supervisor/         # Autonomous task runner (see below)
 └── utils/
 ```
@@ -297,29 +299,33 @@ dispatch through a `special_tool_handler` closure instead.
 
 ## A2A (Agent2Agent) protocol
 
-Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs` starts an axum listener alongside the Telegram bot. The server currently provides the Agent Card, authentication, per-peer tool policy, a real `AgentExecutor`/task store, `SendMessage`, `GetTask`, `CancelTask`, and a `TaskGate` concurrency semaphore. The SDK also supports `returnImmediately`; Phase 4 SSE streaming and Phase 5 outbound client support remain outstanding.
+Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs` starts an axum listener alongside the Telegram bot. The server provides:
+- Server phases 1–4: Agent Card (`/.well-known/agent-card.json`), Bearer + IP authentication, per-peer tool policy, real `AgentExecutor`/task store, JSON-RPC operations (`SendMessage`, `GetTask`, `CancelTask`), concurrency control via `TaskGate`, and SSE streaming (`SendStreamingMessage` emitting lifecycle transitions).
+- Client & tool (Phase 5): Outbound A2A client (`src/a2a/client.rs`) and `call_a2a_agent` tool (`src/a2a/tool.rs`) allowing RustFox to delegate tasks to remote A2A peers.
 
+### Endpoints
 - `GET /.well-known/agent-card.json` — **public**, no auth. Lists skills by
   name/description/tags only; instruction bodies are never included.
 - `POST /jsonrpc` — requires a per-peer bearer token **and** a source IP matching
   the same peer. 401 (bad/absent token), 403 (IP not allowed), 500 (duplicate
   tokens), and JSON-RPC task-method responses for authenticated requests.
 
-Config lives in `[a2a]`, `[a2a.card]` and `[a2a.peers.<name>]`; see
-`config.example.toml`. `A2aConfig::validate()` runs at startup and refuses to
-start the listener on duplicate tokens, an empty token, an empty `ip` list, an
-unparseable IP/CIDR, or any request for TLS (not implemented — rejected rather
-than silently served as plaintext). A listener failure never prevents the
-Telegram bot from starting.
+### Configuration
+- Server config lives in `[a2a]`, `[a2a.card]` and `[a2a.peers.<name>]`.
+- Outbound client peers are configured under `[a2a.outbound.peers.<name>]` with keys `url`, `token`, `timeout_secs`, `poll_interval_ms`, and `poll_timeout_secs`. See `config.example.toml`.
+
+`A2aConfig::validate()` runs at startup and refuses to start the listener on duplicate tokens, an empty token, an empty `ip` list, an unparseable IP/CIDR, or any request for TLS (not implemented — rejected rather than silently served as plaintext). A listener failure never prevents the Telegram bot from starting.
 
 Design spec: `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md`.
 Implementation plans: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-policy.md`,
-`docs/superpowers/plans/2026-09-16-a2a-phase2-task-store-executor.md`, and
-`docs/superpowers/plans/2026-09-16-a2a-phase3-concurrency-get-cancel.md`.
+`docs/superpowers/plans/2026-09-16-a2a-phase2-task-store-executor.md`,
+`docs/superpowers/plans/2026-09-16-a2a-phase3-concurrency-get-cancel.md`, and
+`docs/superpowers/plans/2026-09-16-a2a-phase5-client-tool.md`.
 
 > **Security invariants — do not weaken without a written reason:**
 > - `DEFAULT_PEER_TOOLS` (`src/a2a/policy.rs`) is an **allowlist**. A tool added
 >   to RustFox is *not* granted to peers until it is named there.
+> - **Anti-recursion invariant**: `call_a2a_agent` is **NEVER** in `DEFAULT_PEER_TOOLS`. An inbound peer cannot call outbound A2A peers through RustFox unless explicitly granted by operator policy, preventing unbounded peer-to-peer amplification loops.
 > - `read_soul_file` and `plan_view` are deliberately excluded: `read_soul_file`
 >   can reach `~/.rustfox/config.toml`, which holds the API key and every peer
 >   token. Do not add them back.
@@ -328,6 +334,8 @@ Implementation plans: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-po
 >   refused rather than resolved by `HashMap` iteration order.
 > - The card's advertised URL must come from the address actually bound (or
 >   `public_url`), never the raw `bind` string.
+> - **Redacted tokens**: Outbound peer tokens are never printed in debug representations (`A2aOutboundPeerConfig` redacts tokens), and error messages returned by `call_a2a_agent` sanitize configured tokens and bearer patterns before returning to the model or logs.
+> - **No automatic POST retries**: Outbound `SendMessage` calls are never automatically retried to avoid duplicate remote task creation; only `GetTask` polling retries up to `poll_timeout_secs`.
 
 ## Files Not to Commit
 

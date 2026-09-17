@@ -317,3 +317,16 @@ Be concise and helpful."""
 # loopback, but a remote peer cannot use `http://0.0.0.0:8443` -- it resolves to
 # the *peer's own* loopback. So set `public_url` whenever you bind to 0.0.0.0 or
 # run behind a reverse proxy; startup warns when the derived URL looks unusable.
+#
+# ── Outbound A2A Client Peers (optional) ────────────────────────────────────
+#
+# Allows RustFox to call remote A2A agents via the `call_a2a_agent` tool.
+# If no outbound peers are configured, the tool remains unregistered in the
+# agent tool registry.
+#
+# [a2a.outbound.peers.researcher]
+# url = "http://192.168.1.51:8443"            # Remote agent base URL (http:// or https://)
+# token = "remote-peer-bearer-token"          # Bearer token for remote authentication
+# timeout_secs = 30                           # HTTP request timeout in seconds (default: 30)
+# poll_interval_ms = 250                      # Polling interval in ms when awaiting async tasks (default: 250)
+# poll_timeout_secs = 60                      # Maximum duration to wait for task completion (default: 60)
