@@ -82,6 +82,14 @@
 //!    or a full disk therefore leaves the old file or the new one, never a
 //!    truncated one — a truncated `config.toml` means the operator's bot does
 //!    not start.
+//!
+//!    The target is resolved through any symlink **first** ([`resolve_target`]),
+//!    so a `config.toml` that is a link into a dotfiles repository keeps its
+//!    link and the real file is the one replaced. `rename(2)` replaces the link
+//!    itself, not what it points at, so writing to the path as given would turn
+//!    the operator's symlink into a regular file, leave the real configuration
+//!    stale and copy every secret into a new inode without the target's
+//!    ownership or ACLs.
 //! 3. Only then is the shared configuration handle replaced — the same handle
 //!    `call_a2a_agent` reads, so the running agent uses the new peers on its
 //!    next invocation.
@@ -111,6 +119,26 @@
 //! like every other mutating route, and reachable only with an operator session
 //! or the operator's bearer token. Nothing here is reachable unauthenticated.
 //!
+//! # "The stored one" means the file's, not the handle's
+//!
+//! Every "keep what the peer already has" default — the token and the three
+//! timeouts — comes from the document **just parsed from `config.toml`**, never
+//! from the in-memory handle. The two agree at startup and after every `PUT`,
+//! but an operator who rotates a token by editing `config.toml` without
+//! restarting leaves the handle stale, and the UI's promise is "empty keeps the
+//! stored token". Taking that default from the handle would have the route
+//! compose the *old* token and write it back over the new one — silently
+//! reverting an out-of-band rotation, while the running agent kept using the old
+//! token and its calls failed with no diagnosable cause. The file wins because
+//! the file is what the next start reads.
+//!
+//! Reading the token from the file is safe: it stays in this process, and the
+//! response carries only a fingerprint.
+//!
+//! The file is read **once**, before the candidate is built, and the same parsed
+//! document is what the write edits — so there is no window in which the
+//! defaults and the rewrite could come from two different versions of the file.
+//!
 //! # A rejected `PUT` changes nothing
 //!
 //! The whole candidate configuration is built and validated *before* the live
@@ -119,6 +147,12 @@
 //! through [`A2aOutboundPeerConfig::validate`], the same function
 //! `A2aConfig::validate` calls for each outbound peer at startup, rather than a
 //! second hand-written copy of those rules.
+//!
+//! Peer **names** are checked before the file is read at all, so an invalid name
+//! is a 400 whatever the state of `config.toml`. Everything else is validated
+//! after the read, because the defaults it validates against come from the file;
+//! a request whose peers are all individually well-formed but whose
+//! `config.toml` cannot be read is therefore a 500 rather than a 400.
 //!
 //! # A connection test is bounded
 //!
@@ -550,6 +584,7 @@ struct OutboundPeerView {
 struct OutboundResponse {
     peers: Vec<OutboundPeerView>,
     /// `true`: the peers listed here are in `config.toml` as well as in memory.
+    /// See [`outbound_view`] for what this rests on.
     persistent: bool,
     /// `false`: the change survives a restart. Only an external edit of
     /// `config.toml` followed by a restart discards it.
@@ -561,6 +596,36 @@ struct OutboundResponse {
     token_semantics: &'static str,
 }
 
+/// Describe the live outbound peers, with the three persistence flags.
+///
+/// # The flags are claims about the write path, not observations made here
+///
+/// `persistent`, `restart_reverts` and `affects_running_agent` are **not**
+/// derived from anything this function can see, and that is deliberate:
+///
+/// * `GET` cannot observe the file without reading and parsing `config.toml` on
+///   every poll, and the dashboard polls this route.
+/// * `PUT` *could* observe it — it just wrote it — but the two halves of the
+///   route must not disagree, and the contract is that they report the same
+///   three values.
+///
+/// What the flags rest on is an invariant of [`replace_outbound`]: it writes
+/// `config.toml` **before** it swaps the live handle, and answers **500**
+/// *without* swapping when the write fails. The handle can therefore only ever
+/// hold peers that are also on disk, and a restart — which reads exactly that
+/// file — keeps them. `main.rs` hands the same handle to `call_a2a_agent`, which
+/// is what makes `affects_running_agent` true.
+///
+/// The values are true today, so this is not a lie to the operator. It is a
+/// dependency, and it is named here rather than left implicit because the UI's
+/// save-honesty rests on it: a future path that swapped the handle **without**
+/// writing the file — a read-only-filesystem fallback, a dry-run mode — would
+/// leave the dashboard confidently announcing a save that did not happen, with
+/// the copy driven by a constant.
+/// `tests/web_endpoint.rs`'s
+/// `the_persistence_flags_are_measured_against_the_file_and_the_handle` ties
+/// these three values to the file on disk and to the shared handle, so such a
+/// change fails there instead of in an operator's browser.
 fn outbound_view(outbound: &A2aOutboundConfig) -> OutboundResponse {
     let mut names: Vec<&String> = outbound.peers.keys().collect();
     names.sort();
@@ -663,15 +728,14 @@ async fn replace_outbound(
     // the file and the running agent could disagree.
     let _serialised = a2a.write_lock.lock().await;
 
-    let current = a2a.outbound.read().await.clone();
-
     // Sorted so the error reported for a body with several bad peers is stable
     // across runs, matching `A2aConfig::validate`.
     let mut names: Vec<&String> = body.peers.keys().collect();
     names.sort();
 
-    let mut candidate = A2aOutboundConfig::default();
-    for name in names {
+    // Peer names first, before the file is read at all: an invalid name is a
+    // property of the request body and must not depend on what is on disk.
+    for name in &names {
         if !valid_peer_name(name) {
             tracing::warn!("web: rejected an A2A outbound update with an invalid peer name");
             return (
@@ -683,9 +747,33 @@ async fn replace_outbound(
             )
                 .into_response();
         }
+    }
 
+    // The configuration file is read **once**, here, and supplies both the
+    // "keep what the peer already has" defaults and the document the write
+    // edits. Reading it is blocking work (`read_to_string`), so it runs on the
+    // blocking pool rather than stalling a tokio worker.
+    let config_path = a2a.outbound_config_path.clone();
+    let file = match tokio::task::spawn_blocking(move || ConfigFile::load(&config_path)).await {
+        Ok(Ok(file)) => file,
+        Ok(Err(failure)) => {
+            return persist_failure(&failure, &a2a.outbound_config_path);
+        }
+        Err(join) => {
+            let failure = PersistError::Failed(anyhow::anyhow!(
+                "the configuration file could not be read: {join}"
+            ));
+            return persist_failure(&failure, &a2a.outbound_config_path);
+        }
+    };
+
+    // The file, never the in-memory handle: see `ConfigFile::outbound_peers`.
+    let on_disk = file.outbound_peers();
+
+    let mut candidate = A2aOutboundConfig::default();
+    for name in names {
         let input = &body.peers[name];
-        let existing = current.peers.get(name);
+        let existing = on_disk.peers.get(name);
         let defaults = A2aOutboundPeerConfig::default();
 
         let peer = A2aOutboundPeerConfig {
@@ -739,24 +827,56 @@ async fn replace_outbound(
         candidate.peers.insert(name.clone(), peer);
     }
 
+    // The document edit, the render and the create/write/fsync/chmod/rename
+    // sequence are all blocking work — `sync_all` on a slow volume can take
+    // hundreds of milliseconds, and on a tokio worker thread that is hundreds of
+    // milliseconds in which every other task on that worker is stalled, the
+    // Telegram bot's polling included. The whole read-modify-write therefore
+    // runs on the blocking pool, with the document that was already parsed and
+    // the candidate that was already validated.
+    //
     // Persist first, then apply. The file is the authority: if the write fails,
     // both the file and the running agent must be left exactly as they were, and
     // the caller must be told it failed rather than told "saved".
-    if let Err(failure) = persist_outbound(&a2a.outbound_config_path, &candidate) {
-        // The detail (which carries the path, never a token) goes to the log;
-        // the response body carries no path, like every other route here.
-        tracing::error!(
-            error = %failure.log_detail(&a2a.outbound_config_path),
-            "web: the A2A outbound peers could not be written to the configuration file; \
-             nothing was changed"
-        );
-        return (StatusCode::INTERNAL_SERVER_ERROR, failure.client_message()).into_response();
+    let to_persist = candidate.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        let mut file = file;
+        file.write(&to_persist)
+    })
+    .await;
+
+    let failure = match written {
+        Ok(Ok(())) => None,
+        Ok(Err(failure)) => Some(failure),
+        Err(join) => Some(PersistError::Failed(anyhow::anyhow!(
+            "the configuration file could not be replaced: {join}"
+        ))),
+    };
+    if let Some(failure) = failure {
+        return persist_failure(&failure, &a2a.outbound_config_path);
     }
 
     // The file now holds the new peers. The in-memory swap cannot fail, so this
     // point is the first at which the update is guaranteed to have happened in
     // both places.
-    *a2a.outbound.write().await = candidate;
+    *a2a.outbound.write().await = candidate.clone();
+
+    // Defence in depth for the one class of text this route cannot sanitize
+    // itself: a token it just installed is a token that may end up inside a
+    // `reqwest` URL, a `toml_edit` parse error or an artifact, and the registry
+    // is what catches a value with no recognisable shape wherever it appears.
+    // `register_secret` dedupes and refuses a needle too short to be a
+    // credential, so this is idempotent and cannot over-redact.
+    //
+    // Only the count is logged. Logging the values would be the bug.
+    let registered = crate::supervisor::redact::register_secrets(
+        candidate.peers.values().map(|peer| peer.token.as_str()),
+    );
+    tracing::debug!(
+        peers = candidate.peers.len(),
+        registered,
+        "web: A2A outbound tokens armed in the redaction registry"
+    );
 
     // Names and counts only: this route accepts tokens, and a log line is not
     // the place for one.
@@ -772,15 +892,34 @@ async fn replace_outbound(
     Json(view).into_response()
 }
 
+/// The single failure path of a `PUT`: log the detail, answer the caller.
+///
+/// The detail (which carries the path, never a token) goes to the log; the
+/// response body carries no path, like every other route here. The detail goes
+/// through [`log_safe`] as well, because a `toml_edit` parse error renders the
+/// offending source line and a hand-edited `config.toml` can put a newline in
+/// it.
+fn persist_failure(failure: &PersistError, path: &Path) -> Response {
+    tracing::error!(
+        error = %log_safe(&failure.log_detail(path)),
+        "web: the A2A outbound peers could not be written to the configuration file; \
+         nothing was changed"
+    );
+    (StatusCode::INTERNAL_SERVER_ERROR, failure.client_message()).into_response()
+}
+
 /// The body of `POST /api/a2a/test`: a peer **name**, never a URL.
 ///
 /// `deny_unknown_fields` means a body carrying a `url` alongside the name is
 /// rejected before the handler runs. The field is a name that is looked up in
 /// the configured outbound peers; it is never parsed as an address.
 ///
-/// The name is caller-controlled text, so it is only ever *compared* and
-/// logged through [`log_safe`] — never echoed into a response, and never
-/// allowed to carry a newline into the dashboard's log view.
+/// The name is caller-controlled text. It is only ever *compared*, logged
+/// through [`log_safe`], and echoed through [`echo_safe`] — bounded and stripped
+/// of control characters, so one request produces one bounded log line and one
+/// bounded response field. It is never allowed to carry a newline into either.
+/// The **404** branch does not echo it at all, and says only "unknown outbound
+/// peer": there the caller gets nothing back that they did not already send.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TestPeerRequest {
@@ -803,6 +942,8 @@ struct DiscoveredCard {
 #[derive(Serialize)]
 struct TestResponse {
     ok: bool,
+    /// The peer name as it was given, bounded and stripped of control
+    /// characters by [`echo_safe`]. See [`TestPeerRequest`].
     peer: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     card: Option<DiscoveredCard>,
@@ -842,7 +983,7 @@ async fn test_peer(State(state): State<WebState>, Json(body): Json<TestPeerReque
     match outcome {
         Err(_elapsed) => Json(TestResponse {
             ok: false,
-            peer: body.peer,
+            peer: echo_safe(&body.peer),
             card: None,
             error: Some("the connection test timed out".to_string()),
         })
@@ -856,7 +997,7 @@ async fn test_peer(State(state): State<WebState>, Json(body): Json<TestPeerReque
             );
             Json(TestResponse {
                 ok: false,
-                peer: body.peer,
+                peer: echo_safe(&body.peer),
                 card: None,
                 error: Some(reason),
             })
@@ -882,7 +1023,7 @@ async fn test_peer(State(state): State<WebState>, Json(body): Json<TestPeerReque
 
             Json(TestResponse {
                 ok: true,
-                peer: body.peer,
+                peer: echo_safe(&body.peer),
                 card: Some(DiscoveredCard {
                     name: truncate(&card.name, MAX_ECHOED_CHARS),
                     protocol_binding,
@@ -943,6 +1084,11 @@ impl PersistError {
 
 /// Rewrite `[a2a.outbound.peers]` in `path` to exactly `outbound`, atomically.
 ///
+/// The **synchronous** form of the route's read-modify-write, kept for the tests
+/// that exercise the file handling directly; the route itself interleaves the
+/// read with the request body and runs both halves on the blocking pool. Only
+/// the tests call it, so it is compiled only for them.
+///
 /// Three properties, each of which the module documentation states in full:
 ///
 /// * **Surgical.** The file is parsed with `toml_edit` and only that one table
@@ -959,9 +1105,173 @@ impl PersistError {
 ///   missing file: this route does not create one, because a fresh file holding
 ///   only `[a2a.outbound.peers]` is a configuration the process cannot start
 ///   from.
+#[cfg(test)]
 fn persist_outbound(path: &Path, outbound: &A2aOutboundConfig) -> Result<(), PersistError> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    ConfigFile::load(path)?.write(outbound)
+}
+
+/// The configuration file as it is on disk: the resolved target, its metadata,
+/// and the parsed document.
+///
+/// One value rather than three separate reads, because the route needs all
+/// three of them: the document supplies the "keep what the peer already has"
+/// defaults, the target is what the rename lands on, and the metadata is the
+/// mode the replacement has to carry. Reading it once also removes the window in
+/// which the file could change between the defaults being read and the file
+/// being rewritten.
+struct ConfigFile {
+    /// Where the write actually goes, with every symlink resolved. See
+    /// [`resolve_target`].
+    target: PathBuf,
+    /// The target's own metadata, for its permissions.
+    metadata: std::fs::Metadata,
+    /// The parsed file, kept as a document so the edit stays surgical.
+    document: DocumentMut,
+}
+
+impl ConfigFile {
+    /// Read, resolve and parse the configuration file.
+    ///
+    /// **Blocking.** `read_to_string` is a syscall; the route calls this through
+    /// [`tokio::task::spawn_blocking`].
+    fn load(path: &Path) -> Result<Self, PersistError> {
+        let target = resolve_target(path)?;
+
+        let metadata = std::fs::metadata(&target).map_err(|error| {
+            PersistError::Failed(
+                anyhow::Error::new(error)
+                    .context(format!("{} could not be read", target.display())),
+            )
+        })?;
+
+        let original = std::fs::read_to_string(&target).map_err(|error| {
+            PersistError::Failed(anyhow::Error::new(error).context(format!(
+                "{} could not be read as UTF-8 text",
+                target.display()
+            )))
+        })?;
+
+        // A file this crate cannot parse is a file this route must not rewrite:
+        // the edit is defined in terms of the document that is already there.
+        let document: DocumentMut = original.parse().map_err(|error| {
+            PersistError::Failed(anyhow::anyhow!(
+                "{} is not valid TOML: {error}",
+                target.display()
+            ))
+        })?;
+
+        Ok(Self {
+            target,
+            metadata,
+            document,
+        })
+    }
+
+    /// The outbound peers the **file** currently holds.
+    ///
+    /// This is the authority for a `PUT` that omits a peer's token or timeouts,
+    /// not the in-memory handle. The two agree at startup and after every `PUT`,
+    /// but an operator who rotates a token by editing `config.toml` and does not
+    /// restart leaves the handle stale; taking the default from the handle would
+    /// then have the route compose the *old* token and write it back over the
+    /// new one, while the process carried on using the old one — a silent revert
+    /// with no diagnosable cause. The file wins because the file is what the
+    /// next start reads.
+    ///
+    /// A peer the document does not hold, and a key it does not set, fall back
+    /// to [`A2aOutboundPeerConfig::default`] — the same fallback the route used
+    /// before, so a peer the operator removed from the file is treated as new.
+    fn outbound_peers(&self) -> A2aOutboundConfig {
+        let defaults = A2aOutboundPeerConfig::default();
+        let mut peers = HashMap::new();
+
+        let Some(table) = self
+            .document
+            .get("a2a")
+            .and_then(Item::as_table)
+            .and_then(|a2a| a2a.get("outbound"))
+            .and_then(Item::as_table)
+            .and_then(|outbound| outbound.get("peers"))
+            .and_then(Item::as_table)
+        else {
+            return A2aOutboundConfig::default();
+        };
+
+        for (name, item) in table.iter() {
+            // A `peers` entry that is not a table (`peers = 5`) carries no peer
+            // settings; skipping it leaves it to the default fallback rather
+            // than inventing a peer out of nothing.
+            let Some(peer) = item.as_table() else {
+                continue;
+            };
+
+            let string = |key: &str| peer.get(key).and_then(Item::as_str).map(str::to_string);
+            let integer = |key: &str| {
+                peer.get(key)
+                    .and_then(Item::as_integer)
+                    .and_then(|value| u64::try_from(value).ok())
+            };
+
+            peers.insert(
+                name.to_string(),
+                A2aOutboundPeerConfig {
+                    url: string("url").unwrap_or_default(),
+                    token: string("token").unwrap_or_else(|| defaults.token.clone()),
+                    timeout_secs: integer("timeout_secs").unwrap_or(defaults.timeout_secs),
+                    poll_interval_ms: integer("poll_interval_ms")
+                        .unwrap_or(defaults.poll_interval_ms),
+                    poll_timeout_secs: integer("poll_timeout_secs")
+                        .unwrap_or(defaults.poll_timeout_secs),
+                },
+            );
+        }
+
+        A2aOutboundConfig { peers }
+    }
+
+    /// Replace `[a2a.outbound.peers]` in the document and publish it.
+    ///
+    /// **Blocking**: the route calls this through
+    /// [`tokio::task::spawn_blocking`] with the whole [`ConfigFile`], because
+    /// `write_all`, `sync_all`, `set_permissions` and `rename` are all syscalls
+    /// and `sync_all` on a slow volume can take hundreds of milliseconds.
+    fn write(&mut self, outbound: &A2aOutboundConfig) -> Result<(), PersistError> {
+        set_outbound_peers(&mut self.document, outbound).map_err(PersistError::Failed)?;
+
+        let rendered = self.document.to_string();
+
+        write_replacing(&self.target, rendered.as_bytes(), &self.metadata)
+            .map_err(PersistError::Failed)
+    }
+}
+
+/// The path a write should actually target: `path` with every symlink resolved.
+///
+/// `rename(2)` replaces the **link**, not what it points at. Writing to the path
+/// as given would therefore silently turn a symlinked `config.toml` into a
+/// regular file, leave the real configuration holding its old bytes, and copy
+/// every secret into a new inode without the target's ownership or ACLs.
+/// Symlinking a gitignored credentials file into a dotfiles repository is a
+/// normal setup, and destroying it on the first dashboard save is not something
+/// an operator would expect from a "saved" response.
+///
+/// Resolving the link and operating on the real file keeps the link intact and
+/// the write atomic: the temporary file is created in the *real* target's
+/// directory, so the rename that publishes it stays within one filesystem, and
+/// the link simply points at the updated file afterwards.
+///
+/// Writing *through* the link instead (`File::create(path)` and truncate) is the
+/// alternative that must not be taken: it is not atomic, and a crash halfway
+/// through leaves the operator with a truncated `config.toml` — a bot that does
+/// not start.
+///
+/// `symlink_metadata` rather than `metadata` for the existence check, because a
+/// **dangling** symlink has to be refused exactly like a missing file: this
+/// route must not create a `config.toml`, and writing to the link's target would
+/// create one.
+fn resolve_target(path: &Path) -> Result<PathBuf, PersistError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(PersistError::MissingFile)
         }
@@ -970,29 +1280,18 @@ fn persist_outbound(path: &Path, outbound: &A2aOutboundConfig) -> Result<(), Per
                 anyhow::Error::new(error).context(format!("{} could not be read", path.display())),
             ))
         }
-    };
+    }
 
-    let original = std::fs::read_to_string(path).map_err(|error| {
-        PersistError::Failed(anyhow::Error::new(error).context(format!(
-            "{} could not be read as UTF-8 text",
-            path.display()
-        )))
-    })?;
-
-    // A file this crate cannot parse is a file this route must not rewrite: the
-    // edit is defined in terms of the document that is already there.
-    let mut document: DocumentMut = original.parse().map_err(|error| {
-        PersistError::Failed(anyhow::anyhow!(
-            "{} is not valid TOML: {error}",
-            path.display()
-        ))
-    })?;
-
-    set_outbound_peers(&mut document, outbound).map_err(PersistError::Failed)?;
-
-    let rendered = document.to_string();
-
-    write_replacing(path, rendered.as_bytes(), &metadata).map_err(PersistError::Failed)
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => Ok(resolved),
+        // A dangling link: the path exists, what it names does not.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(PersistError::MissingFile)
+        }
+        Err(error) => Err(PersistError::Failed(anyhow::Error::new(error).context(
+            format!("{} could not be resolved to a real file", path.display()),
+        ))),
+    }
 }
 
 /// Replace the `[a2a.outbound.peers]` table of `document`, and nothing else.
@@ -1244,7 +1543,17 @@ fn test_failure_reason(err: &anyhow::Error, token: &str) -> String {
     bounded_reason(&reason, &[token.to_string()])
 }
 
-/// Redact `secrets` out of `reason` and bound its length.
+/// Redact `secrets` out of `reason`, strip control characters, and bound its
+/// length.
+///
+/// The control-character pass is not cosmetic. The reason is logged
+/// (`tracing::warn!(reason = %reason, …)` in [`test_peer`] and the `tracing::error!`
+/// in [`start_listener`]), and part of it is derived from the operator's own
+/// `config.toml`: `A2aOutboundPeerConfig::validate` and `A2aConfig::validate`
+/// both name the offending peer, and a peer name in a hand-edited file may
+/// contain a newline. A newline in a log message forges a second log line —
+/// exactly what [`log_safe`] exists to prevent for the caller-supplied name, and
+/// the config-derived path needs the same treatment.
 ///
 /// `truncate` cuts on a character boundary, so a multi-byte name cannot be
 /// split into invalid UTF-8.
@@ -1255,7 +1564,7 @@ fn bounded_reason(reason: &str, secrets: &[String]) -> String {
             redacted = redacted.replace(secret.as_str(), "[REDACTED]");
         }
     }
-    truncate(&redacted, MAX_REASON_CHARS)
+    sanitize(&redacted, MAX_REASON_CHARS)
 }
 
 /// First six hex characters of the SHA-256 digest of `token`.
@@ -1304,11 +1613,35 @@ fn valid_peer_name(name: &str) -> bool {
 /// in the dashboard's log view. Control characters are replaced and the result
 /// is bounded, so one request can produce exactly one log line.
 fn log_safe(value: &str) -> String {
+    sanitize(value, MAX_PEER_NAME_CHARS)
+}
+
+/// A caller-supplied string made safe to echo into a response body.
+///
+/// `POST /api/a2a/test` echoes the name it was given back to the caller, and
+/// the name is arbitrary request text: unbounded, it would let one request
+/// return a body of any size. Bounded to [`MAX_ECHOED_CHARS`] — the same bound
+/// every remote-card string gets — and stripped of control characters, so the
+/// echoed value cannot carry a newline into a terminal that prints it.
+///
+/// This is what the "the name is never echoed" claim in the module's earlier
+/// documentation got wrong: it is echoed, in three of the four branches, so it
+/// has to be bounded rather than asserted away.
+fn echo_safe(value: &str) -> String {
+    sanitize(value, MAX_ECHOED_CHARS)
+}
+
+/// Replace every control character with `?` and bound the result to `max`
+/// characters.
+///
+/// The single implementation behind [`log_safe`], [`echo_safe`] and the
+/// config-derived path in [`bounded_reason`], so the three cannot drift apart.
+fn sanitize(value: &str, max: usize) -> String {
     let printable: String = value
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect();
-    truncate(&printable, MAX_PEER_NAME_CHARS)
+    truncate(&printable, max)
 }
 
 /// The tool names the live registry exposes, for expanding a peer's `["*"]`.
@@ -1838,15 +2171,107 @@ bind = "127.0.0.1:8787"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, FIXTURE).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Deliberately **not** `0o600`. The temporary file is created `0o600`, so
+        // a fixture in that mode would make this assertion pass whether or not
+        // `set_permissions` ever runs — it would be measuring the creation mode,
+        // not the preservation. `0o640` is a mode the creation cannot produce, so
+        // the only way to observe it afterwards is to have copied it across.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
 
         persist_outbound(&path, &peers(&["delta"])).expect("the write should succeed");
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
-            "config.toml holds the Telegram token and every peer token; an owner-only file must \
-             stay owner-only, got {mode:o}"
+            mode, 0o640,
+            "config.toml holds the Telegram token and every peer token; the replacement must \
+             carry the original file's mode, got {mode:o}"
+        );
+    }
+
+    /// The write publishes by `rename`, and nothing else observed that.
+    ///
+    /// Every other test here asserts the *end state* — the target's contents, no
+    /// leftover temporary, the error text on failure — and an in-place
+    /// truncate-and-write satisfies all of them. Dropping the `rename` therefore
+    /// left the whole suite green while silently giving up atomicity, which is
+    /// the property that stops a crash or a full disk from leaving a truncated
+    /// `config.toml` behind. A `rename` replaces the directory entry, so the
+    /// inode changes; an in-place write keeps it. That is the difference this
+    /// test measures, and it is the only thing that distinguishes the two.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_publishes_by_rename_rather_than_writing_in_place() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, FIXTURE).unwrap();
+        let before = std::fs::metadata(&path).unwrap().ino();
+
+        persist_outbound(&path, &peers(&["delta"])).expect("the write should succeed");
+
+        let after = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(
+            before, after,
+            "the target must be replaced, not written in place: a crash part-way through an \
+             in-place write leaves a truncated config.toml, which is exactly what the temporary \
+             file and the rename exist to prevent"
+        );
+        assert_eq!(entries(dir.path()), vec!["config.toml".to_string()]);
+    }
+
+    /// A symlinked `config.toml` is written **through**, not replaced.
+    ///
+    /// `rename` replaces the directory entry it is given, so writing to the path
+    /// as given would turn a symlink into a regular file: the link is destroyed,
+    /// the operator's real configuration keeps the old bytes, and the secrets are
+    /// copied into a new inode without the target's ownership or ACLs. Pointing a
+    /// gitignored credentials file at a dotfiles repository is an ordinary thing
+    /// to do, so this is the case the route has to get right.
+    ///
+    /// The mode is `0o640` for the same reason as the test above: `0o600` is the
+    /// temporary file's creation mode and would prove nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_configuration_file_is_written_through_not_replaced() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-config.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&real, FIXTURE).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&real, &link).unwrap();
+
+        persist_outbound(&link, &peers(&["delta"])).expect("the write should succeed");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's symlink must survive a save; replacing it with a regular file would \
+             silently leave the real configuration stale"
+        );
+        let written = std::fs::read_to_string(&real).unwrap();
+        assert!(
+            written.contains("[a2a.outbound.peers.delta]"),
+            "the write must land in the file the symlink names, not in the link: {written}"
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the real file's mode must be carried onto the replacement"
+        );
+        // The temporary is created beside the real file, so the link's directory
+        // holds the link and nothing else.
+        assert_eq!(
+            entries(dir.path())
+                .iter()
+                .filter(|n| n.ends_with(".tmp"))
+                .count(),
+            0,
+            "no temporary file may be left behind"
         );
     }
 

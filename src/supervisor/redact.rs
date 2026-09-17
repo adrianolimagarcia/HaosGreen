@@ -71,6 +71,18 @@ use std::sync::{OnceLock, RwLock};
 /// ~46 bytes, an OpenRouter key ~73).
 pub const MAX_SECRET_LEN: usize = 512;
 
+/// The shortest value [`register_secret`] will accept, in bytes.
+///
+/// A floor for the same reason [`MAX_SECRET_LEN`] is a cap. A short needle is
+/// not a credential, and registering one is destructive rather than merely
+/// useless: the value is replaced *wherever it appears*, so a three-character
+/// needle would rewrite every log line, every artifact and every stored job
+/// summary that happens to contain those characters — the over-redaction failure
+/// this module was already fixed for once, except total. Eight is the same floor
+/// the bare-`Bearer` shape rule uses ([`BEARER_VALUE`]), and it is two orders of
+/// magnitude below the shortest real credential this process holds.
+pub const MIN_SECRET_LEN: usize = 8;
+
 /// What a redacted value is replaced with.
 const MASK: &str = "***";
 
@@ -137,9 +149,17 @@ static REGISTRY: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
 /// True once at least one secret has been registered.
 ///
-/// Read (relaxed) on every `redact()` call: when no secret is registered — every
+/// Read (acquire) on every `redact()` call: when no secret is registered — every
 /// process that never configured one, and every unit test that does not opt in —
 /// the exact-value pass is skipped entirely.
+///
+/// The load is [`Ordering::Acquire`] to pair with the [`Ordering::Release`]
+/// store in [`register_secret`]. A relaxed load here would be a real (if narrow)
+/// race rather than a theoretical one: the flag is what publishes the list, and
+/// a reader that observed it without the acquire could in principle read a
+/// `Vec` that does not yet contain the needle — a log line printed with the
+/// credential still in it. On x86 the acquire load compiles to the same
+/// instruction as the relaxed one, so the guarantee is free.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 fn registry() -> &'static RwLock<Vec<String>> {
@@ -217,12 +237,34 @@ fn rules() -> &'static [Rule] {
 /// * **empty or whitespace-only.** An empty needle matches at every position, so
 ///   registering one would turn every log line into `***`. The guard is explicit
 ///   because the failure is total and silent.
+/// * **shorter than [`MIN_SECRET_LEN`].** Same failure, less obviously: a short
+///   needle is not a credential, and replacing it everywhere would mangle
+///   unrelated text.
 /// * **longer than [`MAX_SECRET_LEN`].** See the constant.
+///
+/// A rejection is **logged**, with the length and never the value: a silently
+/// refused registration is a credential that stays in the logs, so the operator
+/// has to be able to see that it happened. The length is what makes it
+/// diagnosable — `len=4` says the configured token is not a token, `len=600`
+/// says it is not one either.
 ///
 /// Registering the same value twice is a no-op, not a second scan.
 pub fn register_secret(secret: &str) -> bool {
     let needle = secret.trim();
-    if needle.is_empty() || needle.len() > MAX_SECRET_LEN {
+    if needle.is_empty() {
+        return false;
+    }
+    if needle.len() < MIN_SECRET_LEN || needle.len() > MAX_SECRET_LEN {
+        // The length only. A rejected needle is by definition one this module
+        // will not scrub, so logging it would put it in the logs permanently —
+        // the exact outcome the caller was trying to avoid.
+        tracing::warn!(
+            len = needle.len(),
+            min = MIN_SECRET_LEN,
+            max = MAX_SECRET_LEN,
+            "redact: refused a secret whose length is outside the accepted range; \
+             it will NOT be scrubbed from logs"
+        );
         return false;
     }
     let Ok(mut secrets) = registry().write() else {
@@ -255,15 +297,18 @@ pub fn register_secrets<'a>(secrets: impl IntoIterator<Item = &'a str>) -> usize
 /// can guarantee is a secret, and replacing it first means no rule can split it
 /// into pieces the exact match would no longer find.
 fn scrub_registered(text: &str) -> String {
-    if !ARMED.load(Ordering::Acquire) {
-        return text.to_string();
-    }
     let Ok(secrets) = registry().read() else {
         // A poisoned registry is a failure to redact, so the text is left
         // untouched rather than silently mangled — but note that `redact` never
         // panics while holding this lock, so poisoning is unreachable today.
         return text.to_string();
     };
+    if secrets.is_empty() {
+        // The second half of the arm check. `redact` only calls this once
+        // `ARMED` is observed, so the branch is not the hot path's guard; it is
+        // what makes this function correct on its own, for any caller.
+        return text.to_string();
+    }
     let mut out = text.to_string();
     for needle in secrets.iter() {
         if out.contains(needle.as_str()) {
@@ -279,7 +324,10 @@ fn scrub_registered(text: &str) -> String {
 pub fn redact(s: &str) -> String {
     let mut text = Cow::Borrowed(s);
 
-    if ARMED.load(Ordering::Relaxed) {
+    // Acquire, pairing with the release store in `register_secret`: the flag is
+    // what publishes the needle list, so the load that observes it has to be
+    // ordered against the write that filled it.
+    if ARMED.load(Ordering::Acquire) {
         text = Cow::Owned(scrub_registered(text.as_ref()));
     }
 
@@ -489,6 +537,107 @@ mod tests {
         assert_eq!(at_the_cap.len(), MAX_SECRET_LEN);
         assert!(register_secret(&at_the_cap));
         assert!(!redact(&at_the_cap).contains(&at_the_cap));
+    }
+
+    /// A short needle is not a credential, and registering one rewrites
+    /// *unrelated* text: `redact` replaces a registered value wherever it
+    /// appears, so a three-character needle would mangle every log line,
+    /// artifact and stored job summary that happens to contain those
+    /// characters. The floor is the fix.
+    #[test]
+    fn a_secret_shorter_than_the_floor_is_refused() {
+        // A value short enough to appear inside ordinary prose.
+        let too_short = "tok";
+        assert!(
+            !register_secret(too_short),
+            "a 3-byte needle must be refused"
+        );
+        assert!(
+            !register_secret(&"z".repeat(MIN_SECRET_LEN - 1)),
+            "one byte below the floor must be refused"
+        );
+
+        // The proof that matters: the value is still readable in ordinary text
+        // afterwards. If it had been registered, every occurrence would be
+        // `***` — including this sentence's.
+        let prose = "the tok field of an unrelated struct is named tok";
+        assert_eq!(
+            redact(prose),
+            prose,
+            "a refused needle must not rewrite unrelated text"
+        );
+
+        // And the floor itself is accepted, so the guard is a floor rather than
+        // a blanket refusal of short values.
+        let at_the_floor = "floor-01";
+        assert_eq!(at_the_floor.len(), MIN_SECRET_LEN);
+        assert!(register_secret(at_the_floor));
+        assert!(!redact(at_the_floor).contains(at_the_floor));
+    }
+
+    /// The rejection is logged with the length and never the value: a silently
+    /// refused registration is a credential that stays in the logs, and a
+    /// rejection logged with the needle would be worse than the silence.
+    #[test]
+    fn a_refused_needle_is_reported_by_length_and_never_by_value() {
+        use std::io::Write as _;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("the capture buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for Capture {
+            type Writer = Capture;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                Capture(std::sync::Arc::clone(&self.0))
+            }
+        }
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(Capture(std::sync::Arc::clone(&buffer))),
+        );
+
+        // A recognisable short value: if it were logged, the assertion below
+        // would see it.
+        let refused = "SHORTV";
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!register_secret(refused), "a 6-byte needle must be refused");
+        });
+        let _ = std::io::stdout().flush();
+
+        let printed =
+            String::from_utf8_lossy(&buffer.lock().expect("the capture buffer")).into_owned();
+        assert!(
+            !printed.contains(refused),
+            "a refused needle must never be logged: {printed}"
+        );
+        assert!(
+            printed.contains("len=6"),
+            "the rejection must report the length, which is what makes it \
+             diagnosable: {printed}"
+        );
+        assert!(
+            printed.contains("will NOT be scrubbed"),
+            "the operator has to learn the value is not being scrubbed: {printed}"
+        );
     }
 
     #[test]

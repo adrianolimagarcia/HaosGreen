@@ -51,11 +51,18 @@ async fn main() -> Result<()> {
     // suppresses never reaches the buffer and the dashboard shows what the
     // terminal shows. Keeping that composition in the library is what lets a
     // test drive the same subscriber this binary installs.
+    //
+    // The console formatter goes on top through `web::logs::console_layer_with`,
+    // never as a bare `fmt::layer()`: that layer wraps stdout in a
+    // `RedactingWriter`, so the redaction `main.rs` arms below applies to the
+    // terminal and to `journalctl` as well as to the dashboard's ring. Without
+    // it the ring is clean and the persisted console log is not — the leak this
+    // line used to be.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,haos_green=debug,rustfox=debug".into());
 
     haos_green::web::logs::log_subscriber(env_filter, Arc::clone(&logs), Arc::clone(&log_capture))
-        .with(tracing_subscriber::fmt::layer())
+        .with(haos_green::web::logs::console_layer_with(std::io::stdout))
         .init();
 
     // Check for --setup and --service subcommands before doing anything else
@@ -652,8 +659,11 @@ async fn main() -> Result<()> {
 /// are the case that matters: they render the request URL, and a Telegram bot
 /// token lives in that URL's path.
 ///
-/// Empty and unset values are filtered out by `register_secrets` itself; an
-/// empty needle would match everywhere. Nothing here is logged.
+/// Empty, unset and too-short values are filtered out by `register_secrets`
+/// itself; an empty needle would match everywhere, and a needle below
+/// `MIN_SECRET_LEN` is not a credential and would rewrite unrelated text. A
+/// refused value is logged by length, never by value, so a mistyped token is
+/// visible rather than silently unscrubbed. Nothing here is logged.
 ///
 /// `mcp_servers[].env` is deliberately **not** registered: it is a general
 /// environment map (`PATH`, `HOME`, `LANG`), and registering a value that is not

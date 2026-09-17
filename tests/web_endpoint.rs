@@ -4441,6 +4441,77 @@ async fn an_outbound_update_reports_that_it_is_saved_and_live() {
     );
 }
 
+/// The three persistence flags are **measured**, not asserted.
+///
+/// `outbound_view` writes `persistent: true`, `restart_reverts: false` and
+/// `affects_running_agent: true` as literals, and the dashboard's save copy is
+/// driven entirely by them. That is honest today, but it means the UI's honesty
+/// rests on a constant: a future path that updated the handle without writing
+/// the file — a read-only-filesystem fallback, a dry run — would leave the
+/// dashboard confidently announcing a save that never happened.
+///
+/// So this test checks the claim against the two things the flags are about:
+/// the bytes in `config.toml`, and the shared handle the `call_a2a_agent` tool
+/// reads. If the literals ever stop describing what the route actually did, this
+/// fails here rather than in an operator's browser.
+#[tokio::test]
+async fn the_persistence_flags_are_measured_against_the_file_and_the_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config_fixture(dir.path());
+    let config = a2a_config();
+    let outbound = shared_outbound(&config);
+    let state = a2a_state_with_handle(
+        dir.path(),
+        config,
+        a2a_started(),
+        std::sync::Arc::clone(&outbound),
+    );
+    let (base, dir) = spawn_test_server_with_a2a_state(state, dir).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "gamma": { "url": "http://127.0.0.1:9", "token": "gamma-token" } }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("a JSON body");
+
+    // `persistent` and `restart_reverts`: is the peer in the file a restart
+    // would read?
+    let on_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    let in_file = on_disk.contains("[a2a.outbound.peers.gamma]");
+    assert_eq!(
+        body["persistent"],
+        serde_json::json!(in_file),
+        "persistent must describe whether the peer is actually in config.toml; file said \
+         {in_file}: {on_disk}"
+    );
+    assert_eq!(
+        body["restart_reverts"],
+        serde_json::json!(!in_file),
+        "a restart re-reads config.toml, so restart_reverts is the negation of persistence"
+    );
+
+    // `affects_running_agent`: does the handle the tool reads carry the change?
+    let live = outbound.read().await;
+    let seen = live.peers.contains_key("gamma");
+    drop(live);
+    assert_eq!(
+        body["affects_running_agent"],
+        serde_json::json!(seen),
+        "affects_running_agent must describe whether the running tool's handle was updated; \
+         the handle said {seen}"
+    );
+
+    // And the three have to agree with each other: the route claims to do both.
+    assert_eq!(
+        in_file, seen,
+        "the file and the live handle must not disagree"
+    );
+}
+
 #[tokio::test]
 async fn an_outbound_update_reaches_the_running_call_a2a_agent_tool() {
     // The property the shared handle exists for, and it is observed through the
@@ -4662,8 +4733,12 @@ async fn an_outbound_update_keeps_the_configuration_files_permissions() {
     let config_path = dir.path().join("config.toml");
 
     // `config.toml` holds the Telegram token, the OpenRouter key and every peer
-    // token, so an owner-only file is the normal case.
-    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+    // token, so a restrictive mode is the normal case. Deliberately **not**
+    // `0o600`: the temporary file is created `0o600`, so a fixture in that mode
+    // would let this test pass whether or not the route copies the mode across —
+    // it would be asserting the creation mode. `0o640` cannot come from the
+    // creation, so observing it afterwards proves the copy happened.
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o640))
         .expect("chmod the fixture");
     assert_eq!(
         std::fs::metadata(&config_path)
@@ -4671,8 +4746,8 @@ async fn an_outbound_update_keeps_the_configuration_files_permissions() {
             .permissions()
             .mode()
             & 0o777,
-        0o600,
-        "the fixture must start owner-only for this test to mean anything"
+        0o640,
+        "the fixture must start in a mode the temporary file's creation cannot produce"
     );
 
     let response = put_outbound(
@@ -4689,7 +4764,7 @@ async fn an_outbound_update_keeps_the_configuration_files_permissions() {
         .mode()
         & 0o777;
     assert_eq!(
-        mode, 0o600,
+        mode, 0o640,
         "the replacement must carry the original file's mode, got {mode:o}"
     );
 }
@@ -4793,6 +4868,45 @@ async fn an_outbound_update_keeps_a_token_that_was_not_supplied() {
     assert_eq!(
         after["peers"][0]["token_fingerprint"], fingerprint,
         "a refused update must leave the stored token in place"
+    );
+}
+
+/// An out-of-band token rotation in `config.toml` is **kept**, not overwritten.
+///
+/// If the route takes its omission defaults from the in-memory handle, rotating
+/// a token on disk without a restart and then editing *another* peer field in
+/// the dashboard with the token omitted would silently revert the rotation. The
+/// defaults must come from the document just read from disk.
+#[tokio::test]
+async fn an_omitted_token_takes_the_value_currently_on_disk_even_if_memory_differs() {
+    let (base, dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let config_path = dir.path().join("config.toml");
+
+    // Rotate `beta`'s token out-of-band directly on disk, without restarting.
+    let disk_text = std::fs::read_to_string(&config_path).unwrap();
+    let rotated = disk_text.replace("outbound-peer-token-7b2e30", "beta-new-rotated-token");
+    assert_ne!(disk_text, rotated, "the fixture must contain the old token");
+    std::fs::write(&config_path, rotated).unwrap();
+
+    // Now update beta's URL through the dashboard, leaving `token` omitted.
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "beta": { "url": "http://127.0.0.1:9099" } }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    // The written file must preserve the rotated token, NOT the stale startup one.
+    let written = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("beta-new-rotated-token"),
+        "the out-of-band rotated token must be preserved on disk: {written}"
+    );
+    assert!(
+        !written.contains("outbound-peer-token-7b2e30"),
+        "the stale in-memory token must not have been rewritten to disk: {written}"
     );
 }
 

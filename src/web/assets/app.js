@@ -5691,7 +5691,12 @@
 
   function a2aStateText(state) {
     if (state === "started") {
-      return "Started — the listener is serving";
+      // "as observed at startup", not "is serving". The status is a snapshot
+      // taken when the process started the listener: if the serve task dies
+      // afterwards nothing updates this field, so a flat liveness claim would be
+      // one the dashboard cannot back. The failure is logged and shows up in the
+      // log view, which is where an operator would find it.
+      return "Started at launch — the listener bound and was serving then";
     }
     if (state === "disabled") {
       return "Disabled by configuration";
@@ -6126,6 +6131,16 @@
    * — and no claim about what happens to the values afterwards.
    */
   function a2aCautionWorkflow(data) {
+    if (data.persistent === true && data.affects_running_agent !== true) {
+      // Persistent but not live. The save reaches config.toml and stops there,
+      // so the operator still has a manual step — and saying "nothing else to do"
+      // here would be the one thing this page must not do.
+      return (
+        "Run Test connection before you save: it exercises the real discovery path. The save " +
+        "writes [a2a.outbound.peers] in config.toml, but the server did not report that the " +
+        "running agent picks the change up, so restart HaosGreen before relying on it."
+      );
+    }
     if (data.persistent === true) {
       return (
         "Run Test connection before you save: it exercises the real discovery path, and the save " +

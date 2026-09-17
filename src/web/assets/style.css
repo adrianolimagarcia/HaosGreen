@@ -2191,9 +2191,10 @@ input:disabled {
  * than decoration:
  *
  *  * `.a2a-caution` reuses the default-password banner's accent gradient —
- *    attention without alarm — because the outbound editor is in memory only
- *    and an operator who missed that would believe the running agent had been
- *    reconfigured.
+ *    attention without alarm — for the save's consequences, which are not
+ *    obvious from the form: a save rewrites config.toml and can redirect a
+ *    stored peer token to a new host, and an operator who missed that would
+ *    believe the running agent had simply been reconfigured in memory.
  *  * `.a2a-peer-danger` tints a whole peer card, and `.a2a-danger` raises a
  *    warning inside it, for a wildcard tool policy: the one setting on this
  *    page that can hand a remote host shell execution. It is the only peer

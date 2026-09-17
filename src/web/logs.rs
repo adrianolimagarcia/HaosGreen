@@ -60,6 +60,37 @@
 //! realistic flood. Every entry that *is* captured is redacted at construction
 //! (see [`LogEntry::new`]).
 //!
+//! # The console is redacted too, at the writer
+//!
+//! Redacting inside this layer only protects the **ring**. `main.rs` also
+//! installs the console formatter, and before [`RedactingWriter`] existed that
+//! formatter had no redaction at all: every event whose `message` carried a
+//! credential went to stdout — and so to `journalctl`, where
+//! `setup/service.rs` tells the operator to read it — verbatim, while the
+//! dashboard's copy of the same event was clean. A leak that is invisible to the
+//! log-view tests and persisted on disk is the worst shape this bug could have.
+//!
+//! [`RedactingWriter`] closes it on the **write** path: it is a
+//! [`MakeWriter`] wrapper that runs
+//! [`redact`](crate::supervisor::redact::redact) over each buffer before
+//! forwarding it to the writer it wraps, and [`console_layer_with`] is the
+//! composition that installs it. Redacting in [`MessageVisitor`] instead would
+//! have fixed nothing here: the visitor feeds the ring, which was already
+//! covered.
+//!
+//! This is what makes the exact-value registry's stated purpose true. A shape
+//! rule cannot catch a credential with no recognisable shape, and the most
+//! likely secret this process emits has none — `reqwest` renders the request URL
+//! in a transport error, so a failed Telegram call puts
+//! `https://api.telegram.org/bot<token>/sendMessage` into a log message with no
+//! key, no separator and no prefix. `main.rs` registers every configured value
+//! by hand for exactly that case, and until the writer existed those
+//! registrations reached the ring and nothing else.
+//!
+//! The cost is one `redact()` call per console line — the same work the ring
+//! already does for the same events — and it is paid on the logging path of a
+//! process that emits a handful of lines a second.
+//!
 //! # The layer is armed, not merely installed
 //!
 //! `main.rs` installs the layer before the configuration is loaded — the
@@ -92,11 +123,13 @@
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 /// Most bytes of one message the ring retains.
@@ -486,6 +519,131 @@ pub fn log_subscriber(
         .with(LogLayer::new(buffer, armed))
 }
 
+/// The console formatter `main.rs` installs, over a redacting writer.
+///
+/// This exists as a function rather than as an inline
+/// `fmt::layer().with_writer(...)` in `main.rs` for the same reason
+/// [`log_subscriber`] does: the composition the binary actually ships is then
+/// the one under test, so a change that drops the redacting wrapper fails
+/// [`tests::the_console_writer_redacts_a_registered_secret`] instead of shipping.
+///
+/// `writer` is a parameter rather than a hard-coded `std::io::stdout` so the
+/// test can capture what the formatter would have printed. `main.rs` passes
+/// `std::io::stdout`.
+pub fn console_layer_with<W, S>(writer: W) -> impl Layer<S>
+where
+    W: for<'a> MakeWriter<'a> + 'static,
+    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer().with_writer(RedactingWriter::new(writer))
+}
+
+/// A [`MakeWriter`] that redacts everything written through it.
+///
+/// See the module documentation for why redacting here — and not in
+/// [`MessageVisitor`] — is the fix: the visitor feeds the dashboard's ring, which
+/// was already covered, while this is the only thing standing between an event
+/// and stdout, `journalctl`, and the operator's terminal.
+pub struct RedactingWriter<W> {
+    inner: W,
+}
+
+impl<W> RedactingWriter<W> {
+    /// Wrap `inner`, which is any [`MakeWriter`] — `std::io::stdout` in
+    /// `main.rs`, a capture buffer in the tests.
+    pub fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a, W> MakeWriter<'a> for RedactingWriter<W>
+where
+    W: MakeWriter<'a>,
+{
+    type Writer = RedactingWriterGuard<W::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriterGuard {
+            inner: self.inner.make_writer(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// The [`io::Write`] half of [`RedactingWriter`]: buffer, redact, forward.
+///
+/// The buffering is not decoration. `tracing-subscriber` 0.3.23 formats a whole
+/// event into a thread-local `String` and hands it over in a single `write_all`
+/// (`fmt/fmt_layer.rs:1049`), so redacting per `write` call would happen to be
+/// complete today — but nothing in the [`MakeWriter`] contract promises one call
+/// per event, and a formatter that split a credential across two calls would
+/// defeat a per-call redaction while still looking correct. Buffering to the end
+/// of each line, and forwarding whatever is left when the writer is dropped,
+/// makes the property independent of how many calls the formatter makes.
+///
+/// A line is redacted whole, before any of it is written out: redacting after
+/// the fact is not possible, and redacting per fragment could cut a credential
+/// in half and leave a prefix no rule matches.
+pub struct RedactingWriterGuard<W: io::Write> {
+    inner: W,
+    pending: Vec<u8>,
+}
+
+impl<W: io::Write> RedactingWriterGuard<W> {
+    /// Redact `bytes` and hand them to the wrapped writer.
+    fn forward(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Lossy rather than fallible: a log writer that refuses to write because
+        // an event carried a stray byte would turn a cosmetic problem into a
+        // silent one. The console formatter emits UTF-8, so this is a guard
+        // against a caller that does not, not a conversion that normally fires.
+        let text = String::from_utf8_lossy(bytes);
+        let redacted = crate::supervisor::redact::redact(&text);
+        self.inner.write_all(redacted.as_bytes())
+    }
+
+    /// Forward every complete line buffered so far, keeping the tail.
+    fn emit_complete_lines(&mut self) -> io::Result<()> {
+        let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(());
+        };
+        let tail = self.pending.split_off(last_newline + 1);
+        let head = std::mem::replace(&mut self.pending, tail);
+        self.forward(&head)
+    }
+
+    /// Forward whatever is buffered, complete line or not.
+    fn emit_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.forward(&pending)
+    }
+}
+
+impl<W: io::Write> io::Write for RedactingWriterGuard<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        self.emit_complete_lines()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit_pending()?;
+        self.inner.flush()
+    }
+}
+
+impl<W: io::Write> Drop for RedactingWriterGuard<W> {
+    fn drop(&mut self) {
+        // The formatter terminates every event with a newline, so this is the
+        // path for a final fragment with no newline — and for a future caller
+        // that never flushes. The error is dropped rather than panicking: a
+        // `Drop` that panics while the process is shutting down would abort it.
+        let _ = self.emit_pending();
+    }
+}
+
 /// Picks the `message` field out of an event.
 ///
 /// Every other field is deliberately ignored: the design spec's entry shape is
@@ -538,6 +696,7 @@ impl Visit for MessageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     /// An armed switch, for the tests that are about capture rather than about
     /// the arm gate.
@@ -1102,5 +1261,163 @@ mod tests {
             "the inner layer must still receive the event"
         );
         assert!(buffer.is_empty());
+    }
+
+    // ── The console writer (H1) ─────────────────────────────────────────────
+
+    /// A [`MakeWriter`] over a buffer the test can read back.
+    ///
+    /// `Mutex<Vec<u8>>` cannot be shared directly — `tracing-subscriber` has a
+    /// `MakeWriter` impl for `Mutex<W>` but none for `Arc<Mutex<W>>` — so this
+    /// wraps one in an `Arc` and takes the lock in `make_writer`.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+
+    impl io::Write for CapturedGuard<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = CapturedGuard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedGuard(self.0.lock().expect("the capture buffer"))
+        }
+    }
+
+    impl Captured {
+        /// Everything written through this writer so far.
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the capture buffer")).into_owned()
+        }
+    }
+
+    /// The console formatter must redact a **registered** secret, and this is the
+    /// test that has teeth against the whole bug: it drives
+    /// [`console_layer_with`], the composition `main.rs` installs, so replacing
+    /// the redacting wrapper with a plain pass-through writer fails here.
+    ///
+    /// The needle is the case the exact-value registry exists for: it sits in a
+    /// URL path with no key, no separator and no prefix, exactly as a `reqwest`
+    /// transport error renders a Telegram bot token. No shape rule can see it.
+    #[test]
+    fn the_console_writer_redacts_a_registered_secret() {
+        // Unique to this test: the registry is process-global and the unit tests
+        // share one process.
+        let secret = "<CAMPO_SECRET_console_4b7e12>";
+        assert!(
+            crate::supervisor::redact::register_secret(secret),
+            "the needle must be accepted by the registry"
+        );
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(console_layer_with(captured.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "haos_green::logs::console_writer_test",
+                "error sending request for url (https://api.telegram.org/bot{secret}/sendMessage)"
+            );
+        });
+
+        let printed = captured.contents();
+        assert!(
+            !printed.contains(secret),
+            "a registered secret reached the console verbatim: {printed}"
+        );
+        // …and the line was really written, so the assertion above is not
+        // passing because the writer swallowed the event.
+        assert!(
+            printed.contains("api.telegram.org") && printed.contains("sendMessage"),
+            "the console must still receive the line, redacted: {printed}"
+        );
+        assert!(printed.contains("***"), "got {printed}");
+    }
+
+    /// The shape rules apply on the console path too, so a credential that was
+    /// never registered is still scrubbed from stdout and `journalctl`.
+    #[test]
+    fn the_console_writer_applies_the_shape_rules_as_well() {
+        // Built at run time so this file carries no credential-shaped literal.
+        let value = format!("{}{}", "shaped-", "value-0");
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(console_layer_with(captured.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(
+                target: "haos_green::logs::console_writer_test",
+                "the peer refused the call: auth_token={value}"
+            );
+        });
+
+        let printed = captured.contents();
+        assert!(
+            !printed.contains(&value),
+            "a credential-shaped value reached the console: {printed}"
+        );
+        assert!(printed.contains("auth_token=***"), "got {printed}");
+    }
+
+    /// A fragment with no newline is still forwarded when the writer is dropped:
+    /// the formatter always terminates an event, but a writer that silently
+    /// dropped the tail would lose the last line of a process that crashed
+    /// mid-format.
+    #[test]
+    fn a_final_fragment_without_a_newline_is_still_written() {
+        let captured = Captured::default();
+        {
+            let writer = RedactingWriter::new(captured.clone());
+            let mut guard = writer.make_writer();
+            guard
+                .write_all(b"a line with no terminator")
+                .expect("the capture buffer accepts writes");
+        }
+
+        assert_eq!(captured.contents(), "a line with no terminator");
+    }
+
+    /// The property the line buffering exists for, and the reason a per-`write`
+    /// redaction would not be enough on its own: a formatter that emits a
+    /// credential in two calls must still have it redacted as a whole. This
+    /// drives the guard directly, because `tracing-subscriber` 0.3.23 happens to
+    /// hand over one `write_all` per event and would never produce this shape.
+    #[test]
+    fn a_credential_split_across_two_writes_is_redacted_as_a_whole() {
+        let secret = "<CAMPO_SECRET_console_split_9f21>";
+        assert!(
+            crate::supervisor::redact::register_secret(secret),
+            "the needle must be accepted by the registry"
+        );
+
+        let captured = Captured::default();
+        {
+            let writer = RedactingWriter::new(captured.clone());
+            let mut guard = writer.make_writer();
+            guard.write_all(b"calling with ").expect("the first piece");
+            guard
+                .write_all(&secret.as_bytes()[..10])
+                .expect("the first half of the credential");
+            guard
+                .write_all(&secret.as_bytes()[10..])
+                .expect("the second half of the credential");
+            guard.write_all(b"\n").expect("the terminator");
+        }
+
+        let printed = captured.contents();
+        assert!(
+            !printed.contains(secret),
+            "a credential split across two writes must not survive: {printed}"
+        );
+        assert!(printed.contains("calling with"), "got {printed}");
     }
 }
