@@ -176,6 +176,7 @@ mod tests {
             "revert_soul_file",
             "patch_skill",
             "invoke_agent",
+            "call_a2a_agent",
             // Both of these can read outside the sandbox: read_soul_file
             // reaches the RustFox home (config.toml holds the API key and the
             // peer tokens) and accepts an unvalidated file name; plan_view
@@ -369,6 +370,7 @@ mod tests {
             "plan_create",
             "plan_update",
             "plan_view",
+            "call_a2a_agent",
             "mock_tool",
         ]
         .into_iter()

@@ -243,6 +243,11 @@ async fn main() -> Result<()> {
         cancel_registry.clone(),
         sender.clone(),
     )));
+    if !config.a2a.outbound.peers.is_empty() {
+        tool_registry.register(Box::new(rustfox::a2a::tool::CallA2aAgent::new(
+            config.a2a.outbound.clone(),
+        )));
+    }
 
     // Arc::new_cyclic so Agent can store Weak<Self> for job closure captures (breaks Arc cycle)
     let agent = Arc::new_cyclic(|weak| {

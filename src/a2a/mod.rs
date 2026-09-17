@@ -17,11 +17,13 @@ pub mod executor;
 pub mod policy;
 pub mod server;
 pub mod task_store;
+pub mod tool;
 
 pub use auth::{authenticate, AuthError, PeerIdentity};
 pub use executor::{A2aExecutor, NoopExecutor};
 pub use policy::{resolve_allowed_tools, DEFAULT_PEER_TOOLS};
 pub use task_store::SqliteTaskStore;
+pub use tool::CallA2aAgent;
 
 #[cfg(test)]
 mod dependency_probe {
