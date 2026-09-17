@@ -19,8 +19,11 @@
  * the decoder below. The supervisor view lists real tasks and drives their
  * lifecycle through `/api/supervisor/*`. The logs view tails the dashboard's
  * own bounded tracing buffer through the same decoder, dispatching on the
- * `log` event name. A2A is still a deliberate empty state: a stub that invented
- * rows would be worse than an honest "not yet".
+ * `log` event name. The A2A view reports what the listener actually did and
+ * manages the peers, describing its outbound editor from the server's own
+ * persistence flags rather than from a claim made here, and saying plainly that
+ * tokens are write-only and that an inbound peer's allowlists are fail-closed.
+ * No view invents a row it was not given.
  */
 
 (function () {
@@ -61,7 +64,8 @@
     "/a2a": {
       title: "A2A",
       icon: "i-node",
-      body: "A2A will show the listener status, the inbound and outbound peers, and run a real Agent Card discovery test."
+      // Implemented: the A2A view is built by `renderA2a`.
+      body: ""
     },
     "/settings": {
       title: "Settings",
@@ -262,6 +266,7 @@
     resetChat();
     supervisorUnmount();
     logsUnmount();
+    a2aUnmount();
     renderBanner();
     byId("app").hidden = true;
     byId("login-overlay").hidden = false;
@@ -398,10 +403,13 @@
     // Every view owns the whole panel, so the previous one is torn down first —
     // including the chat view's DOM references, which a run that outlives the
     // view would otherwise keep writing into, the supervisor view's poll
-    // timer, and the log view's tail, which must not survive a route change.
+    // timer, the log view's tail, which must not survive a route change, and
+    // the A2A view's in-flight reads, which must not land in a panel that is
+    // gone.
     chatUnmount();
     supervisorUnmount();
     logsUnmount();
+    a2aUnmount();
     clear(host);
     if (route === "/settings") {
       renderSettings(host);
@@ -411,6 +419,8 @@
       renderSupervisor(host);
     } else if (route === "/logs") {
       renderLogs(host);
+    } else if (route === "/a2a") {
+      renderA2a(host);
     } else {
       renderStub(host, route);
     }
@@ -4116,7 +4126,7 @@
     follow: true,
     /** Lines appended while the operator was scrolled away. */
     pendingNew: 0,
-    /** idle | connecting | live | retrying | unavailable | forbidden | unsupported. */
+    /** idle | connecting | live | retrying | unavailable | forbidden | rejected | unsupported. */
     state: "idle",
     /** Failed attempts since the last *stable* stream, for the backoff ladder. */
     attempt: 0,
@@ -4215,7 +4225,12 @@
       return;
     }
     let text = "";
-    if (logs.state === "unavailable" || logs.state === "forbidden" || logs.state === "unsupported") {
+    if (
+      logs.state === "unavailable" ||
+      logs.state === "forbidden" ||
+      logs.state === "rejected" ||
+      logs.state === "unsupported"
+    ) {
       // The status line above is already carrying the reason; a second, wrong
       // explanation ("the buffer is empty") would be worse than none.
       text = "";
@@ -4464,7 +4479,12 @@
     if (logs.state === "retrying") {
       return "warn";
     }
-    if (logs.state === "unavailable" || logs.state === "forbidden" || logs.state === "unsupported") {
+    if (
+      logs.state === "unavailable" ||
+      logs.state === "forbidden" ||
+      logs.state === "rejected" ||
+      logs.state === "unsupported"
+    ) {
       return "error";
     }
     return null;
@@ -4510,6 +4530,17 @@
         ". Retrying is unlikely to help."
       );
     }
+    if (logs.state === "rejected") {
+      // A 4xx that is neither a lost session, a refused address nor the
+      // transient concurrency limit. The server's own words are carried
+      // verbatim when it gave any, because "404" alone would not say *which*
+      // route went missing.
+      return (
+        "The server rejected the log stream: " +
+        (logs.lastError !== "" ? logs.lastError : "the request was rejected") +
+        ". A retry would ask the same question and get the same answer, so this view has stopped retrying on its own."
+      );
+    }
     if (logs.state === "unsupported") {
       return logs.lastError !== ""
         ? logs.lastError
@@ -4525,11 +4556,13 @@
     }
     setStatus(dom.status, logStatusKind(), logStatusText());
     // Retrying is offered only where a retry could plausibly succeed: a 503 is a
-    // startup state and a 403 is an address that has to change, but both can be
-    // resolved by an operator who then wants to reattach without reloading.
+    // startup state, a 403 is an address that has to change and a 4xx is a route
+    // or a request the server would answer the same way again, but all three can
+    // be resolved by an operator who then wants to reattach without reloading.
     dom.retry.hidden = !(
       logs.state === "unavailable" ||
       logs.state === "forbidden" ||
+      logs.state === "rejected" ||
       logs.state === "unsupported"
     );
   }
@@ -4672,14 +4705,44 @@
   }
 
   /**
+   * Whether a non-OK status from `/api/logs/stream` is one to stop on.
+   *
+   * The two answers that already have their own handling — 401 (the session is
+   * gone, so the view signs out) and 403 (the source address is refused) — are
+   * not this predicate's business and are reported as non-terminal here, since
+   * the loop returns on them before it asks. What is left is the difference
+   * between a request the server has already answered and will answer the same
+   * way again, and one worth waiting out:
+   *
+   *  * Every other 4xx is terminal. A 404 from a route that is not mounted, or a
+   *    400 the request itself earns, is not a transient state; retrying it just
+   *    walks the backoff ladder forever.
+   *  * **429 is not terminal.** It is the concurrent-stream limit, and it is
+   *    transient by design: the stream that is holding the slot will end, so
+   *    this waits it out like any other dropped connection.
+   *  * A 5xx, a network failure and a cut stream are not 4xx at all and stay on
+   *    the ladder.
+   */
+  function logStreamStatusIsTerminal(status) {
+    if (status === 401 || status === 403 || status === 429) {
+      return false;
+    }
+    return status >= 400 && status < 500;
+  }
+
+  /**
    * Connect, read, and reconnect while the view is mounted.
    *
    * Every await is guarded on the generation, so a loop that has been superseded
    * by an unmount or an explicit retry stops at its next step instead of
    * starting another connection. The loop ends — rather than retrying — on the
-   * three answers that a retry cannot change: 401 (the session is gone, so the
-   * view signs out), 403 (the source address is refused) and 503 (the dashboard
-   * has no log buffer). Everything else is waited out on the backoff ladder.
+   * answers that a retry cannot change: 401 (the session is gone, so the view
+   * signs out), 403 (the source address is refused), 503 (the dashboard has no
+   * log buffer) and any other 4xx (a route that is not mounted, or a request the
+   * server will answer the same way every time). 429 is deliberately *not* in
+   * that set: it is the concurrent-stream limit and is transient by design, so
+   * it waits out the backoff like a dropped connection. Everything else — 5xx,
+   * a network failure, a cut stream — is waited out on the backoff ladder.
    *
    * `logs.attempt` counts failures since the last stream that stayed up long
    * enough to count (see `LOG_STABLE_MS`), so it is incremented on the failure
@@ -4729,6 +4792,16 @@
         if (status === 503 || status === 403) {
           logs.state = status === 503 ? "unavailable" : "forbidden";
           logs.lastError = raw;
+          paintLogStatus();
+          paintLogEmpty(0);
+          return;
+        }
+        if (logStreamStatusIsTerminal(status)) {
+          // Terminal: no timer is armed and no further attempt is scheduled.
+          // The operator still gets the manual Retry control, because the
+          // route can come back without this page being reloaded.
+          logs.state = "rejected";
+          logs.lastError = raw !== "" ? raw : "the stream answered status " + status;
           paintLogStatus();
           paintLogEmpty(0);
           return;
@@ -5076,6 +5149,1914 @@
     logs.retryDelay = 0;
     logs.connectedBefore = false;
     logs.dom = null;
+  }
+
+  /* ── A2A ───────────────────────────────────────────────────────────────── */
+
+  /*
+   * The A2A connection manager (design spec §5.4, plan Task 20).
+   *
+   * Five properties of the API decide what this view has to say, and saying
+   * them is most of the work — an operator who assumes the opposite of any of
+   * them will misconfigure a surface that lets a remote host run tools here.
+   *
+   *  * `PUT /api/a2a/outbound` **reconfigures a live agent**. The server reports
+   *    what a save actually does in three flags — `persistent`,
+   *    `restart_reverts`, `affects_running_agent` — and the copy below is built
+   *    from those flags plus the server's own `semantics` prose, never from a
+   *    claim hard-coded here. When they say the save writes `config.toml` and
+   *    reaches the running `call_a2a_agent` tool, the block says so, and says why
+   *    that makes the editor dangerous: a save can point a peer's stored token
+   *    at a different host. A flag the server did not send is reported as
+   *    unreported rather than guessed at, so an older server that omits them is
+   *    described as neither persistent nor temporary. The statement sits above
+   *    the editor, not in a footnote under it, because it is what decides
+   *    whether the operator is checking a peer or reconfiguring the agent.
+   *
+   *  * **Tokens are write-only.** No route returns one — not even to an
+   *    authenticated operator — only six hex characters of the SHA-256 digest of
+   *    the configured token. The token field is therefore a password input with
+   *    no reveal control and nothing that suggests a token can be read or copied
+   *    back out, and an empty submission means "keep the stored token" (the
+   *    server's own rule for an omitted key), never "clear it". Clearing a token
+   *    is done by removing the peer; an *explicitly* empty token is a 400.
+   *
+   *  * **`allowed_ips` is fail-closed.** An empty list allows no address at all,
+   *    which is the opposite of `[web].allow_ips`, where an empty list allows
+   *    any source. `allows_no_address` marks such a peer and the server's
+   *    `ip_allowlist_semantics` prose is rendered verbatim beside the list,
+   *    rather than summarised into a wording of this file's own.
+   *
+   *  * **`["*"]` is a trap.** For an inbound peer, `["*"]` as the sole entry
+   *    grants *every* tool, shell execution included — the opposite of the agent
+   *    loop's `allowed_tools`, where a literal `"*"` grants nothing. A wildcard
+   *    peer is rendered in the danger tint with the consequence spelled out, and
+   *    `tools.effective` is what is shown as applying. `effective: null` is
+   *    reported as "cannot be expanded here", never as an empty tool list, which
+   *    would read as "no tools".
+   *
+   *  * **The discovered Agent Card is untrusted remote data.** Only the four
+   *    bounded fields the route echoes are rendered, every one of them through
+   *    `textContent`, and nothing from a card becomes a link, an address, or a
+   *    URL this page would navigate to.
+   *
+   * Teardown follows the supervisor and log views: `a2aUnmount` bumps a
+   * generation counter, so a response that lands after the operator navigated
+   * away — or after the session ended — cannot write into a panel that is gone.
+   * This view sets no timers of its own; the operator reloads when they want to.
+   */
+
+  /** The four routes, each named once so a typo cannot appear in one place. */
+  const A2A_STATUS_PATH = "/api/a2a/status";
+  const A2A_PEERS_PATH = "/api/a2a/peers";
+  const A2A_OUTBOUND_PATH = "/api/a2a/outbound";
+  const A2A_TEST_PATH = "/api/a2a/test";
+
+  /** What a 503 from every one of those routes means, in the operator's terms. */
+  const A2A_UNAVAILABLE_NOTE =
+    "Not available: this dashboard process was started without A2A wiring, so there is nothing to show here. It is a startup configuration state, not a transient failure.";
+
+  /**
+   * The longest list rendered, per peer, before the remainder is summarised.
+   *
+   * `allowed_ips` and `tools.effective` are unbounded from the API's point of
+   * view: the first comes from `config.toml` and the second from the live tool
+   * registry. A few hundred entries are legitimate; a few hundred thousand would
+   * be a panel the operator cannot use. The remainder is always counted on
+   * screen, so nothing is hidden — only collapsed.
+   */
+  const A2A_LIST_RENDER_CAP = 60;
+
+  /** How many peer rows are rendered before the rest are counted instead. */
+  const A2A_PEER_RENDER_CAP = 200;
+
+  /**
+   * The tool-policy `source` values, as the API defines them.
+   *
+   * The labels are deliberately descriptive rather than terse: "wildcard" and
+   * "explicit_wildcard_ignored" are opposite outcomes that differ by one entry
+   * in a list, and the label is what stops them reading alike.
+   */
+  const A2A_TOOL_SOURCES = {
+    default: "No tools key: the conservative default peer allowlist applies",
+    wildcard: "Wildcard: every tool in the live registry applies",
+    explicit: "Explicit allowlist: exactly these tools apply",
+    explicit_wildcard_ignored: "Explicit list: \"*\" is a literal name here, not a wildcard"
+  };
+
+  const a2a = {
+    /** Every reference to this view's DOM, or null while it is unmounted. */
+    dom: null,
+    /**
+     * Bumped by `a2aUnmount`. Every response is applied only while it still
+     * owns the token it was issued under, which is what makes a response that
+     * arrives after a navigation — or after a remount — stale rather than
+     * authoritative.
+     */
+    token: 0,
+    status: null,
+    statusError: "",
+    inbound: null,
+    peersError: "",
+    outbound: null,
+    outboundError: "",
+    /** True when the routes answered 503: no A2A wiring in this process. */
+    unavailable: false,
+    loading: false,
+    loadQueued: false,
+    saving: false,
+    /** The peer whose removal is in flight, or null. */
+    removing: null,
+    /** The peer whose connection test is in flight, or null. */
+    testing: null,
+    /** Test outcomes by peer name, so a repaint does not lose them. */
+    testResults: {},
+    /** The peer being added or edited, or null when the editor is closed. */
+    draft: null
+  };
+
+  /* ── A2A: values from the server ───────────────────────────────────────── */
+
+  /**
+   * A string from the server, or `fallback` when it is not a usable one.
+   *
+   * Every field below crosses a trust boundary: the peer names, addresses and
+   * tool names come from `config.toml`, and the card fields come from another
+   * host. None of them is ever trusted to be the type the API documents.
+   */
+  function a2aText(value, fallback) {
+    return typeof value === "string" && value !== "" ? value : fallback;
+  }
+
+  /** A non-negative integer from the server, or null when it is not one. */
+  function a2aCount(value) {
+    if (typeof value !== "number" || !isFinite(value) || value < 0) {
+      return null;
+    }
+    return Math.floor(value);
+  }
+
+  /** A count as it is rendered: a number, or an admission that none was sent. */
+  function a2aCountText(value) {
+    return value === null ? "not reported" : String(value);
+  }
+
+  /**
+   * `true`, `false`, or `null` when the server did not say.
+   *
+   * The three persistence facts use this. Rendering a missing field as `false`
+   * would assert something the server never stated, and the difference between
+   * "this editor does not persist" and "nobody told the dashboard" is exactly
+   * the difference the operator needs.
+   */
+  function a2aFlag(value) {
+    if (value === true) {
+      return true;
+    }
+    if (value === false) {
+      return false;
+    }
+    return null;
+  }
+
+  /**
+   * The string entries of a server-supplied list.
+   *
+   * The API types these as `Vec<String>`; anything else is dropped rather than
+   * stringified into `[object Object]`, and the count rendered next to the list
+   * comes from this same array, so a dropped entry can never inflate a total.
+   */
+  function a2aStringList(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    const list = [];
+    for (let i = 0; i < value.length; i += 1) {
+      if (typeof value[i] === "string") {
+        list.push(value[i]);
+      }
+    }
+    return list;
+  }
+
+  /** `text`, cut to `max` characters so a hostile string cannot fill a panel. */
+  function a2aClip(text, max) {
+    const value = String(text);
+    return value.length <= max ? value : value.slice(0, max) + "…";
+  }
+
+  function normalizeA2aStatus(body) {
+    const raw = body && typeof body === "object" ? body : {};
+    return {
+      enabled: raw.enabled === true,
+      // Not validated against a closed set: a state this build has never seen
+      // is displayed as the server spelled it rather than mapped to a guess.
+      state: a2aText(raw.state, "unknown"),
+      bound: a2aText(raw.bound, ""),
+      advertisedUrl: a2aText(raw.advertised_url, ""),
+      failure: a2aText(raw.failure, ""),
+      cardName: a2aText(raw.card_name, ""),
+      inboundPeers: a2aCount(raw.inbound_peers),
+      outboundPeers: a2aCount(raw.outbound_peers)
+    };
+  }
+
+  function normalizeA2aToolPolicy(raw) {
+    const tools = raw && typeof raw === "object" ? raw : {};
+    return {
+      // `null` and `[]` are different answers: the key absent versus an
+      // explicitly empty allowlist. `Array.isArray` is what keeps them apart.
+      configured: Array.isArray(tools.configured) ? a2aStringList(tools.configured) : null,
+      source: a2aText(tools.source, "unknown"),
+      effective: Array.isArray(tools.effective) ? a2aStringList(tools.effective) : null,
+      effectiveUnavailable: a2aText(tools.effective_unavailable, "")
+    };
+  }
+
+  function normalizeA2aInboundPeer(raw) {
+    const peer = raw && typeof raw === "object" ? raw : {};
+    return {
+      name: a2aText(peer.name, "(unnamed peer)"),
+      fingerprint: a2aText(peer.token_fingerprint, ""),
+      allowedIps: a2aStringList(peer.allowed_ips),
+      allowsNoAddress: peer.allows_no_address === true,
+      tools: normalizeA2aToolPolicy(peer.tools)
+    };
+  }
+
+  function normalizeA2aInbound(body) {
+    const raw = body && typeof body === "object" ? body : {};
+    return {
+      peers: Array.isArray(raw.peers) ? raw.peers.map(normalizeA2aInboundPeer) : [],
+      ipSemantics: a2aText(raw.ip_allowlist_semantics, ""),
+      toolSemantics: a2aText(raw.tool_policy_semantics, ""),
+      tokenSemantics: a2aText(raw.token_semantics, "")
+    };
+  }
+
+  function normalizeA2aOutboundPeer(raw) {
+    const peer = raw && typeof raw === "object" ? raw : {};
+    return {
+      name: a2aText(peer.name, "(unnamed peer)"),
+      url: a2aText(peer.url, ""),
+      fingerprint: a2aText(peer.token_fingerprint, ""),
+      timeoutSecs: a2aCount(peer.timeout_secs),
+      pollIntervalMs: a2aCount(peer.poll_interval_ms),
+      pollTimeoutSecs: a2aCount(peer.poll_timeout_secs)
+    };
+  }
+
+  function normalizeA2aOutbound(body) {
+    const raw = body && typeof body === "object" ? body : {};
+    return {
+      peers: Array.isArray(raw.peers) ? raw.peers.map(normalizeA2aOutboundPeer) : [],
+      persistent: a2aFlag(raw.persistent),
+      restartReverts: a2aFlag(raw.restart_reverts),
+      affectsRunningAgent: a2aFlag(raw.affects_running_agent),
+      semantics: a2aText(raw.semantics, ""),
+      tokenSemantics: a2aText(raw.token_semantics, "")
+    };
+  }
+
+  /* ── A2A: the tool policy, read exactly as the API defines it ──────────── */
+
+  function a2aToolSourceLabel(source) {
+    return Object.prototype.hasOwnProperty.call(A2A_TOOL_SOURCES, source)
+      ? A2A_TOOL_SOURCES[source]
+      : "Unrecognised policy (\"" + a2aClip(source, 40) + "\")";
+  }
+
+  function a2aIsWildcard(tools) {
+    return tools.source === "wildcard";
+  }
+
+  /**
+   * Whether the resolved list actually names shell execution.
+   *
+   * Checked against `tools.effective` — the list that applies — rather than
+   * assumed from the wildcard, so the warning states what the dashboard can
+   * see. The wildcard follows the registry, so a peer without it today can have
+   * it tomorrow; the warning says that too rather than implying otherwise.
+   */
+  function a2aGrantsShell(tools) {
+    return (
+      a2aIsWildcard(tools) &&
+      tools.effective !== null &&
+      tools.effective.indexOf("execute_command") !== -1
+    );
+  }
+
+  /* ── A2A: the PUT body ─────────────────────────────────────────────────── */
+
+  /**
+   * Whether `PUT /api/a2a/outbound` would accept this peer name.
+   *
+   * The route rejects a name that is empty, longer than 64 characters, or that
+   * carries anything outside ASCII letters, digits, `-`, `_` and `.`. A name in
+   * `config.toml` is not restricted that way — a hand-written file is the
+   * operator's own business — so a configured peer *can* have a name this
+   * editor cannot write back. Sending the whole map anyway would have the
+   * server reject the update with a message that does not name the peer, and
+   * dropping the peer from the body would delete it silently. The view
+   * therefore refuses to save and says which peer is the problem.
+   */
+  function a2aNameWritable(name) {
+    return (
+      typeof name === "string" &&
+      name.length >= 1 &&
+      name.length <= 64 &&
+      /^[A-Za-z0-9._-]+$/.test(name)
+    );
+  }
+
+  /** The configured peers a `PUT` could not carry back, by name. */
+  function a2aWritablePeers(peers) {
+    const bad = [];
+    for (let i = 0; i < peers.length; i += 1) {
+      if (!a2aNameWritable(peers[i].name)) {
+        bad.push(peers[i].name === "" ? "(empty name)" : a2aClip(peers[i].name, 40));
+      }
+    }
+    return bad;
+  }
+
+  /**
+   * The `PUT` entry for a peer that is already configured.
+   *
+   * `token` is deliberately absent. The API keeps the stored token when the key
+   * is omitted, and this dashboard never reads a token back in order to send
+   * one — so the omission is the only correct value here.
+   */
+  function a2aPeerPayload(peer) {
+    return {
+      url: peer.url,
+      timeout_secs: peer.timeoutSecs,
+      poll_interval_ms: peer.pollIntervalMs,
+      poll_timeout_secs: peer.pollTimeoutSecs
+    };
+  }
+
+  /**
+   * The `PUT` entry for the peer being edited.
+   *
+   * An empty token field omits `token`, which is the API's "keep the stored
+   * one". It is never sent as an empty string: an *explicitly* empty token is a
+   * 400 that rejects the whole update, and for a peer that does not exist yet
+   * there is nothing to keep, so the omission means "no token" and the same 400
+   * comes back. The editor says so above the field.
+   */
+  function a2aDraftPayload(values) {
+    const payload = { url: values.url };
+    if (values.token !== "") {
+      payload.token = values.token;
+    }
+    if (values.timeoutSecs !== null) {
+      payload.timeout_secs = values.timeoutSecs;
+    }
+    if (values.pollIntervalMs !== null) {
+      payload.poll_interval_ms = values.pollIntervalMs;
+    }
+    if (values.pollTimeoutSecs !== null) {
+      payload.poll_timeout_secs = values.pollTimeoutSecs;
+    }
+    return payload;
+  }
+
+  /**
+   * The body of `PUT /api/a2a/outbound`: the **whole** peer map.
+   *
+   * The route replaces the configured set rather than merging into it, so a
+   * body carrying only the edited peer would delete every other one. The map is
+   * built on a null prototype because a peer named `__proto__` is a legal name
+   * here — letters and underscores — and assigning that key on an object
+   * literal would set the prototype instead of adding a peer, silently dropping
+   * it from the request.
+   */
+  function a2aPutBody(peers, editedName, editedPayload) {
+    const map = Object.create(null);
+    for (let i = 0; i < peers.length; i += 1) {
+      map[peers[i].name] = a2aPeerPayload(peers[i]);
+    }
+    if (editedName !== null) {
+      map[editedName] = editedPayload;
+    }
+    return { peers: map };
+  }
+
+  /**
+   * Read one of the editor's numeric fields.
+   *
+   * An empty field omits the key, which is how the API is told to keep the
+   * stored value — or the peer's default, for a peer that does not exist yet.
+   * A non-numeric entry is refused here instead of being sent: `-1` in a `u64`
+   * field is a 422 whose body says nothing about which field was wrong. `0` is
+   * deliberately *sent*: the server's own rule ("at least 1") is the authority,
+   * its message names the field, and the operator sees the real reason.
+   */
+  function a2aNumberField(raw, label) {
+    const text = typeof raw === "string" ? raw.trim() : "";
+    if (text === "") {
+      return { ok: true, value: null };
+    }
+    if (!/^[0-9]+$/.test(text)) {
+      return {
+        ok: false,
+        message: label + " must be a whole number of at least 1, or empty to keep the stored value."
+      };
+    }
+    const value = Number(text);
+    if (!isFinite(value) || value > Number.MAX_SAFE_INTEGER) {
+      return { ok: false, message: label + " is too large to send." };
+    }
+    return { ok: true, value: value };
+  }
+
+  /* ── A2A: the connection test's answer ─────────────────────────────────── */
+
+  /**
+   * The outcome of `POST /api/a2a/test`, in the four fields the route echoes.
+   *
+   * The card is remote, attacker-controlled data, so only `name`,
+   * `protocol_binding`, `protocol_version` and `skill_count` are read — the
+   * same four the route bounds — and each is coerced to a string here. A 200
+   * with `ok: false` is a failure the server classified; it carries a short
+   * phrase and never an anyhow chain.
+   */
+  function a2aTestOutcome(body) {
+    const raw = body && typeof body === "object" ? body : {};
+    if (raw.ok === true && raw.card && typeof raw.card === "object") {
+      return {
+        ok: true,
+        card: {
+          name: a2aText(raw.card.name, "unnamed"),
+          protocolBinding: a2aText(raw.card.protocol_binding, "not reported"),
+          protocolVersion: a2aText(raw.card.protocol_version, "not reported"),
+          skillCount: a2aCount(raw.card.skill_count)
+        },
+        error: ""
+      };
+    }
+    return {
+      ok: false,
+      card: null,
+      error: a2aText(raw.error, "The peer answered, but the test reported no reason.")
+    };
+  }
+
+  /* ── A2A: small DOM pieces ─────────────────────────────────────────────── */
+
+  /** A hidden `.status` line, filled in by `setStatus` when there is news. */
+  function a2aStatusLine(role) {
+    const node = make("p", "status");
+    node.setAttribute("role", role || "status");
+    node.hidden = true;
+    return node;
+  }
+
+  /** A labelled input for the peer editor. */
+  function a2aInput(id, labelText, type, noteText) {
+    const wrap = make("div", "field");
+    const label = make("label", "field-label", labelText);
+    label.setAttribute("for", id);
+    const input = document.createElement("input");
+    input.id = id;
+    input.name = id;
+    input.type = type;
+    input.spellcheck = false;
+    if (type === "password") {
+      input.setAttribute("autocomplete", "new-password");
+    } else {
+      input.setAttribute("autocomplete", "off");
+      input.setAttribute("autocapitalize", "none");
+      input.setAttribute("autocorrect", "off");
+    }
+    if (type === "number") {
+      input.setAttribute("inputmode", "numeric");
+      input.min = "1";
+    }
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    if (noteText) {
+      wrap.appendChild(make("p", "a2a-field-note", noteText));
+    }
+    return { wrap: wrap, input: input };
+  }
+
+  /** One of the API's own prose paragraphs, under a heading that names it. */
+  function a2aSemanticsBlock(titleText, bodyText) {
+    const box = make("div", "a2a-semantics");
+    box.appendChild(make("p", "a2a-semantics-title", titleText));
+    box.appendChild(make("p", "a2a-semantics-body", bodyText));
+    return box;
+  }
+
+  function a2aSubLabel(text) {
+    return make("p", "a2a-sub-label", text);
+  }
+
+  /**
+   * A list of values as chips, capped.
+   *
+   * The remainder is reported as a count rather than dropped, so a list too
+   * long to render is still described rather than silently shortened.
+   */
+  function a2aChipList(values, extraClass) {
+    const wrap = make("div", "a2a-chips");
+    const shown = values.slice(0, A2A_LIST_RENDER_CAP);
+    for (let i = 0; i < shown.length; i += 1) {
+      wrap.appendChild(make("span", extraClass ? "tag " + extraClass : "tag", shown[i]));
+    }
+    if (values.length > shown.length) {
+      wrap.appendChild(
+        make("span", "tag a2a-more", "+" + (values.length - shown.length) + " more, not shown")
+      );
+    }
+    return wrap;
+  }
+
+  /** The state pill in a card head. The text always names the state. */
+  function a2aStateChip(state) {
+    if (state === "started") {
+      return { className: "chip chip-running a2a-head-chip", text: "STARTED" };
+    }
+    if (state === "failed") {
+      return { className: "chip chip-failed a2a-head-chip", text: "FAILED" };
+    }
+    if (state === "disabled") {
+      // Deliberately the neutral chip: switched off is the default, not a fault.
+      return { className: "chip a2a-head-chip", text: "DISABLED" };
+    }
+    return { className: "chip chip-unknown a2a-head-chip", text: a2aClip(state, 24).toUpperCase() };
+  }
+
+  function a2aStateText(state) {
+    if (state === "started") {
+      return "Started — the listener is serving";
+    }
+    if (state === "disabled") {
+      return "Disabled by configuration";
+    }
+    if (state === "failed") {
+      return "Failed to start";
+    }
+    return "Unrecognised state: " + a2aClip(state, 60);
+  }
+
+  function a2aFindPeer(name) {
+    const data = a2a.outbound;
+    if (!data) {
+      return null;
+    }
+    for (let i = 0; i < data.peers.length; i += 1) {
+      if (data.peers[i].name === name) {
+        return data.peers[i];
+      }
+    }
+    return null;
+  }
+
+  /* ── A2A: the listener card ────────────────────────────────────────────── */
+
+  function a2aStatusCard() {
+    const card = make("section", "card a2a-status");
+    const head = cardHead("i-node", "Listener");
+    const chip = make("span", "chip a2a-head-chip");
+    head.appendChild(chip);
+    card.appendChild(head);
+
+    const failure = make("div", "a2a-failure");
+    card.appendChild(failure);
+
+    const facts = make("dl", "facts a2a-facts");
+    card.appendChild(facts);
+
+    const notes = make("div", "a2a-notes");
+    card.appendChild(notes);
+
+    const actions = make("div", "actions");
+    const reload = button("Reload", "btn", "button");
+    reload.addEventListener("click", function () {
+      a2aLoad();
+    });
+    actions.appendChild(reload);
+    card.appendChild(actions);
+
+    const status = a2aStatusLine();
+    card.appendChild(status);
+
+    return {
+      card: card,
+      chip: chip,
+      failure: failure,
+      facts: facts,
+      notes: notes,
+      reload: reload,
+      status: status
+    };
+  }
+
+  function paintA2aStatus() {
+    const view = a2a.dom && a2a.dom.status;
+    if (!view) {
+      return;
+    }
+    clear(view.failure);
+    clear(view.facts);
+    clear(view.notes);
+    setStatus(view.status, null, "");
+
+    if (a2a.unavailable) {
+      const chip = a2aStateChip("unavailable");
+      view.chip.className = chip.className;
+      view.chip.textContent = chip.text;
+      setStatus(view.status, "warn", a2a.statusError || A2A_UNAVAILABLE_NOTE);
+      return;
+    }
+
+    const data = a2a.status;
+    const chip = a2aStateChip(data ? data.state : "unknown");
+    view.chip.className = chip.className;
+    view.chip.textContent = chip.text;
+
+    if (a2a.statusError !== "") {
+      setStatus(view.status, "error", a2a.statusError);
+    }
+    if (!data) {
+      return;
+    }
+
+    if (data.state === "failed") {
+      // The reason is the point of the card when the listener is down, so it
+      // sits directly under the head rather than among the facts.
+      const box = make("div", "status status-error a2a-failure-box");
+      box.setAttribute("role", "alert");
+      box.textContent =
+        data.failure !== ""
+          ? data.failure
+          : "The listener failed to start, and no reason was reported.";
+      view.failure.appendChild(box);
+    }
+
+    if (data.state === "disabled") {
+      const note = make("p", "card-note");
+      note.appendChild(make("strong", null, "A2A is switched off. "));
+      note.appendChild(
+        document.createTextNode(
+          "That is the default, and it is not an error: no listener is bound and no remote agent " +
+            "can reach this host. Set [a2a].enabled = true in config.toml and restart HaosGreen to start it."
+        )
+      );
+      view.notes.appendChild(note);
+    }
+
+    addFact(view.facts, "Listener", a2aStateText(data.state));
+    addFact(view.facts, "Card name", data.cardName !== "" ? data.cardName : "not reported");
+    if (data.state === "started") {
+      // Present only while the listener is up; both are reported rather than
+      // derived, because the advertised URL need not be the bound address.
+      addFact(view.facts, "Bound address", data.bound !== "" ? data.bound : "not reported");
+      addFact(
+        view.facts,
+        "Advertised URL",
+        data.advertisedUrl !== "" ? data.advertisedUrl : "not reported"
+      );
+    }
+    addFact(view.facts, "Inbound peers", a2aCountText(data.inboundPeers));
+    addFact(view.facts, "Outbound peers", a2aCountText(data.outboundPeers));
+  }
+
+  /* ── A2A: inbound peers ────────────────────────────────────────────────── */
+
+  function a2aInboundCard() {
+    const card = make("section", "card a2a-inbound");
+    card.appendChild(cardHead("i-shield", "Inbound peers"));
+
+    const notes = make("div", "a2a-notes");
+    card.appendChild(notes);
+
+    const list = make("div", "a2a-peer-list");
+    card.appendChild(list);
+
+    const status = a2aStatusLine();
+    card.appendChild(status);
+
+    return { card: card, notes: notes, list: list, status: status };
+  }
+
+  /** The warning a wildcard peer gets, in the danger tint. */
+  function a2aWildcardWarning(tools) {
+    const box = make("div", "a2a-danger");
+    box.appendChild(icon("i-shield", "icon"));
+    const body = make("div", "a2a-danger-body");
+    body.appendChild(make("p", "a2a-danger-title", "High consequence: this peer may call every tool."));
+    body.appendChild(
+      make(
+        "p",
+        "a2a-danger-text",
+        a2aGrantsShell(tools)
+          ? "Its configured tools are [\"*\"], so the whole live registry applies — including " +
+              "execute_command, which runs shell commands on this host. Remove the wildcard in " +
+              "config.toml unless that is exactly what you intend."
+          : "Its configured tools are [\"*\"], so every tool in the live registry applies. " +
+              "execute_command is not in the expanded list right now, but the wildcard follows the " +
+              "registry: a tool added later is granted automatically, with no change here."
+      )
+    );
+    box.appendChild(body);
+    return box;
+  }
+
+  function a2aInboundPeer(peer) {
+    const wildcard = a2aIsWildcard(peer.tools);
+    const box = make("article", wildcard ? "a2a-peer a2a-peer-danger" : "a2a-peer");
+
+    const head = make("div", "a2a-peer-head");
+    head.appendChild(make("h3", "a2a-peer-name", peer.name));
+    const tags = make("div", "tags");
+    tags.appendChild(
+      make(
+        "span",
+        peer.fingerprint !== "" ? "tag a2a-mono" : "tag tag-danger",
+        peer.fingerprint !== ""
+          ? "token " + peer.fingerprint
+          : "no token configured — this peer can never authenticate"
+      )
+    );
+    if (peer.allowsNoAddress) {
+      tags.appendChild(make("span", "tag tag-danger", "no address allowed"));
+    }
+    if (wildcard) {
+      tags.appendChild(make("span", "tag tag-danger", "wildcard tools"));
+    }
+    head.appendChild(tags);
+    box.appendChild(head);
+
+    if (wildcard) {
+      box.appendChild(a2aWildcardWarning(peer.tools));
+    }
+
+    // Fail-closed allowlist. The API states the asymmetry in prose; the view
+    // says it here too, because the peer list is what an operator actually
+    // reads and `[web].allow_ips` is the reading they arrive with.
+    box.appendChild(a2aSubLabel("Allowed source addresses (fail-closed)"));
+    if (peer.allowsNoAddress || peer.allowedIps.length === 0) {
+      box.appendChild(
+        make(
+          "p",
+          "a2a-empty",
+          "No address is allowed. An empty list is fail-closed for an inbound peer: it can " +
+            "authenticate from nowhere at all. This is the opposite of [web].allow_ips, where an " +
+            "empty list allows any source."
+        )
+      );
+    } else {
+      box.appendChild(a2aChipList(peer.allowedIps, "a2a-mono"));
+    }
+
+    // The tool policy, in the form it was written and the form that applies.
+    box.appendChild(a2aSubLabel("Tool policy"));
+    const facts = make("dl", "facts a2a-facts");
+    addFact(
+      facts,
+      "As written in config.toml",
+      peer.tools.configured === null
+        ? "no tools key"
+        : peer.tools.configured.length === 0
+          ? "an explicitly empty list"
+          : a2aClip(peer.tools.configured.join(", "), 200)
+    );
+    addFact(facts, "How it reads", a2aToolSourceLabel(peer.tools.source));
+    addFact(
+      facts,
+      "Effective",
+      peer.tools.effective === null
+        ? "not available"
+        : peer.tools.effective.length + (peer.tools.effective.length === 1 ? " tool" : " tools")
+    );
+    box.appendChild(facts);
+
+    if (peer.tools.effective !== null) {
+      if (peer.tools.effective.length === 0) {
+        box.appendChild(
+          make("p", "a2a-empty", "This allowlist is empty: no tool is offered to this peer.")
+        );
+      } else {
+        box.appendChild(a2aChipList(peer.tools.effective, "a2a-mono"));
+      }
+    } else {
+      // `null` is not an empty list. Rendering it as one would say "no tools"
+      // about a peer that may in fact hold the whole registry.
+      box.appendChild(
+        make(
+          "p",
+          "a2a-empty",
+          "The list that applies cannot be computed here: " +
+            (peer.tools.effectiveUnavailable !== ""
+              ? peer.tools.effectiveUnavailable
+              : "the server reported no reason.") +
+            " This is not \"no tools\" — treat this peer's effective policy as unknown."
+        )
+      );
+    }
+
+    if (peer.tools.source === "explicit_wildcard_ignored") {
+      box.appendChild(
+        make(
+          "p",
+          "a2a-warn-note",
+          "The configured list carries \"*\" next to other names, so it is read as a literal list and " +
+            "\"*\" grants nothing extra. Only a list whose sole entry is \"*\" is a full grant."
+        )
+      );
+    }
+
+    return box;
+  }
+
+  function paintA2aInbound() {
+    const view = a2a.dom && a2a.dom.inbound;
+    if (!view) {
+      return;
+    }
+    clear(view.notes);
+    clear(view.list);
+    setStatus(view.status, null, "");
+
+    if (a2a.unavailable) {
+      view.notes.appendChild(make("p", "card-note", A2A_UNAVAILABLE_NOTE));
+      return;
+    }
+    if (a2a.peersError !== "") {
+      setStatus(view.status, "error", a2a.peersError);
+      return;
+    }
+    const data = a2a.inbound;
+    if (!data) {
+      return;
+    }
+
+    const note = make("p", "card-note");
+    note.appendChild(
+      document.createTextNode(
+        "These are the peers that may call this agent. Their tokens are never displayed: only a " +
+          "fingerprint of each, which identifies a token you already hold. "
+      )
+    );
+    note.appendChild(make("strong", null, "An inbound peer can run tools on this host."));
+    view.notes.appendChild(note);
+
+    // The server's own wording, not a paraphrase: these are the two readings
+    // that are the opposite of the ones an operator is most likely to carry in.
+    if (data.ipSemantics !== "") {
+      view.notes.appendChild(a2aSemanticsBlock("Address allowlist", data.ipSemantics));
+    }
+    if (data.toolSemantics !== "") {
+      view.notes.appendChild(a2aSemanticsBlock("Tool policy", data.toolSemantics));
+    }
+    if (data.tokenSemantics !== "") {
+      view.notes.appendChild(a2aSemanticsBlock("Tokens", data.tokenSemantics));
+    }
+
+    if (data.peers.length === 0) {
+      view.list.appendChild(
+        make(
+          "p",
+          "a2a-empty",
+          "No inbound peers are configured, so no remote agent can call this one."
+        )
+      );
+      return;
+    }
+
+    const shown = data.peers.slice(0, A2A_PEER_RENDER_CAP);
+    for (let i = 0; i < shown.length; i += 1) {
+      view.list.appendChild(a2aInboundPeer(shown[i]));
+    }
+    if (data.peers.length > shown.length) {
+      view.list.appendChild(
+        make("p", "a2a-more", "…and " + (data.peers.length - shown.length) + " more peers, not shown.")
+      );
+    }
+  }
+
+  /* ── A2A: outbound peers ───────────────────────────────────────────────── */
+
+  function a2aOutboundCard() {
+    const card = make("section", "card a2a-outbound");
+    const head = cardHead("i-node", "Outbound peers");
+    const add = button("Add peer", "btn a2a-head-chip", "button");
+    add.addEventListener("click", function () {
+      a2aOpenEditor(null);
+    });
+    head.appendChild(add);
+    card.appendChild(head);
+
+    const notes = make("div", "a2a-notes");
+    card.appendChild(notes);
+
+    const list = make("div", "a2a-peer-list");
+    card.appendChild(list);
+
+    const editor = make("div", "a2a-editor-slot");
+    card.appendChild(editor);
+
+    const status = a2aStatusLine();
+    card.appendChild(status);
+
+    return {
+      card: card,
+      head: head,
+      add: add,
+      notes: notes,
+      list: list,
+      editor: editor,
+      editorDom: null,
+      status: status
+    };
+  }
+
+  /**
+   * The headline of the caution block, built from the server's three flags.
+   *
+   * Each half of the sentence is stated only when the server stated it. A `null`
+   * flag contributes no clause at all rather than a guess, because the
+   * difference between "this editor does not persist" and "nobody told the
+   * dashboard" is exactly the difference the operator needs, and the flags have
+   * already been one way and then the other.
+   */
+  function a2aCautionTitle(data) {
+    const writes = data.persistent === true;
+    const inMemory = data.persistent === false;
+    const reaches = data.affectsRunningAgent === true;
+    const detached = data.affectsRunningAgent === false;
+    if (writes && reaches) {
+      return "Saving here writes config.toml and reconfigures the running agent immediately.";
+    }
+    if (writes && detached) {
+      return "Saving here writes config.toml. The running agent does not see it.";
+    }
+    if (writes) {
+      return "Saving here writes config.toml.";
+    }
+    if (inMemory && detached) {
+      return "Saving here does not reconfigure the running agent.";
+    }
+    if (inMemory && reaches) {
+      return "Saving here reconfigures the running agent immediately.";
+    }
+    if (inMemory) {
+      return "Saving here does not write config.toml.";
+    }
+    if (reaches) {
+      return "Saving here reconfigures the running agent immediately.";
+    }
+    if (detached) {
+      return "Saving here does not reconfigure the running agent.";
+    }
+    return "The server did not report what saving here does.";
+  }
+
+  /**
+   * What the operator should do with this editor, given what a save does.
+   *
+   * A save that persists and reaches the live agent needs no second step, and
+   * saying otherwise would send the operator to edit a file the dashboard has
+   * just written. A save that does neither still needs the manual one. An
+   * unreported save gets the step that is true either way — the connection test
+   * — and no claim about what happens to the values afterwards.
+   */
+  function a2aCautionWorkflow(data) {
+    if (data.persistent === true) {
+      return (
+        "Run Test connection before you save: it exercises the real discovery path, and the save " +
+        "applies as soon as you confirm it, so there is no later step that writes " +
+        "[a2a.outbound.peers] in config.toml by hand or restarts HaosGreen."
+      );
+    }
+    if (data.persistent === false) {
+      return (
+        "That makes this a place to check a peer, not to configure one: enter it, run Test connection " +
+        "to exercise the real discovery path, then write the values that worked into " +
+        "[a2a.outbound.peers] in config.toml and restart HaosGreen, so the agent actually calls them."
+      );
+    }
+    return (
+      "Run Test connection to exercise the real discovery path before you save: it is the only way to " +
+      "check a peer from here, whatever the save turns out to do."
+    );
+  }
+
+  /**
+   * The consequence that follows from a save having any effect at all.
+   *
+   * Rendered only when the server says the save persists or reaches the running
+   * agent, because that is when the sentence is true: the token is stored per
+   * peer and never shown, so a changed URL is the one edit that can move it
+   * somewhere new. It reuses the wildcard warning's tint rather than inventing
+   * a second one.
+   */
+  function a2aTokenRedirectWarning() {
+    const box = make("div", "a2a-danger");
+    box.appendChild(icon("i-shield", "icon"));
+    const body = make("div", "a2a-danger-body");
+    body.appendChild(make("p", "a2a-danger-title", "A save can redirect a stored token."));
+    body.appendChild(
+      make(
+        "p",
+        "a2a-danger-text",
+        "A peer's token is stored beside its URL and is never shown here, so changing the URL is " +
+          "what decides which host receives it: the next call sends the token you already hold to " +
+          "whatever host the new URL names. Only change a URL when you mean to send the token there."
+      )
+    );
+    box.appendChild(body);
+    return box;
+  }
+
+  /**
+   * What the editor does and does not do, before the operator types in it.
+   *
+   * Every sentence is driven by a field the server sent. A `null` fact is
+   * reported as unreported rather than rendered as either answer, so the same
+   * file describes an in-memory editor, a persistent one, and a server that
+   * declined to say, without any of the three being hard-coded here.
+   */
+  function a2aCautionBlock(data) {
+    const box = make("div", "a2a-caution");
+    box.appendChild(make("p", "a2a-caution-title", a2aCautionTitle(data)));
+
+    const list = make("ul", "a2a-caution-list");
+    if (data.persistent === true) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "This save writes the whole outbound peer list to config.toml, so it survives a restart: " +
+            "the file on disk is what the next start reads."
+        )
+      );
+    }
+    if (data.persistent === false) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "These peers live in memory for the life of this process only. This editor never writes config.toml."
+        )
+      );
+    }
+    if (data.restartReverts === true) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "A restart reverts to the peers in config.toml, discarding anything saved here."
+        )
+      );
+    }
+    if (data.restartReverts === false) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "A restart does not revert this: the peers saved here are the ones config.toml holds."
+        )
+      );
+    }
+    if (data.affectsRunningAgent === true) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "The running call_a2a_agent tool picks this up immediately: no restart is needed for the " +
+            "agent to call the peers saved here."
+        )
+      );
+    }
+    if (data.affectsRunningAgent === false) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "The running call_a2a_agent tool keeps the outbound peers it was built with at startup and does not see this change."
+        )
+      );
+    }
+    if (
+      data.persistent === null &&
+      data.restartReverts === null &&
+      data.affectsRunningAgent === null
+    ) {
+      list.appendChild(
+        make(
+          "li",
+          null,
+          "The server did not report whether this editor persists or reaches the running agent, so " +
+            "the effect of a save here is unknown: it may or may not survive a restart, and it may or " +
+            "may not be picked up without one. Check config.toml after saving to see which it was."
+        )
+      );
+    }
+    box.appendChild(list);
+    if (data.persistent === true || data.affectsRunningAgent === true) {
+      box.appendChild(a2aTokenRedirectWarning());
+    }
+    box.appendChild(make("p", "a2a-caution-workflow", a2aCautionWorkflow(data)));
+    if (data.semantics !== "") {
+      // The server's own words, quoted rather than summarised: it is the one
+      // description here that this file did not write and cannot drift from.
+      box.appendChild(make("p", "a2a-semantics-body", data.semantics));
+    }
+    return box;
+  }
+
+  /** The inline result of a connection test: the card summary, or the reason. */
+  function a2aTestResult(name) {
+    const node = a2aStatusLine();
+    if (a2a.testing === name) {
+      setStatus(node, "warn", "Testing… waiting for the peer to answer with its Agent Card.");
+      return node;
+    }
+    const result = a2a.testResults[name];
+    if (!result) {
+      return node;
+    }
+    if (!result.ok || !result.card) {
+      setStatus(node, "error", result.error);
+      return node;
+    }
+
+    const wrap = make("div", "a2a-result");
+    setStatus(node, "ok", "Connected. The peer answered with an Agent Card.");
+    wrap.appendChild(node);
+    const facts = make("dl", "facts a2a-facts");
+    // The four fields the route echoes, and nothing else. The card is another
+    // host's data: it is shown, never followed.
+    addFact(facts, "Card name", result.card.name);
+    addFact(facts, "Protocol binding", result.card.protocolBinding);
+    addFact(facts, "Protocol version", result.card.protocolVersion);
+    addFact(facts, "Skills", a2aCountText(result.card.skillCount));
+    wrap.appendChild(facts);
+    return wrap;
+  }
+
+  function a2aOutboundRow(peer) {
+    const box = make("article", "a2a-peer");
+
+    const head = make("div", "a2a-peer-head");
+    head.appendChild(make("h3", "a2a-peer-name", peer.name));
+    const tags = make("div", "tags");
+    tags.appendChild(
+      make(
+        "span",
+        peer.fingerprint !== "" ? "tag a2a-mono" : "tag tag-danger",
+        peer.fingerprint !== "" ? "token " + peer.fingerprint : "no token configured"
+      )
+    );
+    head.appendChild(tags);
+    box.appendChild(head);
+
+    const facts = make("dl", "facts a2a-facts");
+    addFact(facts, "Base URL", peer.url !== "" ? peer.url : "not reported");
+    addFact(facts, "Timeout", peer.timeoutSecs === null ? "not reported" : peer.timeoutSecs + "s");
+    addFact(
+      facts,
+      "Poll interval",
+      peer.pollIntervalMs === null ? "not reported" : peer.pollIntervalMs + "ms"
+    );
+    addFact(
+      facts,
+      "Poll timeout",
+      peer.pollTimeoutSecs === null ? "not reported" : peer.pollTimeoutSecs + "s"
+    );
+    box.appendChild(facts);
+
+    const actions = make("div", "actions a2a-row-actions");
+    const testing = a2a.testing === peer.name;
+    const test = button(testing ? "Testing…" : "Test connection", "btn", "button");
+    // Disabled while *any* test is in flight: the server bounds one request, but
+    // it can still take seconds, and a second click would start a second one.
+    test.disabled = a2a.testing !== null;
+    test.addEventListener("click", function () {
+      a2aTestPeer(peer.name);
+    });
+    const edit = button("Edit", "btn btn-ghost", "button");
+    edit.disabled = a2a.saving;
+    edit.addEventListener("click", function () {
+      a2aOpenEditor(peer.name);
+    });
+    const remove = button("Remove", "btn btn-ghost", "button");
+    remove.disabled = a2a.removing !== null || a2a.saving;
+    remove.addEventListener("click", function () {
+      a2aRemovePeer(peer.name);
+    });
+    actions.appendChild(test);
+    actions.appendChild(edit);
+    actions.appendChild(remove);
+    box.appendChild(actions);
+
+    box.appendChild(a2aTestResult(peer.name));
+    return box;
+  }
+
+  function paintA2aOutboundList() {
+    const view = a2a.dom && a2a.dom.outbound;
+    if (!view) {
+      return;
+    }
+    clear(view.list);
+    view.add.disabled = a2a.saving || a2a.removing !== null;
+    const data = a2a.outbound;
+    if (a2a.unavailable || a2a.outboundError !== "" || !data) {
+      return;
+    }
+    if (data.peers.length === 0) {
+      view.list.appendChild(
+        make(
+          "p",
+          "a2a-empty",
+          "No outbound peers are configured, so this agent calls no remote agent. Use Add peer to " +
+            "check one against the real discovery path before saving it."
+        )
+      );
+      return;
+    }
+    const shown = data.peers.slice(0, A2A_PEER_RENDER_CAP);
+    for (let i = 0; i < shown.length; i += 1) {
+      view.list.appendChild(a2aOutboundRow(shown[i]));
+    }
+    if (data.peers.length > shown.length) {
+      view.list.appendChild(
+        make("p", "a2a-more", "…and " + (data.peers.length - shown.length) + " more peers, not shown.")
+      );
+    }
+  }
+
+  function paintA2aOutbound() {
+    const view = a2a.dom && a2a.dom.outbound;
+    if (!view) {
+      return;
+    }
+    clear(view.notes);
+    setStatus(view.status, null, "");
+
+    if (a2a.unavailable) {
+      view.notes.appendChild(make("p", "card-note", A2A_UNAVAILABLE_NOTE));
+      a2a.draft = null;
+      paintA2aEditor();
+      paintA2aOutboundList();
+      return;
+    }
+    if (a2a.outboundError !== "") {
+      setStatus(view.status, "error", a2a.outboundError);
+      paintA2aEditor();
+      paintA2aOutboundList();
+      return;
+    }
+    const data = a2a.outbound;
+    if (data) {
+      view.notes.appendChild(a2aCautionBlock(data));
+      if (data.tokenSemantics !== "") {
+        view.notes.appendChild(a2aSemanticsBlock("Tokens", data.tokenSemantics));
+      }
+    }
+    paintA2aOutboundList();
+    paintA2aEditor();
+  }
+
+  /* ── A2A: the peer editor ──────────────────────────────────────────────── */
+
+  function a2aOpenEditor(name) {
+    if (!a2a.dom || a2a.saving || a2a.removing !== null) {
+      return;
+    }
+    if (name === null) {
+      a2a.draft = {
+        name: "",
+        isNew: true,
+        url: "",
+        timeoutSecs: "",
+        pollIntervalMs: "",
+        pollTimeoutSecs: ""
+      };
+    } else {
+      const peer = a2aFindPeer(name);
+      if (!peer) {
+        return;
+      }
+      a2a.draft = {
+        name: peer.name,
+        isNew: false,
+        url: peer.url,
+        timeoutSecs: peer.timeoutSecs === null ? "" : String(peer.timeoutSecs),
+        pollIntervalMs: peer.pollIntervalMs === null ? "" : String(peer.pollIntervalMs),
+        pollTimeoutSecs: peer.pollTimeoutSecs === null ? "" : String(peer.pollTimeoutSecs)
+      };
+    }
+    paintA2aEditor();
+    if (a2a.dom && a2a.dom.outbound.editorDom) {
+      a2a.dom.outbound.editorDom.url.focus();
+    }
+  }
+
+  /**
+   * Draw the editor.
+   *
+   * Called only when the editor opens, closes, or the peer set is replaced — a
+   * rejected save must leave every field exactly as the operator left it, so
+   * nothing here runs on the failure path.
+   */
+  function paintA2aEditor() {
+    const view = a2a.dom && a2a.dom.outbound;
+    if (!view) {
+      return;
+    }
+    view.editorDom = null;
+    clear(view.editor);
+    const draft = a2a.draft;
+    if (!draft) {
+      return;
+    }
+
+    const form = make("form", "stack a2a-editor");
+    form.noValidate = true;
+    form.appendChild(
+      make("h3", "a2a-editor-title", draft.isNew ? "Add an outbound peer" : "Edit " + draft.name)
+    );
+    form.appendChild(
+      make(
+        "p",
+        "card-note",
+        "Saving sends the whole peer set, because the route replaces it: peers you did not touch are " +
+          "sent back exactly as they are, with their tokens omitted so the stored ones are kept."
+      )
+    );
+
+    const nameField = a2aInput(
+      "a2a-peer-name",
+      "Peer name",
+      "text",
+      draft.isNew
+        ? "Letters, digits, '-', '_' or '.', up to 64 characters. This is the name Test connection takes."
+        : "A peer cannot be renamed here — its name is the key. Remove it and add it again under the new name."
+    );
+    nameField.input.value = draft.name;
+    nameField.input.disabled = !draft.isNew;
+    form.appendChild(nameField.wrap);
+
+    const urlField = a2aInput(
+      "a2a-peer-url",
+      "Base URL",
+      "text",
+      "The peer's http or https base URL — the address its Agent Card is served from."
+    );
+    urlField.input.value = draft.url;
+    form.appendChild(urlField.wrap);
+
+    const tokenField = a2aInput(
+      "a2a-peer-token",
+      "Token (write-only)",
+      "password",
+      draft.isNew
+        ? "A new peer needs a token. It is sent once and is never readable again — not even here."
+        : "Leave empty to keep the stored token. Tokens are never displayed, so an empty field means \"unchanged\", not \"clear\"."
+    );
+    tokenField.input.value = "";
+    tokenField.input.placeholder = draft.isNew
+      ? "the token this peer expects"
+      : "leave empty to keep the stored token";
+    form.appendChild(tokenField.wrap);
+
+    const timeoutField = a2aInput(
+      "a2a-peer-timeout",
+      "Timeout (seconds)",
+      "number",
+      "How long one request to this peer may take. Empty keeps the stored value."
+    );
+    timeoutField.input.value = draft.timeoutSecs;
+    form.appendChild(timeoutField.wrap);
+
+    const pollField = a2aInput(
+      "a2a-peer-poll",
+      "Poll interval (milliseconds)",
+      "number",
+      "How often GetTask is retried while a task runs. Empty keeps the stored value."
+    );
+    pollField.input.value = draft.pollIntervalMs;
+    form.appendChild(pollField.wrap);
+
+    const pollTimeoutField = a2aInput(
+      "a2a-peer-poll-timeout",
+      "Poll timeout (seconds)",
+      "number",
+      "How long this agent keeps polling one task before giving up. Empty keeps the stored value."
+    );
+    pollTimeoutField.input.value = draft.pollTimeoutSecs;
+    form.appendChild(pollTimeoutField.wrap);
+
+    const actions = make("div", "actions");
+    const save = button("Save peer set", "btn btn-accent", "submit");
+    const cancel = button("Cancel", "btn btn-ghost", "button");
+    cancel.addEventListener("click", function () {
+      a2a.draft = null;
+      paintA2aEditor();
+    });
+    actions.appendChild(save);
+    actions.appendChild(cancel);
+    form.appendChild(actions);
+
+    const status = a2aStatusLine("alert");
+    form.appendChild(status);
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      a2aSave();
+    });
+
+    view.editor.appendChild(form);
+    view.editorDom = {
+      form: form,
+      name: nameField.input,
+      url: urlField.input,
+      token: tokenField.input,
+      timeout: timeoutField.input,
+      poll: pollField.input,
+      pollTimeout: pollTimeoutField.input,
+      save: save,
+      cancel: cancel,
+      status: status
+    };
+  }
+
+  /**
+   * Send the whole peer set.
+   *
+   * On any rejection the editor is left untouched — no field is cleared, no
+   * draft is dropped — because the operator has to correct what the server
+   * refused, and a form that emptied itself would have taken the correction
+   * with it. The token field is the one exception after a *successful* save: a
+   * secret does not stay on screen once it has been sent.
+   */
+  async function a2aSave() {
+    const dom = a2a.dom;
+    const draft = a2a.draft;
+    const data = a2a.outbound;
+    if (!dom || !draft || !data || a2a.saving) {
+      return;
+    }
+    const ed = dom.outbound.editorDom;
+    if (!ed) {
+      return;
+    }
+
+    // A peer name the route would reject takes the whole update down with it,
+    // and one it accepts only by omission would be deleted. Refuse first.
+    const bad = a2aWritablePeers(data.peers);
+    if (bad.length > 0) {
+      setStatus(
+        ed.status,
+        "error",
+        "This editor cannot save while the configured peer " +
+          bad.join(", ") +
+          " has a name it cannot write back. Names accepted here are 1-64 characters of letters, " +
+          "digits, '-', '_' or '.'. Rename it in config.toml; saving now would delete it."
+      );
+      return;
+    }
+
+    const name = draft.isNew ? ed.name.value.trim() : draft.name;
+    if (name === "") {
+      setStatus(ed.status, "error", "Enter a peer name.");
+      return;
+    }
+    if (!a2aNameWritable(name)) {
+      setStatus(
+        ed.status,
+        "error",
+        "A peer name must be 1-64 characters of ASCII letters, digits, '-', '_' or '.'."
+      );
+      return;
+    }
+    const url = ed.url.value.trim();
+    if (url === "") {
+      setStatus(ed.status, "error", "Enter the peer's base URL.");
+      return;
+    }
+
+    const timeout = a2aNumberField(ed.timeout.value, "timeout_secs");
+    if (!timeout.ok) {
+      setStatus(ed.status, "error", timeout.message);
+      return;
+    }
+    const poll = a2aNumberField(ed.poll.value, "poll_interval_ms");
+    if (!poll.ok) {
+      setStatus(ed.status, "error", poll.message);
+      return;
+    }
+    const pollTimeout = a2aNumberField(ed.pollTimeout.value, "poll_timeout_secs");
+    if (!pollTimeout.ok) {
+      setStatus(ed.status, "error", pollTimeout.message);
+      return;
+    }
+
+    const body = a2aPutBody(
+      data.peers,
+      name,
+      a2aDraftPayload({
+        url: url,
+        token: ed.token.value,
+        timeoutSecs: timeout.value,
+        pollIntervalMs: poll.value,
+        pollTimeoutSecs: pollTimeout.value
+      })
+    );
+
+    a2a.saving = true;
+    ed.save.disabled = true;
+    ed.cancel.disabled = true;
+    setStatus(ed.status, null, "");
+    const token = a2a.token;
+
+    try {
+      const response = await api(A2A_OUTBOUND_PATH, { method: "PUT", body: body });
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      // The response is the new view of the peer set, so it is used as one.
+      a2a.outbound = normalizeA2aOutbound(response);
+      a2a.outboundError = "";
+      // Every stored peer may have a new URL, so no previous test still stands.
+      a2a.testResults = {};
+      ed.token.value = "";
+      a2a.draft = null;
+      if (a2a.status) {
+        a2a.status.outboundPeers = a2a.outbound.peers.length;
+        paintA2aStatus();
+      }
+      paintA2aOutbound();
+      setStatus(
+        a2a.dom.outbound.status,
+        "ok",
+        "Saved " +
+          a2a.outbound.peers.length +
+          (a2a.outbound.peers.length === 1 ? " peer" : " peers") +
+          a2aSaveOutcomeText("saved", a2a.outbound)
+      );
+    } catch (error) {
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      if (error && error.status === 401) {
+        showLogin("Your session expired. Sign in again.");
+        return;
+      }
+      // The server's own text, next to the fields that produced it.
+      setStatus(ed.status, "error", describeError(error));
+    } finally {
+      a2a.saving = false;
+      // Only if this exact editor is still the one on screen: a successful save
+      // has already replaced it, and touching a detached node would throw.
+      if (token === a2a.token && a2a.dom && a2a.dom.outbound.editorDom === ed) {
+        ed.save.disabled = false;
+        ed.cancel.disabled = false;
+      }
+    }
+  }
+
+  /* ── A2A: actions ──────────────────────────────────────────────────────── */
+
+  /**
+   * The tail of a success message, built from the same flags as the caution
+   * block so a confirmation cannot say the opposite of what the operator just
+   * read above the editor.
+   *
+   * `verb` is "saved" or "removed": the only two writes this view makes. The
+   * destination clause is only named when the server named it, and a server that
+   * reported nothing gets a sentence that claims nothing.
+   */
+  function a2aSaveOutcomeText(verb, data) {
+    const saved = verb === "saved";
+    const writes = data.persistent === true;
+    const inMemory = data.persistent === false;
+    const reaches = data.affectsRunningAgent === true;
+    const detached = data.affectsRunningAgent === false;
+
+    let where;
+    if (writes) {
+      where = saved ? " to config.toml" : " from config.toml";
+    } else if (inMemory) {
+      where = saved ? " to the in-memory list" : " from the in-memory peer list";
+    } else if (reaches) {
+      where = saved ? " to the running agent's peer list" : " from the running agent's peer list";
+    } else {
+      return "; the server did not report where this was written.";
+    }
+
+    if (writes && reaches) {
+      return where + ", and the running agent is already using the result.";
+    }
+    if (writes && detached) {
+      return where + ". The running agent still uses the peers it started with.";
+    }
+    if (writes) {
+      return where + ".";
+    }
+    if (detached) {
+      return (
+        where +
+        (saved
+          ? ". config.toml is unchanged and the running agent still uses the peers it started with."
+          : ". config.toml still lists it, and the running agent is unaffected.")
+      );
+    }
+    if (reaches) {
+      return where + ".";
+    }
+    return where + ". config.toml is " + (saved ? "unchanged" : "still listing it") + ".";
+  }
+
+  /**
+   * Run one connection test.
+   *
+   * `a2a.testing` is the guard: a second click while a test is in flight is
+   * dropped rather than issued, because the server's own bound is ten seconds
+   * and two overlapping requests would only make the panel lie about which
+   * result is on screen.
+   */
+  async function a2aTestPeer(name) {
+    if (!a2a.dom || a2a.testing !== null || a2a.saving || a2a.removing !== null) {
+      return;
+    }
+    a2a.testing = name;
+    delete a2a.testResults[name];
+    paintA2aOutboundList();
+
+    const token = a2a.token;
+    try {
+      const body = await api(A2A_TEST_PATH, { method: "POST", body: { peer: name } });
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      a2a.testResults[name] = a2aTestOutcome(body);
+    } catch (error) {
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      if (error && error.status === 401) {
+        showLogin("Your session expired. Sign in again.");
+        return;
+      }
+      a2a.testResults[name] = { ok: false, card: null, error: describeError(error) };
+    } finally {
+      if (token === a2a.token) {
+        a2a.testing = null;
+      }
+      if (token === a2a.token && a2a.dom) {
+        paintA2aOutboundList();
+      }
+    }
+  }
+
+  /**
+   * Drop one peer from the in-memory set.
+   *
+   * This is the only way to delete a peer, because the route replaces the map
+   * rather than merging into it — and it is also how a token is cleared, since
+   * an empty token in a `PUT` is a 400 rather than an erasure.
+   */
+  async function a2aRemovePeer(name) {
+    const dom = a2a.dom;
+    const data = a2a.outbound;
+    if (!dom || !data || a2a.removing !== null || a2a.saving || a2a.testing !== null) {
+      return;
+    }
+    const remaining = [];
+    for (let i = 0; i < data.peers.length; i += 1) {
+      if (data.peers[i].name !== name) {
+        remaining.push(data.peers[i]);
+      }
+    }
+    if (remaining.length === data.peers.length) {
+      return;
+    }
+    const bad = a2aWritablePeers(remaining);
+    if (bad.length > 0) {
+      setStatus(
+        dom.outbound.status,
+        "error",
+        "Cannot save the peer set: the configured peer " +
+          bad.join(", ") +
+          " has a name this editor cannot write back. Rename it in config.toml."
+      );
+      return;
+    }
+
+    a2a.removing = name;
+    paintA2aOutboundList();
+    const token = a2a.token;
+    try {
+      const response = await api(A2A_OUTBOUND_PATH, {
+        method: "PUT",
+        body: a2aPutBody(remaining, null, null)
+      });
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      a2a.outbound = normalizeA2aOutbound(response);
+      a2a.outboundError = "";
+      a2a.testResults = {};
+      if (a2a.draft && !a2a.draft.isNew && a2a.draft.name === name) {
+        a2a.draft = null;
+      }
+      if (a2a.status) {
+        a2a.status.outboundPeers = a2a.outbound.peers.length;
+        paintA2aStatus();
+      }
+      paintA2aOutbound();
+      setStatus(
+        a2a.dom.outbound.status,
+        "ok",
+        "Removed " + a2aClip(name, 64) + a2aSaveOutcomeText("removed", a2a.outbound)
+      );
+    } catch (error) {
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      if (error && error.status === 401) {
+        showLogin("Your session expired. Sign in again.");
+        return;
+      }
+      setStatus(a2a.dom.outbound.status, "error", describeError(error));
+    } finally {
+      a2a.removing = null;
+      if (token === a2a.token && a2a.dom) {
+        paintA2aOutboundList();
+      }
+    }
+  }
+
+  /* ── A2A: loading and teardown ─────────────────────────────────────────── */
+
+  /** A settled promise, so three reads can be applied together. */
+  function a2aSettled(promise) {
+    return promise.then(
+      function (value) {
+        return { ok: true, value: value };
+      },
+      function (error) {
+        return { ok: false, error: error };
+      }
+    );
+  }
+
+  function applyA2aResults(results) {
+    for (let i = 0; i < results.length; i += 1) {
+      if (!results[i].ok && results[i].error && results[i].error.status === 401) {
+        showLogin("Your session expired. Sign in again.");
+        return;
+      }
+    }
+
+    const statusResult = results[0];
+    const peersResult = results[1];
+    const outboundResult = results[2];
+
+    // 503 from the status route means this process has no A2A wiring at all:
+    // a startup configuration state, not a transient failure, so the view says
+    // so once instead of retrying it.
+    a2a.unavailable =
+      !statusResult.ok && !!statusResult.error && statusResult.error.status === 503;
+
+    if (statusResult.ok) {
+      a2a.status = normalizeA2aStatus(statusResult.value);
+      a2a.statusError = "";
+    } else {
+      a2a.status = null;
+      a2a.statusError = describeError(statusResult.error);
+    }
+
+    if (peersResult.ok) {
+      a2a.inbound = normalizeA2aInbound(peersResult.value);
+      a2a.peersError = "";
+    } else {
+      a2a.inbound = null;
+      a2a.peersError = describeError(peersResult.error);
+    }
+
+    if (outboundResult.ok) {
+      a2a.outbound = normalizeA2aOutbound(outboundResult.value);
+      a2a.outboundError = "";
+    } else {
+      a2a.outbound = null;
+      a2a.outboundError = describeError(outboundResult.error);
+      a2a.draft = null;
+    }
+
+    paintA2aStatus();
+    paintA2aInbound();
+    paintA2aOutbound();
+  }
+
+  /**
+   * Read all three surfaces.
+   *
+   * They are read together and applied together: the peer counts on the status
+   * card and the peer lists below it are one snapshot, and a card that mixed a
+   * fresh count with a stale list would be describing a configuration that
+   * never existed.
+   */
+  async function a2aLoad() {
+    if (!a2a.dom) {
+      return;
+    }
+    if (a2a.loading) {
+      a2a.loadQueued = true;
+      return;
+    }
+    a2a.loading = true;
+    const token = a2a.token;
+    a2a.dom.status.reload.disabled = true;
+
+    try {
+      const results = await Promise.all([
+        a2aSettled(api(A2A_STATUS_PATH)),
+        a2aSettled(api(A2A_PEERS_PATH)),
+        a2aSettled(api(A2A_OUTBOUND_PATH))
+      ]);
+      if (token !== a2a.token || !a2a.dom) {
+        return;
+      }
+      applyA2aResults(results);
+    } finally {
+      a2a.loading = false;
+      if (token === a2a.token && a2a.dom) {
+        a2a.dom.status.reload.disabled = false;
+      }
+      if (a2a.loadQueued) {
+        a2a.loadQueued = false;
+        a2aLoad();
+      }
+    }
+  }
+
+  function renderA2a(host) {
+    const statusCard = a2aStatusCard();
+    const inboundCard = a2aInboundCard();
+    const outboundCard = a2aOutboundCard();
+    host.appendChild(statusCard.card);
+    host.appendChild(inboundCard.card);
+    host.appendChild(outboundCard.card);
+
+    a2a.dom = {
+      host: host,
+      status: statusCard,
+      inbound: inboundCard,
+      outbound: outboundCard
+    };
+    a2a.status = null;
+    a2a.statusError = "";
+    a2a.inbound = null;
+    a2a.peersError = "";
+    a2a.outbound = null;
+    a2a.outboundError = "";
+    a2a.unavailable = false;
+    a2a.loading = false;
+    a2a.loadQueued = false;
+    a2a.saving = false;
+    a2a.removing = null;
+    a2a.testing = null;
+    a2a.testResults = {};
+    a2a.draft = null;
+
+    a2aLoad();
+  }
+
+  /**
+   * Drop every reference to the A2A view's DOM.
+   *
+   * `navigate()` calls this before rendering the next route and `showLogin`
+   * calls it when the session ends. Bumping `token` is what makes an in-flight
+   * read stale: nulling `dom` alone would not, because a remount restores it
+   * before a slow response lands, and that response would then paint a snapshot
+   * taken before the navigation.
+   */
+  function a2aUnmount() {
+    a2a.token += 1;
+    a2a.dom = null;
+    a2a.status = null;
+    a2a.statusError = "";
+    a2a.inbound = null;
+    a2a.peersError = "";
+    a2a.outbound = null;
+    a2a.outboundError = "";
+    a2a.unavailable = false;
+    a2a.loading = false;
+    a2a.loadQueued = false;
+    a2a.saving = false;
+    a2a.removing = null;
+    a2a.testing = null;
+    a2a.testResults = {};
+    a2a.draft = null;
   }
 
   /* ── Boot ──────────────────────────────────────────────────────────────── */

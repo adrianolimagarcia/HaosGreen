@@ -23,7 +23,7 @@ pub use auth::{authenticate, AuthError, PeerIdentity};
 pub use executor::{A2aExecutor, NoopExecutor};
 pub use policy::{resolve_allowed_tools, DEFAULT_PEER_TOOLS};
 pub use task_store::SqliteTaskStore;
-pub use tool::CallA2aAgent;
+pub use tool::{CallA2aAgent, SharedOutboundConfig};
 
 #[cfg(test)]
 mod dependency_probe {

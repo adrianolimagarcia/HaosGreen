@@ -2576,6 +2576,22 @@ Requirements:
   a SHA-256 digest). The raw token is never returned.
 - `PUT /api/a2a/outbound` accepts replacement tokens; an omitted token keeps the
   existing one rather than clearing it.
+- `PUT /api/a2a/outbound` **persists and is live** (operator decision; design
+  spec §5.4.1, which withdrew the "editing `config.toml` from the UI" non-goal
+  for this one route). It rewrites only the `[a2a.outbound.peers]` table of the
+  `config.toml` the process was started from — the path
+  `home::resolve_config_path` resolved, never a re-derivation — through
+  `toml_edit`, so every comment, blank line and key order *outside* that table is
+  preserved. The write is atomic (a temporary file in the same directory,
+  fsynced, renamed over the target) and the replacement keeps the original file's
+  permissions. Only after the file is written are the peers applied to the shared
+  handle `main.rs` creates — the same handle `call_a2a_agent` reads — so the
+  running agent uses them on its next invocation. A failed write is a 500 that
+  leaves both the file and the running configuration unchanged; a missing
+  `config.toml` is refused rather than created. Concurrent `PUT`s are serialised
+  by a mutex around the read-modify-write. The response reports
+  `persistent: true`, `restart_reverts: false`, `affects_running_agent: true`,
+  with prose that says the same.
 - `POST /api/a2a/test` calls `A2aClient::discover` against the named peer and
   returns the card name, protocol binding, and skill count, or a redacted error.
 - When the A2A listener is disabled, status reports that plainly rather than
@@ -2585,6 +2601,24 @@ Requirements:
 
 Run: `cargo test --test web_endpoint a2a`
 Expected: PASS.
+
+- [ ] **Step 4b: Prove the persistence tests have teeth**
+
+The persistence properties are only worth testing if the tests fail when the
+implementation stops providing them. Mutate each one, confirm the named test
+fails, revert:
+
+- Write the whole document back through serde instead of `toml_edit` →
+  `an_outbound_update_rewrites_only_the_outbound_table_of_a_real_config_file`
+  must fail on the comment/byte-identity assertions.
+- Drop the rename and write in place → the atomicity and leftover-temporary-file
+  assertions must fail.
+- Skip `set_permissions` → `an_outbound_update_keeps_the_configuration_files_permissions`
+  must fail.
+- Give `CallA2aAgent` its own copy of the configuration instead of the shared
+  handle → `an_outbound_update_reaches_the_running_call_a2a_agent_tool` must fail.
+- Apply the peers in memory before writing the file, or ignore the write error →
+  `a_failed_write_leaves_the_file_and_the_running_agent_unchanged` must fail.
 
 - [ ] **Step 5: Prove the no-token test has teeth**
 

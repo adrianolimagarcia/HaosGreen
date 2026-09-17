@@ -46,11 +46,33 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 /// browsers that do not implement the directive.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; frame-ancestors 'none'";
 
-/// Add the four response headers the dashboard always sends.
+/// Add the response headers the dashboard always sends.
 ///
 /// Applied to every response, including the ones this module rejects, so a
 /// 403 cannot be framed, sniffed, or used to leak the dashboard's URL through
 /// a `Referer`.
+///
+/// # `Cache-Control: no-store` is not optional here
+///
+/// Every response this dashboard sends is either session-scoped or carries log
+/// content: `GET /api/logs` and `/api/logs/stream` return the process's own log
+/// (targets, paths, task ids, error text), the settings route returns the
+/// configuration surface, and the login response carries a `Set-Cookie` that a
+/// cache would happily replay to the next client. A cached copy of any of them
+/// outlives the session that authorised it — a shared proxy, or a browser
+/// history restore, is enough.
+///
+/// `Vary: Cookie` is the companion: these responses depend on the session
+/// cookie, and a cache that does not know that may serve one session's body to
+/// another. It is set on every response for the same reason `no-store` is — the
+/// layer that stamps it does not know which handler produced the response, and
+/// a rule that has to be remembered per route is a rule that will be forgotten
+/// by the next route.
+///
+/// The cost is that the three static assets are re-fetched rather than served
+/// from cache. They are ~230 KB, they are served by the same process that
+/// already answered the request, and correctness of the rule above is worth
+/// more than the round trip.
 pub fn harden(response: &mut Response) {
     let headers = response.headers_mut();
     headers.insert(
@@ -66,6 +88,8 @@ pub fn harden(response: &mut Response) {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::VARY, HeaderValue::from_static("Cookie"));
 }
 
 /// The `Host` values this listener answers to.
@@ -327,7 +351,12 @@ pub fn session_from_cookies(headers: &HeaderMap) -> Option<String> {
 /// the A2A module for its own authentication, and both copies are pinned by
 /// tests, including the fail-closed cases (`Bearer` with no token, an empty
 /// token, an unknown scheme).
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+///
+/// `pub(crate)` rather than private because `routes::logs` re-checks the
+/// credential of an already-open SSE stream: `guard` authorises a stream once,
+/// at connect, and the stream has to be able to ask the same question again when
+/// the session behind it goes away.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let value = raw.trim_start();
     let (scheme, token) = value.split_once(' ')?;
@@ -805,6 +834,45 @@ mod tests {
     fn the_content_security_policy_forbids_framing() {
         assert!(CONTENT_SECURITY_POLICY.contains("default-src 'self'"));
         assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+    }
+
+    /// Nothing this dashboard sends may be cached.
+    ///
+    /// A response carrying log content, the settings surface, or a `Set-Cookie`
+    /// that outlives the session that authorised it is exactly what a shared
+    /// cache or a browser's back button would replay.
+    #[test]
+    fn every_response_is_uncacheable_and_varies_on_the_session_cookie() {
+        let mut response = (StatusCode::OK, "log content").into_response();
+        harden(&mut response);
+        let headers = response.headers();
+
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "a response that can carry a credential or a log line must not be storable"
+        );
+        assert_eq!(
+            headers.get(header::VARY).and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "the body depends on the session cookie, and a cache has to know that"
+        );
+    }
+
+    /// The headers go on refusals too: a 401 or a 403 is a response a cache can
+    /// store just as happily as a 200.
+    #[test]
+    fn a_refusal_is_uncacheable_too() {
+        let response = refused("host not permitted");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
     }
 
     #[test]

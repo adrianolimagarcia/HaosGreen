@@ -23,6 +23,9 @@ serde_json = "1"
 
 # Configuration
 toml = "0.8"
+# Format-preserving edits to config.toml (`PUT /api/a2a/outbound`). The same
+# version `toml` 0.8 already depends on, so this adds no new code to the build.
+toml_edit = "0.22"
 
 # MCP client
 rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }

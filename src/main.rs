@@ -23,11 +23,26 @@ async fn main() -> Result<()> {
     // The dashboard's log view reads from this buffer; the layer below is what
     // fills it. It is built before the subscriber because the layer needs the
     // handle, and it is shared with `web::spawn` so the routes read the same
-    // ring the layer writes to. Bounded (see `LOG_BUFFER_CAPACITY`), so an
-    // instance that never enables the dashboard pays only for the ring.
+    // ring the layer writes to.
+    //
+    // The ring is bounded by `LOG_BUFFER_CAPACITY` entries *and* by the byte
+    // budget in `web::logs` — an entry count alone bounds nothing in bytes — and
+    // it stays empty until the dashboard is known to be enabled (see
+    // `log_capture` below).
     let logs = Arc::new(haos_green::web::logs::LogBuffer::new(
         haos_green::web::state::LOG_BUFFER_CAPACITY,
     ));
+
+    // Whether the ring is recording.
+    //
+    // The subscriber has to be installed before anything can log, and `--setup`
+    // and `--service` run before a configuration has been read at all, so the
+    // layer cannot simply be left out for an instance whose `[web].enabled`
+    // turns out to be false. It is disarmed instead and armed below, once the
+    // configuration says the dashboard is on: until then `on_event` returns on
+    // one relaxed load, and the process pays neither the field visitor, nor the
+    // redaction pass, nor the timestamp, and retains nothing.
+    let log_capture = Arc::new(AtomicBool::new(false));
 
     // Initialize logging
     //
@@ -39,7 +54,7 @@ async fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,haos_green=debug,rustfox=debug".into());
 
-    haos_green::web::logs::log_subscriber(env_filter, Arc::clone(&logs))
+    haos_green::web::logs::log_subscriber(env_filter, Arc::clone(&logs), Arc::clone(&log_capture))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -83,6 +98,31 @@ async fn main() -> Result<()> {
     info!("Loading configuration from: {}", config_path.display());
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    // Register every configured secret with the redaction filter *before*
+    // anything can log one.
+    //
+    // Shape rules cannot catch a credential that has no recognisable shape, and
+    // the most likely secret this process emits has none: a `reqwest` transport
+    // error renders the request URL, so a failed Telegram call puts
+    // `https://api.telegram.org/bot<token>/sendMessage` into a log message with
+    // no key, no separator and no prefix. An exact-value registration catches it
+    // wherever it appears — URL path, query string, or prose — and it also
+    // hardens every artifact the supervisor writes, which goes through the same
+    // `redact()`.
+    //
+    // Only the count is logged. Logging the values would be the bug.
+    let registered = haos_green::supervisor::redact::register_secrets(configured_secrets(&config));
+
+    // The dashboard is enabled, so the log ring may start recording — armed
+    // *before* the line below, so the ring's first entry is the one that says
+    // the scrubber is armed rather than the line after it. See `log_capture`
+    // above for why this is a switch rather than an install.
+    if config.web.enabled {
+        log_capture.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    info!("  Secret scrubber: {registered} configured value(s) armed");
 
     // Build provider registry from config
     let (provider_sections, default_provider, fallback_chain) = config.build_providers();
@@ -245,6 +285,13 @@ async fn main() -> Result<()> {
     let restart_pending = Arc::new(AtomicBool::new(false));
     let soul_updated = Arc::new(AtomicBool::new(false));
 
+    // The single shared handle for the outbound A2A peers. One `Arc`, cloned
+    // into the `call_a2a_agent` tool below and into the dashboard's A2A state,
+    // is what makes `PUT /api/a2a/outbound` reach the running agent: the route
+    // writes this value, the tool reads it on its next invocation.
+    let a2a_outbound: haos_green::a2a::SharedOutboundConfig =
+        Arc::new(tokio::sync::RwLock::new(config.a2a.outbound.clone()));
+
     let mut tool_registry = haos_green::tool_registry::ToolRegistry::new();
     tool_registry.register(Box::new(haos_green::builtin_tools::BuiltinTools::new(
         config.skills.directory.clone(),
@@ -274,11 +321,15 @@ async fn main() -> Result<()> {
         cancel_registry.clone(),
         sender.clone(),
     )));
-    if !config.a2a.outbound.peers.is_empty() {
-        tool_registry.register(Box::new(haos_green::a2a::tool::CallA2aAgent::new(
-            config.a2a.outbound.clone(),
-        )));
-    }
+    // Registered unconditionally. `CallA2aAgent::define` offers nothing while
+    // the shared handle holds no peers, so with an empty `[a2a.outbound]` this
+    // adds no tool to the model — but it does mean a peer added later through
+    // `PUT /api/a2a/outbound` is reachable without a restart. Registering it
+    // only when the startup configuration was non-empty would make the first
+    // peer added from the dashboard silently unusable.
+    tool_registry.register(Box::new(haos_green::a2a::tool::CallA2aAgent::new(
+        Arc::clone(&a2a_outbound),
+    )));
 
     // Arc::new_cyclic so Agent can store Weak<Self> for job closure captures (breaks Arc cycle)
     let agent = Arc::new_cyclic(|weak| {
@@ -478,41 +529,46 @@ async fn main() -> Result<()> {
         Err(e) => warn!("  Supervisor: failed to enumerate resumable tasks: {e}"),
     }
 
-    // A2A listener (Phase 1: Agent Card + authentication only).
-    if config.a2a.enabled {
-        // Validate first. Every rule checked here already fails closed at
-        // request time; validating up front turns a silent per-request denial
-        // (or a 500 from duplicate tokens) into one loud startup error. The
-        // listener is not started on failure — but the Telegram bot still is,
-        // because an A2A misconfiguration must not take the bot down.
-        match config.a2a.validate() {
-            Ok(()) => {
-                // `spawn` binds, then derives the advertised URL from the
-                // address it actually bound, so the Agent Card never
-                // advertises port 0 for an ephemeral bind.
-                let a2a_executor = haos_green::a2a::A2aExecutor::new(agent.clone());
-                let a2a_store = haos_green::a2a::SqliteTaskStore::new(agent.memory.connection());
-                if let Err(e) = haos_green::a2a::server::spawn(
-                    config.a2a.clone(),
-                    a2a_skills,
-                    a2a_executor,
-                    a2a_store,
-                )
-                .await
-                {
-                    tracing::error!(error = %e, "A2A listener failed to start");
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "A2A configuration is invalid; the A2A listener was NOT started"
-                );
-            }
-        }
+    // A2A listener. The outcome is *observed*, not discarded: `start_listener`
+    // returns the address it actually bound and the URL the Agent Card
+    // advertises, or the reason no listener is serving. That value is what the
+    // dashboard's `GET /api/a2a/status` reports, so the dashboard cannot claim
+    // a status nobody saw.
+    let a2a_outcome = if config.a2a.enabled {
+        // `spawn` binds, then derives the advertised URL from the address it
+        // actually bound, so the Agent Card never advertises port 0 for an
+        // ephemeral bind. Validation happens inside `start_listener`, before
+        // the bind: the listener is not started on failure — but the Telegram
+        // bot still is, because an A2A misconfiguration must not take the bot
+        // down.
+        let a2a_executor = haos_green::a2a::A2aExecutor::new(agent.clone());
+        let a2a_store = haos_green::a2a::SqliteTaskStore::new(agent.memory.connection());
+        haos_green::web::routes::a2a::start_listener(
+            &config.a2a,
+            a2a_skills,
+            a2a_executor,
+            a2a_store,
+        )
+        .await
     } else {
-        tracing::debug!("A2A disabled");
-    }
+        haos_green::web::routes::a2a::A2aListenerOutcome::Disabled
+    };
+
+    // Built whether or not the listener is running: the outbound half of the
+    // A2A surface is useful with `[a2a].enabled = false` (the `call_a2a_agent`
+    // tool is registered from `[a2a.outbound]` regardless), and the status
+    // route reports "disabled" rather than erroring.
+    //
+    // `a2a_outbound` is the same handle the tool above holds, so a `PUT` on this
+    // route reaches the running agent. `config_path` is the path `Config::load`
+    // read at startup, so the file the route rewrites is the file the process
+    // was started from.
+    let a2a_web = Arc::new(haos_green::web::routes::a2a::A2aWebState::new(
+        config.a2a.clone(),
+        a2a_outcome,
+        Arc::clone(&a2a_outbound),
+        config_path.clone(),
+    ));
 
     // Web dashboard listener. Like the A2A listener, a failure here is logged
     // and the Telegram bot keeps running: a dashboard misconfiguration must not
@@ -531,6 +587,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&agent),
                 Arc::clone(&_supervisor),
                 Arc::clone(&logs),
+                Some(Arc::clone(&a2a_web)),
             )
             .await
             {
@@ -585,4 +642,38 @@ async fn main() -> Result<()> {
     info!("Shutdown complete.");
 
     Ok(())
+}
+
+/// Every secret the configuration holds, for the redaction registry.
+///
+/// These are registered by *value*, so they are scrubbed wherever they appear —
+/// a URL path, a query string, a sentence — which is the only mechanism that
+/// catches a credential with no recognisable shape. `reqwest`'s transport errors
+/// are the case that matters: they render the request URL, and a Telegram bot
+/// token lives in that URL's path.
+///
+/// Empty and unset values are filtered out by `register_secrets` itself; an
+/// empty needle would match everywhere. Nothing here is logged.
+///
+/// `mcp_servers[].env` is deliberately **not** registered: it is a general
+/// environment map (`PATH`, `HOME`, `LANG`), and registering a value that is not
+/// a secret would redact it out of every log line — the over-redaction failure
+/// this module was also fixed for. A token that a server's URL embeds as a query
+/// parameter is covered only by the shape rules.
+fn configured_secrets(config: &Config) -> Vec<&str> {
+    let mut secrets = vec![
+        config.telegram.bot_token.as_str(),
+        config.openrouter.api_key.as_str(),
+    ];
+    for peer in config.a2a.peers.values() {
+        secrets.push(peer.token.as_str());
+    }
+    for peer in config.a2a.outbound.peers.values() {
+        secrets.push(peer.token.as_str());
+    }
+    for server in &config.mcp_servers {
+        secrets.extend(server.auth_token.as_deref());
+        secrets.extend(server.refresh_token.as_deref());
+    }
+    secrets
 }

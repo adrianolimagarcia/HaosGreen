@@ -17,6 +17,7 @@
 //! the gate — a handler mounted on the public router is covered the moment it
 //! is added.
 
+pub mod a2a;
 pub mod auth_routes;
 pub mod chat;
 pub mod logs;
@@ -39,8 +40,14 @@ use crate::web::state::WebState;
 /// persisted state. The log routes belong here for the same reason in reverse:
 /// the log carries targets, paths and error text, and it is the surface a
 /// future change is most likely to leak through.
+///
+/// The A2A routes belong here for both reasons at once: the peer listings name
+/// every peer and its allowed addresses, the `PUT` rewrites outbound
+/// configuration, and the test route makes this process issue an outbound
+/// request carrying a configured peer token.
 pub fn router() -> Router<WebState> {
     Router::new()
+        .merge(a2a::router())
         .merge(auth_routes::router())
         .merge(chat::router())
         .merge(logs::router())

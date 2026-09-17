@@ -5,8 +5,29 @@
 //! installed by `main.rs` alongside the console formatter, so the buffer sees
 //! the same events the terminal does.
 //!
-//! The buffer is hard-bounded: a dashboard must never be the reason a
-//! long-running process grows without limit (design spec §5.3).
+//! # What actually bounds this buffer
+//!
+//! Three limits, because "bounded by entry count" is not a bound in bytes:
+//!
+//! * [`LogBuffer::capacity`] entries, oldest evicted first.
+//! * [`MAX_MESSAGE_BYTES`] per message, applied at capture with an explicit
+//!   `… [N more characters]` marker. Without it one 100 MB line is one entry.
+//! * [`DEFAULT_MAX_BYTES`] of retained text, evicted oldest-first exactly like
+//!   the entry cap. The ring holds
+//!   `min(capacity × per-entry size, max_bytes)` — so a capacity of 2000 with
+//!   8 KiB messages is 4 MiB, not 16 MiB.
+//!
+//! Readers share entries through `Arc` rather than copying them: `recent` and
+//! `since` bump refcounts under the lock instead of cloning payloads, so a
+//! dashboard read cannot stall the process's logging path (every `tracing` call
+//! in the process takes the same mutex). See
+//! [`tests::readers_share_the_entry_allocation_instead_of_cloning_it`].
+//!
+//! Everything downstream is bounded by those: one `GET /api/logs` returns at
+//! most [`crate::web::routes::logs::MAX_LIMIT`] entries (so at most
+//! `MAX_LIMIT × MAX_MESSAGE_BYTES`, 8 MiB, and in practice the byte budget),
+//! one SSE stream queues at most 128 serialized entries, and the number of
+//! concurrent streams is capped by [`MAX_LOG_STREAMS`] permits.
 //!
 //! # What the layer captures, and why
 //!
@@ -39,20 +60,81 @@
 //! realistic flood. Every entry that *is* captured is redacted at construction
 //! (see [`LogEntry::new`]).
 //!
+//! # The layer is armed, not merely installed
+//!
+//! `main.rs` installs the layer before the configuration is loaded — the
+//! subscriber has to exist before anything can log, and `--setup` runs before
+//! there is a configuration at all — so the layer cannot be *absent* for an
+//! instance that turns out to have `[web].enabled = false`. It is gated on an
+//! [`AtomicBool`] instead: `on_event` returns on one relaxed load until `main.rs`
+//! has seen a configuration that enables the dashboard. An instance that never
+//! enables it pays neither the visitor, nor the redaction, nor the timestamp,
+//! and retains nothing.
+//!
+//! The gate is deliberately **not** [`Layer::enabled`]. `Layered::enabled` ANDs
+//! every layer's answer with the inner subscriber's, so a layer that answered
+//! `false` would silence every layer inside it — the console formatter
+//! included — turning "the dashboard is off" into "the process logs nothing".
+//!
 //! # The layer cannot take the process down
 //!
 //! `on_event` is synchronous and never awaits, holds no lock across a call to
 //! anything else, and never panics: a poisoned buffer lock makes
 //! [`LogBuffer::push`] drop the event rather than propagate. A diagnostic
 //! convenience must not be able to kill the process that also serves Telegram.
+//!
+//! A poisoned lock is *not* silent, though: [`LogBuffer::poisoned`] reports it
+//! and the log routes answer 503, because a ring that has stopped recording
+//! while `GET /api/logs` still returns 200 with a stale list is exactly the
+//! "indistinguishable from a quiet process" failure the 503 contract exists to
+//! prevent.
 
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+/// Most bytes of one message the ring retains.
+///
+/// The message is truncated at capture, with an explicit marker, rather than
+/// stored whole and truncated when rendered: the ring is what has to be bounded,
+/// and a message that never enters it cannot be the reason the process grows.
+/// 8 KiB is two orders of magnitude above a normal log line and well below
+/// anything an operator would want to read in a browser.
+pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// Default budget for the retained text of a whole ring, in bytes.
+///
+/// The entry count alone does not bound memory: 2000 entries of a megabyte each
+/// is two gigabytes. The byte budget is what makes "bounded" true regardless of
+/// message size; the entry count is what keeps the *number* of entries (and so
+/// the cost of a scan) bounded regardless of how small they are.
+pub const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many live log streams one buffer will serve at once.
+///
+/// Every SSE tail is a spawned task plus a 128-slot channel of serialized
+/// entries — up to `128 × MAX_MESSAGE_BYTES`, about 1 MiB, per stream — and an
+/// authenticated client can ask for as many as it likes, so the number of tails
+/// has to be bounded by the server rather than by the client's restraint. Eight
+/// covers the realistic case with room to spare (an operator with several tabs
+/// open, plus a `curl` while debugging) while keeping the dashboard's tail cost
+/// under ~8 MiB.
+///
+/// A request over the limit is answered **429 Too Many Requests**, not 503:
+/// 503 is this dashboard's "started without this feature" contract, and the log
+/// view treats it as terminal, whereas a stream limit is transient and has to
+/// be retried.
+///
+/// The cap lives on the buffer rather than on `WebState` because the buffer is
+/// the resource the tails consume: one buffer, one set of tails, and a test that
+/// builds its own buffer gets its own cap.
+pub const MAX_LOG_STREAMS: usize = 8;
 
 /// One tracing event, already redacted.
 #[derive(Clone, Debug, Serialize)]
@@ -72,14 +154,42 @@ impl LogEntry {
     /// The message is redacted here, at construction, not at render time: a
     /// secret that is never stored cannot be leaked by a later bug in a
     /// rendering path.
+    ///
+    /// Redaction runs **before** truncation, and the order matters: truncating
+    /// first could cut a credential in half, leaving a prefix that no rule
+    /// matches and that is still a disclosure.
     pub fn new(level: &str, target: &str, message: &str) -> Self {
         Self {
             timestamp: chrono::Utc::now().to_rfc3339(),
             level: level.to_string(),
             target: target.to_string(),
-            message: crate::supervisor::redact::redact(message),
+            message: truncate(crate::supervisor::redact::redact(message)),
         }
     }
+
+    /// The bytes this entry occupies in the ring.
+    fn bytes(&self) -> usize {
+        self.timestamp.len() + self.level.len() + self.target.len() + self.message.len()
+    }
+}
+
+/// Cut `message` down to [`MAX_MESSAGE_BYTES`] and say how much was dropped.
+///
+/// The cut is made on a `char` boundary so the retained text is always valid
+/// UTF-8, and the marker counts *characters*, not bytes: an operator reading
+/// "… [900 more characters]" should be able to trust the number.
+fn truncate(message: String) -> String {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message;
+    }
+    let total_chars = message.chars().count();
+    let mut cut = MAX_MESSAGE_BYTES;
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let kept = &message[..cut];
+    let dropped = total_chars.saturating_sub(kept.chars().count());
+    format!("{kept}… [{dropped} more characters]")
 }
 
 /// A fixed-capacity ring buffer of [`LogEntry`].
@@ -87,14 +197,21 @@ impl LogEntry {
 /// Every method is failure-tolerant by design: a poisoned lock drops the event
 /// (on write) or returns nothing (on read). The dashboard's log view is a
 /// diagnostic convenience, so it must never be able to panic the process that
-/// also serves Telegram.
+/// also serves Telegram — [`LogBuffer::poisoned`] is how the failure is surfaced
+/// to the operator instead.
 pub struct LogBuffer {
     capacity: usize,
+    max_bytes: usize,
     inner: Mutex<Inner>,
+    /// Permits for live SSE tails. See [`MAX_LOG_STREAMS`].
+    tail_permits: Arc<Semaphore>,
 }
 
 struct Inner {
-    entries: VecDeque<LogEntry>,
+    entries: VecDeque<Arc<LogEntry>>,
+    /// Total bytes of the retained entries, kept in step with `entries` inside
+    /// the same lock so a reader can never observe the two out of step.
+    bytes: usize,
     /// Number of entries ever pushed — the sequence number the *next* entry
     /// will receive.
     ///
@@ -109,32 +226,74 @@ struct Inner {
 }
 
 impl LogBuffer {
+    /// A buffer bounded by `capacity` entries and by [`DEFAULT_MAX_BYTES`].
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_bytes(capacity, DEFAULT_MAX_BYTES)
+    }
+
+    /// A buffer with an explicit byte budget.
+    ///
+    /// Separate from [`LogBuffer::new`] so the byte budget can be exercised with
+    /// a few kilobytes instead of four megabytes.
+    pub fn with_max_bytes(capacity: usize, max_bytes: usize) -> Self {
         Self {
             capacity,
+            max_bytes,
             inner: Mutex::new(Inner {
                 entries: VecDeque::with_capacity(capacity),
+                bytes: 0,
                 pushed: 0,
             }),
+            tail_permits: Arc::new(Semaphore::new(MAX_LOG_STREAMS)),
         }
     }
 
-    /// Append an entry, dropping the oldest when the buffer is full.
+    /// The permits that bound how many live tails this buffer serves.
     ///
-    /// A capacity of zero is legal and discards everything.
+    /// A stream takes one with `try_acquire_owned` and holds it for as long as
+    /// its response body lives, so the bound is on *live* streams rather than on
+    /// requests in flight, and a client that disconnects returns its permit the
+    /// moment its body is dropped.
+    ///
+    /// Returned as an `Arc` rather than a reference because the permit has to
+    /// outlive the handler that takes it: the response body owns it.
+    pub fn tail_permits(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.tail_permits)
+    }
+
+    /// Append an entry, dropping the oldest until both limits hold.
+    ///
+    /// A capacity of zero is legal and discards everything. The newest entry is
+    /// always retained, even if it alone exceeds the byte budget — a ring that
+    /// evicted the entry it was just handed would report an empty log for a
+    /// process that is logging.
     pub fn push(&self, entry: LogEntry) {
+        let entry = Arc::new(entry);
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        inner.bytes = inner.bytes.saturating_add(entry.bytes());
         inner.entries.push_back(entry);
         inner.pushed = inner.pushed.saturating_add(1);
-        while inner.entries.len() > self.capacity {
-            inner.entries.pop_front();
+
+        while inner.entries.len() > self.capacity
+            || (inner.bytes > self.max_bytes && inner.entries.len() > 1)
+        {
+            let Some(oldest) = inner.entries.pop_front() else {
+                break;
+            };
+            inner.bytes = inner.bytes.saturating_sub(oldest.bytes());
         }
     }
 
     /// The most recent `limit` entries, oldest first.
-    pub fn recent(&self, limit: usize) -> Vec<LogEntry> {
+    ///
+    /// The entries are shared, not copied: the only work done under the lock is
+    /// one refcount bump per entry. Cloning the payloads here — which is what
+    /// this used to do, up to 1000 entries of arbitrary size — meant a dashboard
+    /// read blocked every `tracing` call in the process for as long as the copy
+    /// took.
+    pub fn recent(&self, limit: usize) -> Vec<Arc<LogEntry>> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
@@ -146,6 +305,16 @@ impl LogBuffer {
         self.capacity
     }
 
+    /// The byte budget the ring evicts against.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Bytes of entry text currently retained.
+    pub fn bytes(&self) -> usize {
+        self.inner.lock().map(|inner| inner.bytes).unwrap_or(0)
+    }
+
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -155,6 +324,31 @@ impl LogBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// True when the ring has stopped recording.
+    ///
+    /// `push` and the readers all treat a poisoned lock as "do nothing", which
+    /// on its own is indistinguishable from a quiet process: the routes would
+    /// answer 200 with the entries from before the poison and an operator would
+    /// see a log that simply stopped. The routes check this and answer 503.
+    pub fn poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
+    /// Poison the ring's lock, for tests that need to prove the 503 contract.
+    ///
+    /// Test-only, and `#[doc(hidden)]` for the same reason the
+    /// `spawn_for_test_*` entry points in `web::mod` are: the condition it
+    /// creates is otherwise unreachable (nothing in this module panics while
+    /// holding the lock), and an integration test cannot reach a private field
+    /// to create it.
+    #[doc(hidden)]
+    pub fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inner.lock().expect("poison_for_test: lock");
+            panic!("poison_for_test: deliberately poisoning the log buffer lock");
+        }));
     }
 
     /// The sequence number the next pushed entry will receive.
@@ -174,16 +368,17 @@ impl LogBuffer {
     ///   returned entry, so a caller that feeds it back can never be handed the
     ///   same entry twice — including when the ring wrapped between two calls.
     /// * **No reordering.** Entries come out in push order.
-    /// * **Bounded work.** At most `max` entries are cloned, so a caller that
-    ///   fell behind (or a burst of thousands of events) costs one bounded
-    ///   allocation per call rather than the whole ring.
+    /// * **Bounded work.** At most `max` entries are handed out, and each is a
+    ///   refcount bump rather than a copy, so a caller that fell behind (or a
+    ///   burst of thousands of events) costs one bounded allocation per call
+    ///   rather than the whole ring.
     ///
     /// If `from_seq` is older than the oldest entry still retained — the tail
     /// fell further behind than the capacity — the gap is skipped and the
     /// returned `next` starts at the oldest retained entry. Those entries are
     /// gone; reporting the gap is the caller's business, and the tail cannot
     /// invent them.
-    pub fn since(&self, from_seq: u64, max: usize) -> (Vec<LogEntry>, u64) {
+    pub fn since(&self, from_seq: u64, max: usize) -> (Vec<Arc<LogEntry>>, u64) {
         let Ok(inner) = self.inner.lock() else {
             return (Vec::new(), from_seq);
         };
@@ -221,20 +416,29 @@ fn captures(level: Level) -> bool {
 /// A `tracing_subscriber::Layer` that copies events into a [`LogBuffer`].
 ///
 /// Installed by `main.rs` with the same `EnvFilter` the console formatter uses,
-/// so the dashboard sees what the terminal sees. See the module documentation
-/// for the inclusion policy.
+/// so the dashboard sees what the terminal sees, and armed by `main.rs` once it
+/// knows the dashboard is enabled. See the module documentation for the
+/// inclusion policy and for why the arm switch is not [`Layer::enabled`].
 pub struct LogLayer {
     buffer: Arc<LogBuffer>,
+    armed: Arc<AtomicBool>,
 }
 
 impl LogLayer {
-    pub fn new(buffer: Arc<LogBuffer>) -> Self {
-        Self { buffer }
+    pub fn new(buffer: Arc<LogBuffer>, armed: Arc<AtomicBool>) -> Self {
+        Self { buffer, armed }
     }
 }
 
 impl<S: Subscriber> Layer<S> for LogLayer {
     fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        // One relaxed load on the disabled path: an instance with
+        // `[web].enabled = false` pays nothing else — no visitor, no redaction,
+        // no timestamp, nothing retained.
+        if !self.armed.load(Ordering::Relaxed) {
+            return;
+        }
+
         let metadata = event.metadata();
         if !captures(*metadata.level()) {
             return;
@@ -266,18 +470,20 @@ impl<S: Subscriber> Layer<S> for LogLayer {
 /// position is not load-bearing, only its presence. The layer therefore does
 /// **not** filter itself — a layer that returned `false` from `enabled` would
 /// silence every layer inside it, the console formatter included. Filtering
-/// belongs to the filter.
+/// belongs to the filter, and the dashboard's on/off switch is `armed`, checked
+/// inside `on_event`.
 ///
 /// `LookupSpan` is part of the return type because `fmt::layer()`, which
 /// `main.rs` adds on top, requires it; `Registry` provides it.
 pub fn log_subscriber(
     filter: tracing_subscriber::EnvFilter,
     buffer: Arc<LogBuffer>,
+    armed: Arc<AtomicBool>,
 ) -> impl Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync + 'static
 {
     tracing_subscriber::registry()
         .with(filter)
-        .with(LogLayer::new(buffer))
+        .with(LogLayer::new(buffer, armed))
 }
 
 /// Picks the `message` field out of an event.
@@ -332,6 +538,12 @@ impl Visit for MessageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An armed switch, for the tests that are about capture rather than about
+    /// the arm gate.
+    fn armed() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
 
     #[test]
     fn the_buffer_is_bounded_and_drops_the_oldest_first() {
@@ -404,6 +616,181 @@ mod tests {
         assert_eq!(buffer.recent(usize::MAX).len(), 100);
     }
 
+    // ── The byte budget (M2) ────────────────────────────────────────────────
+
+    /// The entry count is not a bound in bytes. With a 4 KiB budget, entries of
+    /// ~1 KiB must be evicted long before the capacity of 100 is reached.
+    #[test]
+    fn the_ring_evicts_on_bytes_and_not_only_on_the_entry_count() {
+        let buffer = LogBuffer::with_max_bytes(100, 4 * 1024);
+        let payload = "z".repeat(1024);
+
+        for i in 0..10 {
+            buffer.push(LogEntry::new("info", "t", &format!("{i}{payload}")));
+        }
+
+        assert!(
+            buffer.len() < 10,
+            "the byte budget must evict entries the count limit would have kept: {} retained",
+            buffer.len()
+        );
+        assert!(
+            buffer.bytes() <= 4 * 1024,
+            "retained bytes must stay inside the budget: {}",
+            buffer.bytes()
+        );
+
+        // The newest entry is always the one that was just pushed.
+        let entries = buffer.recent(1);
+        assert!(entries[0].message.starts_with('9'), "got {entries:?}");
+    }
+
+    /// A single entry larger than the whole budget must not empty the ring: a
+    /// process that is logging must never show an empty log.
+    #[test]
+    fn a_single_entry_larger_than_the_budget_is_still_retained() {
+        let buffer = LogBuffer::with_max_bytes(100, 16);
+        buffer.push(LogEntry::new(
+            "info",
+            "t",
+            "a message that is longer than the budget",
+        ));
+
+        assert_eq!(buffer.len(), 1, "the newest entry must survive eviction");
+    }
+
+    // ── The per-message cap (M2) ────────────────────────────────────────────
+
+    /// One enormous log line is one entry unless it is capped at capture.
+    #[test]
+    fn a_message_larger_than_the_cap_is_truncated_with_a_marker() {
+        let huge = "x".repeat(MAX_MESSAGE_BYTES * 3);
+        let entry = LogEntry::new("info", "t", &huge);
+
+        assert!(
+            entry.message.len() < huge.len(),
+            "the message must be capped: {} bytes retained",
+            entry.message.len()
+        );
+        assert!(
+            entry.message.contains("more characters]"),
+            "the truncation must be explicit: {}",
+            &entry.message[entry.message.len() - 40..]
+        );
+
+        // The number in the marker is the number of characters dropped.
+        let dropped = huge.chars().count() - MAX_MESSAGE_BYTES;
+        assert!(
+            entry
+                .message
+                .contains(&format!("[{dropped} more characters]")),
+            "the marker must count what was dropped: {}",
+            &entry.message[entry.message.len() - 40..]
+        );
+    }
+
+    /// The cut must not split a multi-byte character: the retained text is a
+    /// `String`, so a byte-wise cut would panic or corrupt it.
+    #[test]
+    fn truncation_cuts_on_a_character_boundary() {
+        let huge = "é".repeat(MAX_MESSAGE_BYTES);
+        let entry = LogEntry::new("info", "t", &huge);
+        assert!(entry.message.starts_with('é'));
+        assert!(entry.message.contains("more characters]"));
+    }
+
+    #[test]
+    fn a_message_inside_the_cap_is_untouched() {
+        let entry = LogEntry::new("info", "t", "a short line");
+        assert_eq!(entry.message, "a short line");
+    }
+
+    // ── Readers share the payload (M1) ──────────────────────────────────────
+
+    /// The structural claim behind the lock-contention fix: a reader does not
+    /// copy an entry, it takes a reference to the one the ring already holds.
+    ///
+    /// A timing assertion would be flaky; pointer identity is not. If `recent`
+    /// cloned the payload — which is what it did before this test existed — the
+    /// two reads would return two distinct allocations with a strong count of
+    /// one each, and this fails.
+    #[test]
+    fn readers_share_the_entry_allocation_instead_of_cloning_it() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(LogEntry::new("info", "t", &"p".repeat(4096)));
+
+        let first = buffer.recent(1);
+        let second = buffer.recent(1);
+        let via_since = buffer.since(0, 8).0;
+
+        assert!(
+            Arc::ptr_eq(&first[0], &second[0]),
+            "two reads of the same entry must return the same allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&first[0], &via_since[0]),
+            "`since` must hand out the ring's own entry too"
+        );
+        assert_eq!(
+            Arc::strong_count(&first[0]),
+            4,
+            "one reference in the ring plus one per reader — a clone would add \
+             an allocation with a count of one, not a reference"
+        );
+    }
+
+    // ── The stream cap (M3) ─────────────────────────────────────────────────
+
+    /// The buffer hands out a fixed, small number of tail permits, and gives one
+    /// back when the holder drops it.
+    #[test]
+    fn the_tail_permits_bound_the_number_of_live_streams() {
+        let buffer = LogBuffer::new(8);
+        let permits: Vec<_> = (0..MAX_LOG_STREAMS)
+            .map(|_| {
+                buffer
+                    .tail_permits()
+                    .try_acquire_owned()
+                    .expect("a permit inside the cap must be granted")
+            })
+            .collect();
+
+        assert!(
+            buffer.tail_permits().try_acquire_owned().is_err(),
+            "the {MAX_LOG_STREAMS}th concurrent stream must be refused"
+        );
+
+        drop(permits);
+        assert!(
+            buffer.tail_permits().try_acquire_owned().is_ok(),
+            "a disconnected stream must return its permit"
+        );
+    }
+
+    // ── The poisoned lock (L2) ──────────────────────────────────────────────
+
+    /// A ring that has stopped recording must be *reportable*. Without this the
+    /// routes answer 200 with a stale list, which is indistinguishable from a
+    /// quiet process.
+    #[test]
+    fn a_poisoned_lock_is_reported_and_never_panics() {
+        let buffer = LogBuffer::new(8);
+        buffer.push(LogEntry::new("info", "t", "before"));
+        assert!(!buffer.poisoned());
+
+        buffer.poison_for_test();
+
+        assert!(buffer.poisoned(), "the poison must be observable");
+        // And every entry point stays non-panicking, which is what keeps the
+        // `tracing` layer from taking the process down.
+        buffer.push(LogEntry::new("info", "t", "after"));
+        assert!(buffer.recent(8).is_empty());
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.bytes(), 0);
+        assert_eq!(buffer.next_seq(), 0);
+        assert!(buffer.since(0, 8).0.is_empty());
+    }
+
     // ── The tail cursor ─────────────────────────────────────────────────────
 
     /// The property the SSE tail depends on: feeding the returned cursor back in
@@ -420,7 +807,7 @@ mod tests {
             buffer.push(LogEntry::new("info", "t", &format!("line {i}")));
             let (entries, next) = buffer.since(cursor, 16);
             cursor = next;
-            seen.extend(entries.into_iter().map(|entry| entry.message));
+            seen.extend(entries.into_iter().map(|entry| entry.message.clone()));
         }
 
         assert_eq!(
@@ -481,7 +868,7 @@ mod tests {
             .into_iter()
             .chain(second)
             .chain(third)
-            .map(|entry| entry.message)
+            .map(|entry| entry.message.clone())
             .collect();
         assert_eq!(
             messages,
@@ -527,7 +914,8 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let buffer = Arc::new(LogBuffer::new(16));
-        let subscriber = tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer)));
+        let subscriber =
+            tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer), armed()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "haos_green::logs::layer_test", "rendered {} {}", "a", 42);
@@ -556,6 +944,7 @@ mod tests {
         let subscriber = log_subscriber(
             tracing_subscriber::EnvFilter::new("warn"),
             Arc::clone(&buffer),
+            armed(),
         );
 
         tracing::subscriber::with_default(subscriber, || {
@@ -579,7 +968,8 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let buffer = Arc::new(LogBuffer::new(16));
-        let subscriber = tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer)));
+        let subscriber =
+            tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer), armed()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::trace!(target: "haos_green::logs::level_test", "per-frame chatter");
@@ -604,7 +994,8 @@ mod tests {
         let secret = format!("{}{}", "s3cr3t-", "value");
 
         let buffer = Arc::new(LogBuffer::new(16));
-        let subscriber = tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer)));
+        let subscriber =
+            tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer), armed()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "haos_green::logs::redact_test", "calling with token={secret}");
@@ -625,7 +1016,8 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let buffer = Arc::new(LogBuffer::new(16));
-        let subscriber = tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer)));
+        let subscriber =
+            tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer), armed()));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(target: "haos_green::logs::fields_test", port = 8080, "listening");
@@ -634,5 +1026,81 @@ mod tests {
         let entries = buffer.recent(16);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].message, "listening");
+    }
+
+    // ── The arm gate (M4) ───────────────────────────────────────────────────
+
+    /// An instance that never enables the dashboard must retain nothing: the
+    /// layer is installed (the subscriber has to exist before the configuration
+    /// is read) but disarmed.
+    #[test]
+    fn a_disarmed_layer_retains_nothing_and_can_be_armed_later() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = Arc::new(LogBuffer::new(16));
+        let armed = Arc::new(AtomicBool::new(false));
+        let subscriber =
+            tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer), armed.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "haos_green::logs::arm_test", "emitted while disarmed");
+        });
+        assert!(
+            buffer.is_empty(),
+            "a disarmed layer must not spend a slot on anything"
+        );
+
+        // `main.rs` arms it once it has read a configuration that enables the
+        // dashboard; everything after that is captured as usual.
+        armed.store(true, Ordering::Relaxed);
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(LogLayer::new(Arc::clone(&buffer), armed.clone())),
+            || {
+                tracing::error!(target: "haos_green::logs::arm_test", "emitted while armed");
+            },
+        );
+        let entries = buffer.recent(16);
+        assert_eq!(entries.len(), 1, "got {entries:?}");
+        assert_eq!(entries[0].message, "emitted while armed");
+    }
+
+    /// The gate must not be [`Layer::enabled`]: `Layered::enabled` ANDs every
+    /// layer's answer with the inner subscriber's, so a layer that returned
+    /// `false` there would silence the console formatter too. This drives a
+    /// two-layer stack and proves the inner layer still sees the event while
+    /// `LogLayer` is disarmed.
+    #[test]
+    fn a_disarmed_log_layer_does_not_silence_the_layers_inside_it() {
+        use std::sync::atomic::AtomicUsize;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        #[derive(Default)]
+        struct Counter(Arc<AtomicUsize>);
+
+        impl<S: Subscriber> Layer<S> for Counter {
+            fn on_event(&self, _event: &Event<'_>, _context: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let buffer = Arc::new(LogBuffer::new(16));
+        let subscriber = tracing_subscriber::registry()
+            .with(Counter(Arc::clone(&seen)))
+            .with(LogLayer::new(
+                buffer.clone(),
+                Arc::new(AtomicBool::new(false)),
+            ));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "haos_green::logs::arm_test", "still delivered");
+        });
+
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            1,
+            "the inner layer must still receive the event"
+        );
+        assert!(buffer.is_empty());
     }
 }

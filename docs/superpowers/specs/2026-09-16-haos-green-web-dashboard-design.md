@@ -374,7 +374,7 @@ of unbounded memory growth.
 GET  /api/a2a/status      → listener enabled/bound URL, advertised card name, peer counts
 GET  /api/a2a/peers       → inbound peers, tokens redacted
 GET  /api/a2a/outbound    → outbound peers, tokens redacted
-PUT  /api/a2a/outbound    → write outbound peers; tokens are write-only
+PUT  /api/a2a/outbound    → replace outbound peers; tokens are write-only; persists
 POST /api/a2a/test        → real Agent Card discovery against a configured peer
 ```
 
@@ -382,6 +382,64 @@ The connection test calls the existing `A2aClient::discover` so the operator
 tests the real code path rather than a bespoke probe. Tokens are never returned
 by any endpoint, not even to an authenticated operator — the UI shows a
 fingerprint and accepts a replacement.
+
+#### 5.4.1 `PUT /api/a2a/outbound` is live and persistent
+
+**Amended by operator decision.** §10 previously listed "editing `config.toml`
+from the UI" as a non-goal. The operator withdrew it for this one route, which
+now does three things, in this order, and reports success only when all three
+happened:
+
+- **It rewrites only the `[a2a.outbound.peers]` table** of the file the process
+  was started from — the path `home::resolve_config_path` resolved at startup, so
+  the file written is the file read. The edit goes through `toml_edit`, which
+  keeps every comment, blank line, key order and formatting choice *outside* that
+  table byte-identical. The `Config` struct is never re-serialized: that would
+  delete the operator's comments and reorder the file that holds their secrets.
+  Comments *inside* the replaced table annotate entries that were replaced, so
+  they go with them.
+- **The write is atomic.** The new text goes to a temporary file in the same
+  directory, is fsynced, is given the original file's permissions, and is only
+  then renamed over `config.toml`. A crash or a full disk therefore leaves the
+  old file or the new one, never a truncated one — a truncated `config.toml`
+  means the operator's bot does not start.
+- **Permissions are preserved.** `config.toml` holds the Telegram token, the
+  OpenRouter key and every peer token, so an owner-only file stays owner-only,
+  and the temporary file is never even briefly world-readable.
+- **Only then is the change applied to the running agent.** `main.rs` creates one
+  shared handle (`Arc<tokio::sync::RwLock<A2aOutboundConfig>>`) and clones it
+  into both the `call_a2a_agent` tool and the dashboard state, so the running
+  agent uses the new peers on its next invocation. The tool is registered
+  unconditionally, so the *first* peer added from the dashboard is reachable
+  without a restart.
+
+The change survives a restart. It is lost only if the operator edits
+`config.toml` externally and restarts, at which point the file is the authority
+again, as it is for every other setting.
+
+A failed write is reported as a failure: **500**, with the file and the running
+configuration both left exactly as they were. A "saved" response that did not
+save would be worse than an error. A missing `config.toml` is one of those
+failures — the route does not create one, because a fresh file holding only
+`[a2a.outbound.peers]` is a configuration the process cannot start from.
+Concurrent `PUT`s are serialised by a mutex around the read-modify-write, so the
+file cannot be interleaved and the file and the running configuration always
+agree once a request has answered.
+
+The response reports what happened rather than leaving it to be discovered:
+
+```json
+{"peers": [], "persistent": true, "restart_reverts": false,
+ "affects_running_agent": true, "semantics": "...", "token_semantics": "..."}
+```
+
+**Security consequence — this route can redirect a stored token.** An omitted
+`token` keeps the stored one, so a `PUT` that changes a peer's `url` points the
+*existing* token at a new host without the caller ever knowing the token. That is
+a real capability and it is why this route is CSRF-guarded like every other
+mutating route and reachable only with an operator session or the operator's
+bearer token. It is never on the public router. Supply the token explicitly when
+changing a URL.
 
 ### 5.5 Settings
 
@@ -472,6 +530,10 @@ out until that restart (§4.4). `public_url` is both the `Secure`-cookie switch
 and the host the dashboard answers to (§4.5.1); a non-loopback `bind` without it
 logs a startup warning.
 
+The one exception to "the dashboard never writes this file" is
+`PUT /api/a2a/outbound`, which rewrites the `[a2a.outbound.peers]` table and
+nothing else (§5.4.1).
+
 ---
 
 ## 8. Testing strategy
@@ -531,9 +593,14 @@ other and may land in any order after it.
 - WebSocket transport; SSE covers the streaming need.
 - Multiple users, roles, or per-user permissions — one operator identity.
 - TLS termination inside the process; use a reverse proxy or Tailscale.
-- Editing `config.toml` from the UI.
 - Self-upgrade or binary reload from the UI.
 - Persisting chat sessions across process restarts.
+
+> **Withdrawn:** "editing `config.toml` from the UI" was listed here. The operator
+> overrode it for exactly one route — `PUT /api/a2a/outbound`, which writes only
+> the `[a2a.outbound.peers]` table. See §5.4.1. Every other setting still comes
+> from the file: in particular `PUT /api/settings/allow-ips` remains in-memory
+> only (§7), and no route writes any other section of `config.toml`.
 
 ---
 

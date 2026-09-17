@@ -16,6 +16,12 @@
 //! the tracing layer must say so rather than render an empty log, which is
 //! indistinguishable from a quiet process.
 //!
+//! Both also answer **503** when the buffer's lock is poisoned
+//! ([`LogBuffer::poisoned`]). A ring that has stopped recording is the same
+//! failure in a different disguise: without this, `GET /api/logs` would answer
+//! 200 with the entries from before the poison and an operator would see a log
+//! that simply stopped.
+//!
 //! # `limit` is clamped on the server, always
 //!
 //! The client's number is never trusted to bound the work the server does:
@@ -40,7 +46,10 @@
 //! without a second call.
 //!
 //! Entries are returned **oldest first**, matching the ring's own order, so the
-//! view can append what it already has.
+//! view can append what it already has. They are serialized by reference: the
+//! handler holds the `Arc`s the ring handed it and the response body is written
+//! from those, so a history read copies no payload at all — the entries are
+//! shared with the logging path rather than duplicated away from it.
 //!
 //! # The stream
 //!
@@ -59,6 +68,31 @@
 //! a silent process still ends the moment its receiver goes away. Nothing in
 //! the loop can block on the client either — a full channel makes `send` await,
 //! and it returns `Err` (rather than hanging) as soon as the receiver is gone.
+//!
+//! ## Why there is a cap on how many streams can be open
+//!
+//! "It cannot leak a task per abandoned tab" bounds one tab, not the client: an
+//! authenticated client can open as many streams as it asks for, and each is a
+//! task plus a [`STREAM_CHANNEL_CAPACITY`]-slot channel of serialized entries.
+//! A stream therefore holds one of the buffer's
+//! [`MAX_LOG_STREAMS`](crate::web::logs::MAX_LOG_STREAMS) permits for as long as
+//! its body lives, and a request that cannot get one is answered **429** with a
+//! `Retry-After`.
+//!
+//! 429 rather than 503, deliberately: the log view treats 503 as terminal
+//! ("this dashboard was started without a log buffer"), so a transient stream
+//! limit answered as 503 would permanently disable the view in that tab.
+//!
+//! ## Why an open stream stops when the session does
+//!
+//! A stream is authorised once, at connect, by `middleware::guard`. On its own
+//! that means logging out — or a session reaching its TTL — leaves an
+//! already-open tail delivering the log to a client that is no longer
+//! authenticated, for as long as the tab stays open. The tail therefore
+//! re-validates its own credential every [`AUTH_RECHECK_INTERVAL`] and ends when
+//! it stops being valid. The check is the same one `guard` makes, against the
+//! same stores, and a bearer-authenticated stream re-checks the bearer for the
+//! same reason (the token can be rotated from the settings route).
 //!
 //! ## Why it cannot repeat or reorder an entry across a ring wrap
 //!
@@ -81,25 +115,27 @@
 //! buffer has no notification channel, and adding one would mean the layer —
 //! which runs inside the process's own logging path — waking every subscriber
 //! on every event. A tick takes one uncontended mutex, compares one integer,
-//! and clones only the entries that are actually new (at most [`STREAM_BATCH`]
-//! of them), so an idle stream costs a lock and a comparison four times a
-//! second and allocates nothing. It is bounded by construction: no tick can
-//! scan more than one batch.
+//! and takes a reference to only the entries that are actually new (at most
+//! [`STREAM_BATCH`] of them), so an idle stream costs a lock and a comparison
+//! four times a second and allocates nothing. It is bounded by construction: no
+//! tick can scan more than one batch.
 //!
 //! The interval is the worst-case latency of a new line appearing, not a
 //! correctness parameter.
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::web::logs::LogEntry;
+use crate::web::middleware;
 use crate::web::state::WebState;
 
 /// The SSE event name carrying one [`LogEntry`].
@@ -113,6 +149,15 @@ pub const MAX_LIMIT: usize = 1000;
 
 /// The body of a rejected `limit`.
 const BAD_LIMIT: &str = "limit must be a non-negative integer";
+
+/// The body of a stream request that could not get a permit.
+const TOO_MANY_STREAMS: &str =
+    "too many live log streams are already open; close one and try again";
+
+/// The body returned when the ring has stopped recording.
+const POISONED_BUFFER: &str =
+    "the log buffer lock is poisoned: the ring has stopped recording and the entries it still \
+     holds are stale";
 
 /// Capacity of the channel between the tail task and the response body.
 ///
@@ -132,10 +177,19 @@ const STREAM_BATCH: usize = 256;
 /// How often the tail looks for new entries.
 ///
 /// Bounded and cheap by construction (see the module documentation): one lock,
-/// one integer comparison, and a clone of only what is new. 250 ms is the
+/// one integer comparison, and a reference to only what is new. 250 ms is the
 /// worst-case delay before a new line reaches the browser, which is well under
 /// what an operator perceives as "live".
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often an open stream re-checks that its client is still authorised.
+///
+/// See the module documentation: a stream is authorised once at connect, and
+/// logout or session expiry has to end it. Two seconds bounds how long a
+/// revoked session keeps receiving the log; the check itself is a hash lookup
+/// against the session store, so it is cheap enough to run this often on every
+/// open stream.
+const AUTH_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often an idle stream emits a comment line.
 ///
@@ -151,9 +205,12 @@ pub fn router() -> Router<WebState> {
 
 /// The body of `GET /api/logs`.
 #[derive(Serialize)]
-struct LogsResponse {
+struct LogsResponse<'a> {
     /// Oldest first, at most `limit` of them.
-    entries: Vec<LogEntry>,
+    ///
+    /// Borrowed from the ring's own `Arc`s, so building this response copies no
+    /// message text: the entries are shared with the logging path.
+    entries: Vec<&'a LogEntry>,
     /// The ring's capacity, so the view can say how much history exists
     /// without asking twice.
     capacity: usize,
@@ -184,29 +241,75 @@ async fn recent_logs(State(state): State<WebState>, Query(query): Query<LogQuery
         Err((status, message)) => return (status, message).into_response(),
     };
 
+    if buffer.poisoned() {
+        return (StatusCode::SERVICE_UNAVAILABLE, POISONED_BUFFER).into_response();
+    }
+
     let capacity = buffer.capacity();
     let limit = match parse_limit(query.limit.as_deref(), capacity) {
         Ok(limit) => limit,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
 
+    let entries = buffer.recent(limit);
     Json(LogsResponse {
-        entries: buffer.recent(limit),
+        entries: entries.iter().map(Arc::as_ref).collect(),
         capacity,
     })
     .into_response()
 }
 
-async fn stream_logs(State(state): State<WebState>) -> Response {
+async fn stream_logs(State(state): State<WebState>, headers: HeaderMap) -> Response {
     let buffer = match state.logs_or_unavailable() {
         Ok(buffer) => buffer,
         Err((status, message)) => return (status, message).into_response(),
+    };
+
+    if buffer.poisoned() {
+        return (StatusCode::SERVICE_UNAVAILABLE, POISONED_BUFFER).into_response();
+    }
+
+    // The permit is held by the response body, not by this handler: what is
+    // capped is live streams, and a client that disconnects gives its permit
+    // back the moment its body is dropped.
+    let permit = match buffer.tail_permits().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, TOO_MANY_STREAMS).into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            return response;
+        }
     };
 
     // Read before the response is returned: the head reaches the client after
     // this, so anything pushed once the client can see the stream is at or after
     // the cursor and will be delivered.
     let mut next = buffer.next_seq();
+
+    // The credential this stream was authorised with, re-checked periodically.
+    // Captured as owned values so the check can run inside the tail task.
+    let session = middleware::session_from_cookies(&headers);
+    let bearer = middleware::bearer_token(&headers).map(str::to_owned);
+    let sessions = Arc::clone(&state.sessions);
+    let credentials = Arc::clone(&state.credentials);
+    let still_authorised = move || -> bool {
+        let session_ok = session
+            .as_deref()
+            .map(|id| sessions.validate(id))
+            .unwrap_or(false);
+        let bearer_ok = bearer
+            .as_deref()
+            .map(|token| {
+                credentials
+                    .lock()
+                    .map(|c| c.verify_bearer(token))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        session_ok || bearer_ok
+    };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(STREAM_CHANNEL_CAPACITY);
 
@@ -216,12 +319,22 @@ async fn stream_logs(State(state): State<WebState>) -> Response {
         // burst of catch-up ticks: the cursor makes catching up unnecessary.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        let mut recheck = tokio::time::interval(AUTH_RECHECK_INTERVAL);
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 // The response body holds the only receiver. When the client
                 // disconnects the body is dropped, this resolves, and the task
                 // ends — whether or not it had anything to send.
                 _ = tx.closed() => break,
+                // Logout, or a session reaching its TTL, must end a stream that
+                // is already open.
+                _ = recheck.tick() => {
+                    if !still_authorised() {
+                        break;
+                    }
+                }
                 _ = ticker.tick() => {
                     let (entries, cursor) = buffer.since(next, STREAM_BATCH);
                     next = cursor;
@@ -229,7 +342,7 @@ async fn stream_logs(State(state): State<WebState>) -> Response {
                         // A `LogEntry` is four `String`s, so this cannot fail;
                         // it is written as a skip rather than an `expect`
                         // because this task must never panic.
-                        let Ok(data) = serde_json::to_string(&entry) else {
+                        let Ok(data) = serde_json::to_string(entry.as_ref()) else {
                             continue;
                         };
                         if tx.send(Event::default().event(EVENT_LOG).data(data)).await.is_err() {
@@ -242,9 +355,13 @@ async fn stream_logs(State(state): State<WebState>) -> Response {
     });
 
     // Dropping this stream drops `rx`, which is what stops `tail`. The join
-    // handle is awaited only so a task that ends on its own (never, today) ends
-    // the body too, rather than leaving a stream that can only ever be idle.
+    // handle is awaited only so a task that ends on its own — a revoked session
+    // does exactly that — ends the body too, rather than leaving a stream that
+    // can only ever be idle.
     let stream = async_stream::stream! {
+        // Bound to a name, not to `_`: a permit dropped here would be released
+        // before the first frame and the cap would count nothing.
+        let _permit = permit;
         loop {
             tokio::select! {
                 biased;
@@ -324,5 +441,25 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(decoded["message"].as_str().unwrap(), entry.message);
         assert_eq!(decoded["level"].as_str().unwrap(), "INFO");
+    }
+
+    /// The tail serializes the ring's own `Arc`, so the same entry serializes
+    /// identically whether it is reached through the history route or the
+    /// stream. A response built by cloning would be a second allocation; this
+    /// pins that both paths produce the same bytes from the same object.
+    #[test]
+    fn a_shared_entry_serializes_the_same_way_as_the_ring_holds_it() {
+        use crate::web::logs::LogBuffer;
+
+        let buffer = LogBuffer::new(4);
+        buffer.push(LogEntry::new("WARN", "haos_green::test", "shared"));
+
+        let entries = buffer.recent(1);
+        let via_arc = serde_json::to_string(entries[0].as_ref()).unwrap();
+        let via_ref: &LogEntry = entries[0].as_ref();
+        let via_borrow = serde_json::to_string(via_ref).unwrap();
+
+        assert_eq!(via_arc, via_borrow);
+        assert!(via_arc.contains("\"shared\""));
     }
 }

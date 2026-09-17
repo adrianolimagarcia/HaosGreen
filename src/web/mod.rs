@@ -122,6 +122,7 @@ fn build_state(
     agent: Option<Arc<Agent>>,
     supervisor: Option<Arc<Supervisor>>,
     logs: Option<Arc<logs::LogBuffer>>,
+    a2a: Option<Arc<routes::a2a::A2aWebState>>,
 ) -> Result<WebState> {
     config.validate()?;
     let credentials_path = home.join("web-auth.toml");
@@ -144,6 +145,7 @@ fn build_state(
         credentials_path,
         chat: Arc::new(chat::ChatSessionStore::new()),
         logs,
+        a2a,
         config,
         agent,
         supervisor,
@@ -158,12 +160,18 @@ fn build_state(
 /// `logs` is the **same** `Arc<LogBuffer>` the `LogLayer` installed in
 /// `main.rs` writes into. Handing the dashboard its own buffer would compile,
 /// run, and show an operator a permanently empty log view.
+///
+/// `a2a` carries what `main.rs` observed about the A2A listener. It is a
+/// parameter rather than something the dashboard reads for itself: the outcome
+/// is only knowable where the listener was started, and a dashboard that
+/// guessed at it would report a status nobody observed.
 pub async fn spawn(
     config: WebConfig,
     home: PathBuf,
     agent: Arc<Agent>,
     supervisor: Arc<Supervisor>,
     logs: Arc<logs::LogBuffer>,
+    a2a: Option<Arc<routes::a2a::A2aWebState>>,
 ) -> Result<SocketAddr> {
     // The flag is authoritative here too, not only at the call site: a caller
     // that forgets to check `enabled` must not be able to open the port.
@@ -172,7 +180,7 @@ pub async fn spawn(
     }
 
     let bind = config.bind.clone();
-    let state = build_state(config, home, Some(agent), Some(supervisor), Some(logs))?;
+    let state = build_state(config, home, Some(agent), Some(supervisor), Some(logs), a2a)?;
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("failed to bind web dashboard to {bind}"))?;
@@ -255,7 +263,7 @@ pub async fn spawn_for_test_with_agent(
     config: WebConfig,
     agent: Option<Arc<Agent>>,
 ) -> Result<(SocketAddr, ())> {
-    spawn_for_test_with_handles(home, config, agent, None, None).await
+    spawn_for_test_with_handles(home, config, agent, None, None, None).await
 }
 
 /// [`spawn_for_test_with_agent`] with a supervisor attached.
@@ -272,7 +280,7 @@ pub async fn spawn_for_test_with_supervisor(
     config: WebConfig,
     supervisor: Option<Arc<Supervisor>>,
 ) -> Result<(SocketAddr, ())> {
-    spawn_for_test_with_handles(home, config, None, supervisor, None).await
+    spawn_for_test_with_handles(home, config, None, supervisor, None, None).await
 }
 
 /// [`spawn_for_test_with`] with a live log buffer attached.
@@ -289,7 +297,24 @@ pub async fn spawn_for_test_with_logs(
     config: WebConfig,
     logs: Arc<logs::LogBuffer>,
 ) -> Result<(SocketAddr, ())> {
-    spawn_for_test_with_handles(home, config, None, None, Some(logs)).await
+    spawn_for_test_with_handles(home, config, None, None, Some(logs), None).await
+}
+
+/// [`spawn_for_test_with`] with the A2A surface attached.
+///
+/// The A2A routes answer 503 without one, and the state carries the listener
+/// outcome the status route reports, so a test that never wires it would prove
+/// nothing about either. The state is built by the caller because the outcome
+/// it holds is an *observation* — `start_listener` is what produces it, and a
+/// test that wants the failure path calls it with a configuration that really
+/// fails to bind.
+#[doc(hidden)]
+pub async fn spawn_for_test_with_a2a(
+    home: PathBuf,
+    config: WebConfig,
+    a2a: Arc<routes::a2a::A2aWebState>,
+) -> Result<(SocketAddr, ())> {
+    spawn_for_test_with_handles(home, config, None, None, None, Some(a2a)).await
 }
 
 /// The shared body of the `spawn_for_test_with_*` entry points.
@@ -299,9 +324,10 @@ async fn spawn_for_test_with_handles(
     agent: Option<Arc<Agent>>,
     supervisor: Option<Arc<Supervisor>>,
     logs: Option<Arc<logs::LogBuffer>>,
+    a2a: Option<Arc<routes::a2a::A2aWebState>>,
 ) -> Result<(SocketAddr, ())> {
     config.enabled = true;
-    let state = build_state(config, home, agent, supervisor, logs)?;
+    let state = build_state(config, home, agent, supervisor, logs, a2a)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {

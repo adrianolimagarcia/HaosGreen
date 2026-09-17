@@ -56,12 +56,30 @@ pub struct WebState {
     /// writes to: a buffer of the dashboard's own would be permanently empty,
     /// which is exactly the kind of failure that looks like "no logs yet".
     pub logs: Option<Arc<LogBuffer>>,
+    /// The A2A surface (Phase 5): the inbound peers as configured, the live
+    /// outbound peers, and what `main.rs` observed about the listener.
+    ///
+    /// The outbound peers are held behind the **same** shared handle
+    /// `main.rs` gives `call_a2a_agent`, so `PUT /api/a2a/outbound` reaches the
+    /// running agent as well as `config.toml`. It is a handle and not a copy
+    /// for exactly that reason.
+    ///
+    /// `None` when the dashboard was started without A2A wiring. It carries
+    /// tokens — they are what the fingerprints are derived from — so it is
+    /// never serialized; the route module builds its responses from structs
+    /// that have no field able to hold one.
+    pub a2a: Option<Arc<super::routes::a2a::A2aWebState>>,
 }
 
 /// Number of tracing events retained for the dashboard log view.
 ///
-/// Bounded so the dashboard can never be the cause of unbounded memory growth
-/// (design spec §5.3).
+/// **This is not a bound in bytes, and on its own it never was.** An entry count
+/// bounds how many entries are retained, not how much memory they occupy: 2000
+/// entries of an arbitrary message size is an arbitrary amount of memory. The
+/// bytes are bounded by [`crate::web::logs::MAX_MESSAGE_BYTES`] (applied at
+/// capture) and by [`crate::web::logs::DEFAULT_MAX_BYTES`] (the ring's byte
+/// budget, evicted oldest-first), which together cap the ring at
+/// `min(capacity × per-entry size, max_bytes)` — 4 MiB at this capacity.
 pub const LOG_BUFFER_CAPACITY: usize = 2000;
 
 impl WebState {
@@ -101,6 +119,20 @@ impl WebState {
             "the dashboard was started without a log buffer",
         ))
     }
+
+    /// The A2A state, or a 503 body explaining why it is missing.
+    ///
+    /// Same contract again: a dashboard wired without A2A must say so rather
+    /// than report an empty peer list, which would be indistinguishable from a
+    /// configuration with no peers.
+    pub fn a2a_or_unavailable(
+        &self,
+    ) -> Result<Arc<super::routes::a2a::A2aWebState>, (axum::http::StatusCode, &'static str)> {
+        self.a2a.clone().ok_or((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "the dashboard was started without A2A wiring",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +160,7 @@ mod tests {
             credentials_path: PathBuf::from("/nonexistent/web-auth.toml"),
             chat: Arc::new(ChatSessionStore::new()),
             logs: Some(Arc::new(LogBuffer::new(16))),
+            a2a: None,
         }
     }
 
@@ -148,5 +181,11 @@ mod tests {
         };
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(message.contains("supervisor"));
+
+        let Err((status, message)) = state.a2a_or_unavailable() else {
+            panic!("a state with no A2A wiring must not hand one out");
+        };
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.contains("A2A"));
     }
 }

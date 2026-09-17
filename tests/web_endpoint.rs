@@ -218,7 +218,7 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
     // header is sent on all of them so the request reaches the authentication
     // check rather than being stopped by the CSRF gate first: this test is
     // about authentication.
-    let cases: [(&str, &str, Option<serde_json::Value>); 19] = [
+    let cases: [(&str, &str, Option<serde_json::Value>); 24] = [
         ("GET", "/api/settings", None),
         (
             "POST",
@@ -267,6 +267,24 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
         // guard here would leak more than any other route.
         ("GET", "/api/logs", None),
         ("GET", "/api/logs/stream", None),
+        // The A2A surface (Phase 5). The listings name every peer and its
+        // allowed addresses, the `PUT` rewrites outbound configuration, and
+        // the test route makes the server issue an outbound request carrying a
+        // configured peer token — the fourth route where a missing guard would
+        // be a real hole rather than an information leak.
+        ("GET", "/api/a2a/status", None),
+        ("GET", "/api/a2a/peers", None),
+        ("GET", "/api/a2a/outbound", None),
+        (
+            "PUT",
+            "/api/a2a/outbound",
+            Some(serde_json::json!({"peers": {}})),
+        ),
+        (
+            "POST",
+            "/api/a2a/test",
+            Some(serde_json::json!({"peer": "beta"})),
+        ),
     ];
 
     for (method, path, body) in cases {
@@ -2717,6 +2735,350 @@ async fn the_log_stream_task_stops_when_the_client_disconnects() {
     assert_eq!(response.status(), 200);
 }
 
+// ── What the log view must never serve ──────────────────────────────────────
+
+/// A configured secret that reaches the ring must not reach the browser, on
+/// either the history route or the live stream.
+///
+/// The shape rules alone cannot catch this one. A `reqwest` transport error
+/// renders the request URL, and a Telegram bot token lives in that URL's *path*
+/// — `https://api.telegram.org/bot<token>/sendMessage` has no key, no separator
+/// and no `sk-` prefix, so nothing about it looks like a credential. It is
+/// caught because `main.rs` registers every configured secret by value at
+/// startup, and this test performs that same registration.
+#[tokio::test]
+async fn a_configured_secret_in_a_logged_url_never_reaches_the_dashboard() {
+    let (base, _dir, buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    // Built at runtime so this file never carries a credential-shaped literal,
+    // and unique to this test: the registry is process-global.
+    let token = format!("{}{}", "8123456789:AAH", "zz_capture_probe_1f4c9d");
+    assert!(
+        haos_green::supervisor::redact::register_secret(&token),
+        "the startup registration must accept a configured token"
+    );
+
+    // Open the live stream first: the entry is pushed once the response head is
+    // in, so the tail is guaranteed to deliver it.
+    let response = client
+        .get(format!("{base}/api/logs/stream"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "ERROR",
+        "haos_green::platform::telegram",
+        &format!("error sending request for url (https://api.telegram.org/bot{token}/sendMessage)"),
+    ));
+    // The same value in a message with no shape a rule can recognise: no key, no
+    // separator, no `bot` prefix, no `sk-`. Only the by-value registration can
+    // catch this one, which is what makes this test a test of the registration
+    // rather than of the shape rules.
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "WARN",
+        "haos_green::a2a::client",
+        &format!("the peer rejected the credential {token}"),
+    ));
+
+    let events = read_sse_frames(response, 2, std::time::Duration::from_secs(5)).await;
+    let payloads: Vec<String> = events
+        .iter()
+        .filter(|(kind, _)| kind == "log")
+        .map(|(_, data)| data.clone())
+        .collect();
+    assert_eq!(
+        payloads.len(),
+        2,
+        "the stream must deliver both entries: {events:?}"
+    );
+    for data in &payloads {
+        assert!(
+            !data.contains(&token),
+            "the live stream served the token: {data}"
+        );
+    }
+    assert!(
+        payloads[0].contains("api.telegram.org"),
+        "the diagnostic value of the message must survive: {}",
+        payloads[0]
+    );
+    assert!(
+        payloads[1].contains("the peer rejected the credential"),
+        "the message must survive with only the credential masked: {}",
+        payloads[1]
+    );
+
+    let body = get_logs(&base, &cookie, "").await.text().await.unwrap();
+    assert!(
+        !body.contains(&token),
+        "the history route served the token: {body}"
+    );
+    assert!(body.contains("api.telegram.org"), "{body}");
+}
+
+/// A ring that has stopped recording must say so, on both routes.
+///
+/// `push` and the readers all treat a poisoned lock as "do nothing", which on
+/// its own is indistinguishable from a quiet process: the routes would answer
+/// 200 with the entries from before the poison and an operator would see a log
+/// that simply stopped.
+#[tokio::test]
+async fn a_poisoned_log_buffer_is_a_503_and_not_an_empty_log() {
+    let (base, _dir, buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "INFO",
+        "haos_green::test",
+        "recorded before the poison",
+    ));
+
+    // The ring works, so a 503 after the poison cannot be a route that was
+    // broken all along.
+    let response = get_logs(&base, &cookie, "").await;
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("recorded before the poison"), "{body}");
+
+    buffer.poison_for_test();
+
+    let response = get_logs(&base, &cookie, "").await;
+    assert_eq!(
+        response.status(),
+        503,
+        "a ring that stopped recording must not answer 200 with a stale list"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("poisoned"),
+        "the refusal must say why: {body}"
+    );
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/logs/stream"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        503,
+        "the stream must refuse a ring that is not recording either"
+    );
+}
+
+/// A client cannot open an unbounded number of live tails.
+///
+/// Each stream is a task plus a 128-slot channel of serialized entries, and the
+/// route is behind nothing but a session: without a cap, one authenticated
+/// client decides how much memory the dashboard's tail costs.
+///
+/// The refusal is **429**, not 503: the log view treats 503 as terminal, so a
+/// transient limit answered that way would disable the view in that tab
+/// permanently.
+#[tokio::test]
+async fn the_number_of_live_log_streams_is_capped() {
+    let (base, _dir, _buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    let stream = |client: &reqwest::Client, cookie: &str| {
+        client
+            .get(format!("{base}/api/logs/stream"))
+            .header(reqwest::header::COOKIE, cookie)
+            .send()
+    };
+
+    let mut open = Vec::new();
+    for index in 0..haos_green::web::logs::MAX_LOG_STREAMS {
+        let response = stream(&client, &cookie).await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "stream {index} is inside the cap and must open"
+        );
+        open.push(response);
+    }
+
+    let refused = stream(&client, &cookie).await.unwrap();
+    assert_eq!(
+        refused.status(),
+        429,
+        "the stream past the cap must be refused as a transient condition, \
+         not as an unavailable feature"
+    );
+    assert_eq!(
+        refused
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("5"),
+        "a 429 must tell the client when to come back"
+    );
+
+    // Dropping a stream closes its connection, which drops the response body,
+    // which returns the permit. Nothing else in this test owns a stream.
+    drop(open.pop());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let response = stream(&client, &cookie).await.unwrap();
+        if response.status() == 200 {
+            break;
+        }
+        assert_eq!(response.status(), 429);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a closed stream never returned its permit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Logging out ends a stream that is already open.
+///
+/// The guard authorises a stream once, at connect. Without a re-check, a
+/// destroyed session would keep receiving the process's log — targets, paths,
+/// task ids, error text — for as long as the tab stayed open.
+#[tokio::test]
+async fn an_open_log_stream_ends_when_its_session_is_destroyed() {
+    let (base, _dir, buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    let streaming = client
+        .get(format!("{base}/api/logs/stream"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), 200);
+
+    let logout = client
+        .post(format!("{base}/api/auth/logout"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .header("x-haos-green-csrf", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "the logout must succeed");
+
+    // The stream must end on its own. Reading the body to EOF is the
+    // observation: a stream that is still live never reaches EOF, and this
+    // fails on the timeout instead of hanging the suite.
+    let tail = tokio::time::timeout(std::time::Duration::from_secs(15), streaming.text()).await;
+    assert!(
+        tail.is_ok(),
+        "the stream outlived the session that authorised it"
+    );
+
+    // And a fresh request with the dead cookie is refused, so the stream really
+    // did end because the session is gone.
+    assert_eq!(get_logs(&base, &cookie, "").await.status(), 401);
+
+    // The buffer is untouched by any of this.
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "INFO",
+        "haos_green::test",
+        "still recording",
+    ));
+    assert!(!buffer.is_empty());
+}
+
+/// Nothing the dashboard sends may be cached.
+///
+/// The log routes are the clearest case: a cached copy of the process's log
+/// outlives the session that authorised it, and a shared proxy or a browser's
+/// restored history is enough to serve it to someone else.
+#[tokio::test]
+async fn the_log_routes_are_never_cached() {
+    let (base, _dir, _buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    let history = get_logs(&base, &cookie, "").await;
+    assert_eq!(history.status(), 200);
+    assert_eq!(
+        history
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "the log history must not be storable"
+    );
+    assert_eq!(
+        history
+            .headers()
+            .get(reqwest::header::VARY)
+            .and_then(|value| value.to_str().ok()),
+        Some("Cookie"),
+        "the body depends on the session cookie"
+    );
+
+    let streaming = client
+        .get(format!("{base}/api/logs/stream"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), 200);
+    assert_eq!(
+        streaming
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "the live stream must not be storable"
+    );
+
+    // The refusal path carries them too: a cache stores a 401 as happily as a
+    // 200.
+    let anonymous = get_logs(&base, "", "").await;
+    assert_eq!(anonymous.status(), 401);
+    assert_eq!(
+        anonymous
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+}
+
+/// One enormous log line cannot be served whole.
+///
+/// The ring bounds entries by count *and* by bytes, and the per-message cap is
+/// applied at capture with an explicit marker — a log view that silently
+/// returned a prefix would be worse than one that says how much it dropped.
+#[tokio::test]
+async fn an_enormous_log_message_is_served_truncated_and_says_so() {
+    let (base, _dir, buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let huge = "L".repeat(haos_green::web::logs::MAX_MESSAGE_BYTES * 4);
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "INFO",
+        "haos_green::test",
+        &huge,
+    ));
+
+    let body = get_logs(&base, &cookie, "").await.text().await.unwrap();
+    assert!(
+        body.len() < huge.len(),
+        "the served message must be capped: {} bytes for a {} byte message",
+        body.len(),
+        huge.len()
+    );
+    assert!(
+        body.contains("more characters]"),
+        "the truncation must be explicit"
+    );
+}
+
 // ── Live chat streaming (opt-in) ────────────────────────────────────────────
 //
 // Nothing on the agent path is stubbed here. The test builds a real
@@ -3175,4 +3537,1410 @@ async fn a_live_chat_message_streams_tokens_and_exactly_one_done_event() {
     assert_eq!(cancel.status(), 200);
     let cancel: serde_json::Value = cancel.json().await.unwrap();
     assert_eq!(cancel["cancelled"], serde_json::json!(false));
+}
+
+// ── A2A (Phase 5) ───────────────────────────────────────────────────────────
+//
+// The A2A surface is the only one that makes the server issue an outbound
+// request on the caller's behalf, so these tests are as much about what does
+// *not* happen as about the JSON shapes. The two properties that matter most:
+//
+// * a response body never contains a configured token, in either direction, and
+// * `POST /api/a2a/test` cannot be aimed at a host the operator did not
+//   configure — the route takes a peer *name*, and a name that does not exist
+//   is a 404 with no request leaving the process.
+
+/// The inbound peer's token. Recognisable so a leak is unmistakable.
+const A2A_INBOUND_TOKEN: &str = "inbound-peer-token-1f4c9a";
+/// The outbound peer's token.
+const A2A_OUTBOUND_TOKEN: &str = "outbound-peer-token-7b2e30";
+
+/// A configuration with two inbound peers and one outbound peer, all carrying
+/// recognisable tokens.
+///
+/// Every peer is one `A2aConfig::validate` accepts, so this configuration can
+/// be handed to the real `start_listener` — the status tests need a
+/// configuration whose *only* problem is the bind.
+///
+/// `enabled` is left off: the listener outcome is supplied separately by each
+/// test, which is the point of the status route.
+fn a2a_config() -> haos_green::config::A2aConfig {
+    use haos_green::config::{A2aOutboundPeerConfig, A2aPeerConfig};
+    use std::collections::HashMap;
+
+    let mut peers = HashMap::new();
+    peers.insert(
+        "laptop".to_string(),
+        A2aPeerConfig {
+            token: A2A_INBOUND_TOKEN.to_string(),
+            ip: vec!["10.0.0.5".to_string(), "192.168.1.0/24".to_string()],
+            tools: None,
+        },
+    );
+    peers.insert(
+        "server".to_string(),
+        A2aPeerConfig {
+            token: "second-inbound-peer-token".to_string(),
+            ip: vec!["10.0.0.6".to_string()],
+            tools: Some(vec!["read_file".to_string()]),
+        },
+    );
+
+    let mut outbound = HashMap::new();
+    outbound.insert(
+        "beta".to_string(),
+        A2aOutboundPeerConfig {
+            url: "http://127.0.0.1:9".to_string(),
+            token: A2A_OUTBOUND_TOKEN.to_string(),
+            timeout_secs: 2,
+            ..A2aOutboundPeerConfig::default()
+        },
+    );
+
+    haos_green::config::A2aConfig {
+        peers,
+        outbound: haos_green::config::A2aOutboundConfig { peers: outbound },
+        ..haos_green::config::A2aConfig::default()
+    }
+}
+
+/// The outcome of a listener that bound successfully.
+fn a2a_started() -> haos_green::web::routes::a2a::A2aListenerOutcome {
+    haos_green::web::routes::a2a::A2aListenerOutcome::Started {
+        bound: "127.0.0.1:8443".parse().unwrap(),
+        advertised_url: "https://haos.example.com:8443".to_string(),
+    }
+}
+
+/// A `config.toml` with the properties the surgical-edit test needs: comments of
+/// every kind (whole-line, inline, a box-drawing separator), unrelated sections
+/// both before and after the outbound peers, and the outbound peer the dashboard
+/// is configured with.
+///
+/// The token matches [`A2A_OUTBOUND_TOKEN`], so the file and the in-memory
+/// configuration agree the way a real startup would leave them.
+fn a2a_config_toml() -> String {
+    format!(
+        r#"# HaosGreen configuration.
+# The comments in this file belong to the operator; the dashboard must not eat them.
+[telegram]
+bot_token = "telegram-secret-token"   # inline comment, kept
+allowed_user_ids = [1]
+
+# ── A2A ──────────────────────────────────────────────────────────────
+[a2a]
+enabled = false
+
+[a2a.card]
+name = "HaosGreen"
+
+[a2a.outbound.peers.beta]
+url = "http://127.0.0.1:9"    # the old url
+token = "{A2A_OUTBOUND_TOKEN}"
+timeout_secs = 2
+
+# The web dashboard.
+[web]
+enabled = true
+bind = "127.0.0.1:8787"
+"#
+    )
+}
+
+/// Write the fixture into `dir` and return its path.
+///
+/// **Every test's configuration file lives inside a `tempfile::TempDir`.** The
+/// route now writes to whatever path it was handed, and pointing it at a real
+/// `config.toml` would destroy the operator's credentials.
+fn write_config_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    std::fs::write(&path, a2a_config_toml()).expect("the fixture should be writable");
+    path
+}
+
+/// The shared outbound handle `main.rs` would create for `config`.
+fn shared_outbound(
+    config: &haos_green::config::A2aConfig,
+) -> haos_green::a2a::SharedOutboundConfig {
+    std::sync::Arc::new(tokio::sync::RwLock::new(config.outbound.clone()))
+}
+
+/// An `A2aWebState` whose configuration file is `<dir>/config.toml`.
+fn a2a_state_in(
+    dir: &std::path::Path,
+    config: haos_green::config::A2aConfig,
+    outcome: haos_green::web::routes::a2a::A2aListenerOutcome,
+) -> haos_green::web::routes::a2a::A2aWebState {
+    let outbound = shared_outbound(&config);
+    a2a_state_with_handle(dir, config, outcome, outbound)
+}
+
+/// The same, around a handle the caller keeps so it can observe what the route
+/// wrote into it.
+fn a2a_state_with_handle(
+    dir: &std::path::Path,
+    config: haos_green::config::A2aConfig,
+    outcome: haos_green::web::routes::a2a::A2aListenerOutcome,
+    outbound: haos_green::a2a::SharedOutboundConfig,
+) -> haos_green::web::routes::a2a::A2aWebState {
+    haos_green::web::routes::a2a::A2aWebState::new(
+        config,
+        outcome,
+        outbound,
+        dir.join("config.toml"),
+    )
+}
+
+/// Start a dashboard with the A2A surface wired, a real `config.toml` fixture in
+/// a temp directory, and a listener that bound successfully.
+async fn spawn_test_server_with_a2a(
+    config: haos_green::config::A2aConfig,
+) -> (String, tempfile::TempDir) {
+    spawn_test_server_with_a2a_and_outcome(config, a2a_started()).await
+}
+
+/// The same, with a listener outcome the caller chooses.
+async fn spawn_test_server_with_a2a_and_outcome(
+    config: haos_green::config::A2aConfig,
+    outcome: haos_green::web::routes::a2a::A2aListenerOutcome,
+) -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    write_config_fixture(dir.path());
+    let state = a2a_state_in(dir.path(), config, outcome);
+    spawn_test_server_with_a2a_state(state, dir).await
+}
+
+/// Start a dashboard with an A2A state the caller built.
+///
+/// The directory is passed in rather than created here because the state has to
+/// be pointed at the fixture inside it before the server starts.
+async fn spawn_test_server_with_a2a_state(
+    state: haos_green::web::routes::a2a::A2aWebState,
+    dir: tempfile::TempDir,
+) -> (String, tempfile::TempDir) {
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_a2a(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        std::sync::Arc::new(state),
+    )
+    .await
+    .expect("the dashboard should start with A2A wiring");
+    (format!("http://{addr}"), dir)
+}
+
+/// Every A2A route, as `(method, path, body)`.
+///
+/// One list, used by both the 503 and the CSRF sweeps, so a route added to the
+/// module and forgotten here is a route that is covered by neither.
+fn a2a_routes() -> Vec<(&'static str, &'static str, Option<serde_json::Value>)> {
+    vec![
+        ("GET", "/api/a2a/status", None),
+        ("GET", "/api/a2a/peers", None),
+        ("GET", "/api/a2a/outbound", None),
+        (
+            "PUT",
+            "/api/a2a/outbound",
+            Some(serde_json::json!({"peers": {}})),
+        ),
+        (
+            "POST",
+            "/api/a2a/test",
+            Some(serde_json::json!({"peer": "beta"})),
+        ),
+    ]
+}
+
+/// A TCP listener that counts every connection it accepts.
+///
+/// This is what gives the "no outbound request" assertions teeth: the count is
+/// only meaningful if the same harness is *observed* counting a request that
+/// really was made, which each test does by testing a configured peer last.
+///
+/// Each accepted connection is answered with a 404 so a real request finishes
+/// immediately instead of waiting for the peer's timeout.
+async fn spawn_connection_recorder() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the recorder");
+    let addr = listener.local_addr().expect("recorder address");
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&count);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            // The request is deliberately not parsed: the test only cares that
+            // it arrived.
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    (format!("http://{addr}"), count)
+}
+
+/// A TCP listener that accepts connections and never answers them.
+///
+/// The accepted streams are held open for the life of the task: dropping one
+/// would turn "the peer is black-holed" into "the peer closed the connection",
+/// which is a different failure and would not exercise the timeout.
+async fn spawn_black_hole() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the black hole");
+    let addr = listener.local_addr().expect("black-hole address");
+
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            held.push(stream);
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// `PUT` the given peer map and return the response.
+async fn put_outbound(base: &str, cookie: &str, peers: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .put(format!("{base}/api/a2a/outbound"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, cookie)
+        .json(&serde_json::json!({ "peers": peers }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `GET` a route and return `(status, body)`.
+async fn get_body(base: &str, cookie: &str, path: &str) -> (u16, String) {
+    let response = reqwest::Client::new()
+        .get(format!("{base}{path}"))
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn every_a2a_route_returns_503_without_a2a_wiring() {
+    // The default harness wires no A2A state, which is the contract every
+    // optional handle in `WebState` follows: a named 503, never an empty peer
+    // list that looks like a configuration with no peers.
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    for (method, path, body) in a2a_routes() {
+        let mut request = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{base}{path}"),
+            )
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::COOKIE, &cookie);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "{method} {path} without A2A wiring must be 503, got {}",
+            response.status()
+        );
+        let message = response.text().await.unwrap();
+        assert!(
+            message.contains("A2A"),
+            "{method} {path} must name the missing wiring, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_mutating_a2a_routes_require_the_csrf_header() {
+    let (base, _dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    for (method, path, body) in a2a_routes() {
+        if method == "GET" {
+            continue;
+        }
+        let mut request = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{base}{path}"),
+            )
+            .header(reqwest::header::COOKIE, &cookie);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "{method} {path} without the CSRF header must be 403, got {}",
+            response.status()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_status_route_reports_the_address_that_was_bound_and_the_url_advertised() {
+    // The two are reported separately on purpose: the advertised URL is what
+    // the Agent Card tells peers to use, and it is `[a2a].public_url` when set,
+    // which need not be the bound address at all.
+    let (base, _dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let (status, body) = get_body(&base, &cookie, "/api/a2a/status").await;
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+
+    assert_eq!(body["state"], serde_json::json!("started"));
+    assert_eq!(
+        body["enabled"],
+        serde_json::json!(true),
+        "a listener that started was necessarily enabled"
+    );
+    assert_eq!(body["bound"], serde_json::json!("127.0.0.1:8443"));
+    assert_eq!(
+        body["advertised_url"],
+        serde_json::json!("https://haos.example.com:8443")
+    );
+    assert_eq!(body["inbound_peers"], serde_json::json!(2));
+    assert_eq!(body["outbound_peers"], serde_json::json!(1));
+    assert!(
+        body.get("failure").is_none(),
+        "a started listener has no failure to report: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_status_route_reports_a_disabled_listener_without_erroring() {
+    let config = a2a_config();
+    let (base, _dir) = spawn_test_server_with_a2a_and_outcome(
+        config,
+        haos_green::web::routes::a2a::A2aListenerOutcome::Disabled,
+    )
+    .await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let (status, body) = get_body(&base, &cookie, "/api/a2a/status").await;
+    assert_eq!(status, 200, "disabled is an answer, not an error");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    assert_eq!(body["state"], serde_json::json!("disabled"));
+    assert_eq!(body["enabled"], serde_json::json!(false));
+    assert!(body.get("bound").is_none());
+    assert!(body.get("advertised_url").is_none());
+    assert!(body.get("failure").is_none());
+}
+
+#[tokio::test]
+async fn the_status_route_reports_a_listener_that_could_not_bind() {
+    // The failure path, exercised through the real wiring: `start_listener`
+    // binds a port that is already taken, so the outcome it returns is an
+    // observation of a genuine bind failure rather than a hand-made value.
+    // A status route that always said "started" would fail here.
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("occupy a port");
+    let taken = occupied.local_addr().expect("the occupied address");
+
+    let memory = haos_green::memory::MemoryStore::open_in_memory().expect("open a memory store");
+    let store = haos_green::a2a::SqliteTaskStore::new(memory.connection());
+
+    let config = haos_green::config::A2aConfig {
+        enabled: true,
+        bind: taken.to_string(),
+        ..a2a_config()
+    };
+
+    let outcome = haos_green::web::routes::a2a::start_listener(
+        &config,
+        haos_green::skills::SkillRegistry::new(),
+        haos_green::a2a::NoopExecutor,
+        store,
+    )
+    .await;
+
+    let reason = match &outcome {
+        haos_green::web::routes::a2a::A2aListenerOutcome::Failed { reason } => reason.clone(),
+        other => panic!("binding an occupied port must be reported as a failure, got {other:?}"),
+    };
+    assert!(
+        reason.contains("bind"),
+        "the reason must name the failed bind, got {reason:?}"
+    );
+
+    let (base, _dir) = spawn_test_server_with_a2a_and_outcome(config, outcome).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let (status, body) = get_body(&base, &cookie, "/api/a2a/status").await;
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    assert_eq!(
+        body["state"],
+        serde_json::json!("failed"),
+        "a listener that never started must not be reported as running: {body}"
+    );
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    assert!(
+        body.get("bound").is_none(),
+        "a listener that never bound has no address to report: {body}"
+    );
+    assert!(
+        body["failure"]
+            .as_str()
+            .is_some_and(|failure| failure.contains("bind")),
+        "the failure must be reported, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_status_route_reports_an_invalid_configuration_as_a_failure() {
+    // The other way a listener never starts: `A2aConfig::validate` refuses the
+    // configuration before the bind. The dashboard must say so rather than
+    // reporting "disabled" (which would suggest the operator turned it off) or
+    // "started" (which would be a lie).
+    let mut peers = std::collections::HashMap::new();
+    peers.insert(
+        "broken".to_string(),
+        haos_green::config::A2aPeerConfig {
+            token: String::new(),
+            ip: vec!["10.0.0.5".to_string()],
+            tools: None,
+        },
+    );
+    let config = haos_green::config::A2aConfig {
+        enabled: true,
+        peers,
+        ..haos_green::config::A2aConfig::default()
+    };
+
+    let memory = haos_green::memory::MemoryStore::open_in_memory().expect("open a memory store");
+    let store = haos_green::a2a::SqliteTaskStore::new(memory.connection());
+    let outcome = haos_green::web::routes::a2a::start_listener(
+        &config,
+        haos_green::skills::SkillRegistry::new(),
+        haos_green::a2a::NoopExecutor,
+        store,
+    )
+    .await;
+
+    match &outcome {
+        haos_green::web::routes::a2a::A2aListenerOutcome::Failed { reason } => assert!(
+            reason.contains("empty token"),
+            "the reason must explain the refusal, got {reason:?}"
+        ),
+        other => panic!("an invalid configuration must be a failure, got {other:?}"),
+    }
+
+    let (base, _dir) = spawn_test_server_with_a2a_and_outcome(config, outcome).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let (_, body) = get_body(&base, &cookie, "/api/a2a/status").await;
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    assert_eq!(body["state"], serde_json::json!("failed"));
+    assert!(
+        body["failure"]
+            .as_str()
+            .is_some_and(|failure| failure.contains("empty token")),
+        "the refusal must reach the dashboard, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn no_a2a_response_body_contains_a_configured_token() {
+    // The token is the one secret this surface handles, and it must not appear
+    // in *any* response — not in a listing, not in a status, not in the body of
+    // the call that accepts a new one, and not in a failed connection test.
+    let (recorder, _connections) = spawn_connection_recorder().await;
+    let mut config = a2a_config();
+    config
+        .outbound
+        .peers
+        .get_mut("beta")
+        .expect("the beta peer")
+        .url = recorder.clone();
+
+    let (base, _dir) = spawn_test_server_with_a2a(config.clone()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    let mut bodies: Vec<(String, String)> = Vec::new();
+    for path in ["/api/a2a/status", "/api/a2a/peers", "/api/a2a/outbound"] {
+        let (status, body) = get_body(&base, &cookie, path).await;
+        assert_eq!(status, 200, "{path} should answer");
+        bodies.push((path.to_string(), body));
+    }
+
+    // The `PUT` that *accepts* tokens must not return them either.
+    let replaced = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({
+            "beta": { "url": recorder, "token": A2A_OUTBOUND_TOKEN },
+            "gamma": { "url": "http://127.0.0.1:9", "token": "gamma-secret-token" },
+        }),
+    )
+    .await;
+    assert_eq!(replaced.status(), 200, "the update should be accepted");
+    bodies.push((
+        "PUT /api/a2a/outbound".to_string(),
+        replaced.text().await.unwrap(),
+    ));
+
+    // A connection test against a peer that answers 404: a failing test is
+    // exactly where an error chain would carry a header value.
+    let tested = client
+        .post(format!("{base}/api/a2a/test"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "peer": "beta" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tested.status(), 200);
+    let tested_body = tested.text().await.unwrap();
+    assert!(
+        tested_body.contains("\"ok\":false"),
+        "the recorder answers 404, so the test must report a failure: {tested_body}"
+    );
+    bodies.push(("POST /api/a2a/test".to_string(), tested_body));
+
+    for (where_, body) in &bodies {
+        for token in [
+            A2A_INBOUND_TOKEN,
+            A2A_OUTBOUND_TOKEN,
+            "second-inbound-peer-token",
+            "gamma-secret-token",
+        ] {
+            assert!(
+                !body.contains(token),
+                "{where_} returned a configured token: {body}"
+            );
+        }
+    }
+
+    // …and the fingerprints are there, so "no token" is not being achieved by
+    // returning nothing at all.
+    let peers = &bodies[1].1;
+    let peers: serde_json::Value = serde_json::from_str(peers).expect("a JSON body");
+    let laptop = peers["peers"]
+        .as_array()
+        .expect("a peers array")
+        .iter()
+        .find(|peer| peer["name"] == serde_json::json!("laptop"))
+        .expect("the laptop peer");
+    assert!(
+        laptop["token_fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.len() == 6),
+        "every peer must carry a short fingerprint: {laptop}"
+    );
+    let outbound = &bodies[2].1;
+    let outbound: serde_json::Value = serde_json::from_str(outbound).expect("a JSON body");
+    assert!(
+        outbound["peers"][0]["token_fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.len() == 6),
+        "an outbound peer must carry a short fingerprint: {outbound}"
+    );
+}
+
+#[tokio::test]
+async fn the_peers_route_reports_the_policies_that_actually_apply() {
+    let mut config = a2a_config();
+    // Empty `ip` means *no address at all* here, the opposite of
+    // `[web].allow_ips`. `A2aConfig::validate` refuses such a peer at startup,
+    // so it only exists in a state a test built by hand — and the route must
+    // still report it truthfully rather than invent an allowlist or drop it.
+    config.peers.insert(
+        "nowhere".to_string(),
+        haos_green::config::A2aPeerConfig {
+            token: "third-inbound-peer-token".to_string(),
+            ip: Vec::new(),
+            tools: Some(vec![]),
+        },
+    );
+
+    let (base, _dir) = spawn_test_server_with_a2a(config).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let (status, body) = get_body(&base, &cookie, "/api/a2a/peers").await;
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+    let peers = body["peers"].as_array().expect("a peers array");
+    assert_eq!(peers.len(), 3, "every configured peer must be listed");
+    // Sorted, so the response is stable across runs.
+    let names: Vec<&str> = peers.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert_eq!(names, vec!["laptop", "nowhere", "server"]);
+
+    let laptop = &peers[0];
+    assert_eq!(
+        laptop["allowed_ips"],
+        serde_json::json!(["10.0.0.5", "192.168.1.0/24"])
+    );
+    assert_eq!(
+        laptop["allows_no_address"],
+        serde_json::json!(false),
+        "a peer with addresses does not deny everything"
+    );
+    assert_eq!(laptop["tools"]["configured"], serde_json::Value::Null);
+    assert_eq!(laptop["tools"]["source"], serde_json::json!("default"));
+
+    // The fail-closed case: an empty A2A allowlist denies every address, the
+    // opposite of an empty `[web].allow_ips`.
+    let nowhere = &peers[1];
+    assert_eq!(nowhere["allowed_ips"], serde_json::json!([]));
+    assert_eq!(
+        nowhere["allows_no_address"],
+        serde_json::json!(true),
+        "an empty A2A ip list must be reported as denying every address"
+    );
+    assert_eq!(
+        nowhere["tools"]["effective"],
+        serde_json::json!([]),
+        "an explicit empty tool list grants nothing"
+    );
+
+    let server = &peers[2];
+    assert_eq!(server["tools"]["source"], serde_json::json!("explicit"));
+    assert_eq!(
+        server["tools"]["effective"],
+        serde_json::json!(["read_file"])
+    );
+
+    // The asymmetry is stated in the body, so a reader cannot carry the web
+    // semantics over to A2A (or the other way round for the tool policies).
+    let ip_note = body["ip_allowlist_semantics"]
+        .as_str()
+        .expect("the ip semantics note");
+    assert!(ip_note.contains("empty list allows no address"));
+    assert!(ip_note.contains("[web].allow_ips"));
+    let tool_note = body["tool_policy_semantics"]
+        .as_str()
+        .expect("the tool policy note");
+    assert!(tool_note.contains("execute_command"));
+    assert!(tool_note.contains("allowed_tools"));
+}
+
+#[tokio::test]
+async fn a_rejected_outbound_update_leaves_the_previous_configuration_intact() {
+    let (base, _dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let (_, before) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+
+    // One bad peer and one perfectly good one: the good one must not be
+    // installed either. A partially applied update is the failure this guards,
+    // so the good peer is named "alpha" — it sorts *before* the bad one, which
+    // is the order a non-atomic implementation would apply them in.
+    let rejected = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({
+            "alpha": { "url": "http://127.0.0.1:9", "token": "alpha-token" },
+            "beta": { "url": "not-a-url", "token": "replacement-token" },
+        }),
+    )
+    .await;
+    assert_eq!(rejected.status(), 400, "a malformed url must be refused");
+
+    let (_, after) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+    let after_json: serde_json::Value = serde_json::from_str(&after).expect("a JSON body");
+    let names: Vec<&str> = after_json["peers"]
+        .as_array()
+        .expect("a peers array")
+        .iter()
+        .filter_map(|peer| peer["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["beta"],
+        "a rejected update must not add or remove peers: {after_json}"
+    );
+    assert_eq!(
+        after_json["peers"][0]["url"],
+        serde_json::json!("http://127.0.0.1:9"),
+        "the previous url must survive a rejected update"
+    );
+
+    // The fingerprint is the observable proxy for "the token did not change":
+    // it is derived from the token, so an unchanged fingerprint means the
+    // replacement token was not installed.
+    let before: serde_json::Value = serde_json::from_str(&before).expect("a JSON body");
+    assert_eq!(
+        before["peers"][0]["token_fingerprint"], after_json["peers"][0]["token_fingerprint"],
+        "the previous token must survive a rejected update"
+    );
+}
+
+/// `text` with its `[a2a.outbound.peers]` table removed.
+///
+/// `toml_edit` round-trips a document it has not changed byte-for-byte, so
+/// comparing the two strings of a before/after pair compares every *other* byte
+/// of the file — comments, blank lines and all.
+fn without_outbound_peers(text: &str) -> String {
+    let mut document: toml_edit::DocumentMut = text.parse().expect("valid TOML");
+    if let Some(table) = document
+        .get_mut("a2a")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|a2a| a2a.get_mut("outbound"))
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        table.remove("peers");
+    }
+    document.to_string()
+}
+
+/// The names of any temporary files left in `dir`.
+///
+/// The dashboard also writes `web-auth.toml` there, so this filters rather than
+/// counting: the property is "no leftover from the atomic write", not "the
+/// directory holds one file".
+fn temporary_files(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("the directory should be readable")
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".tmp"))
+        .collect()
+}
+
+/// The `[a2a]` section of a written `config.toml`, deserialized the way
+/// `Config::load` deserializes it.
+///
+/// This is what makes "persistent" a measurement rather than a claim: the file
+/// the route wrote has to load back into the same configuration type the process
+/// starts from.
+#[derive(serde::Deserialize)]
+struct ReloadedConfig {
+    a2a: haos_green::config::A2aConfig,
+}
+
+/// The peer names in a written `config.toml`, sorted.
+fn reloaded_peer_names(path: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).expect("the config file should be readable");
+    let reloaded: ReloadedConfig =
+        toml::from_str(&text).expect("the file the route wrote must still be loadable");
+    let mut names: Vec<String> = reloaded.a2a.outbound.peers.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// A `ToolContext` for driving the real `call_a2a_agent` handler.
+fn a2a_tool_context() -> haos_green::tool_registry::ToolContext {
+    haos_green::tool_registry::ToolContext {
+        sandbox_dir: std::path::PathBuf::from("/tmp"),
+        home_dir: None,
+        sender: std::sync::Arc::new(LiveNoopSender),
+        cancel_registry: std::sync::Arc::new(haos_green::cancel_registry::CancelRegistry::new()),
+        user_id: "operator".to_string(),
+        chat_id: "dashboard".to_string(),
+        tool_ui_mode: haos_green::tool_registry::ToolUiMode::Minimal,
+    }
+}
+
+#[tokio::test]
+async fn an_outbound_update_reports_that_it_is_saved_and_live() {
+    let (base, dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "gamma": { "url": "http://127.0.0.1:9", "token": "gamma-token" } }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("a JSON body");
+
+    assert_eq!(
+        body["persistent"],
+        serde_json::json!(true),
+        "the peers are in config.toml now, and the response has to say so: {body}"
+    );
+    assert_eq!(
+        body["restart_reverts"],
+        serde_json::json!(false),
+        "a restart reads the file this route wrote: {body}"
+    );
+    assert_eq!(
+        body["affects_running_agent"],
+        serde_json::json!(true),
+        "the running call_a2a_agent tool reads the handle this route wrote: {body}"
+    );
+
+    // The prose has to be true as well, not just the flags: a UI renders it.
+    let semantics = body["semantics"].as_str().expect("the semantics note");
+    assert!(semantics.contains("config.toml"), "{semantics}");
+    assert!(semantics.contains("atomic"), "{semantics}");
+    assert!(semantics.contains("call_a2a_agent"), "{semantics}");
+    assert!(
+        semantics.contains("permissions"),
+        "the note must mention that permissions are kept: {semantics}"
+    );
+    assert!(
+        !semantics.contains("non-goal") && !semantics.contains("in memory"),
+        "the old, now-false wording is still there: {semantics}"
+    );
+
+    let tokens = body["token_semantics"].as_str().expect("the token note");
+    assert!(
+        tokens.contains("omits"),
+        "an omitted token keeps the stored one, and the note must say so: {tokens}"
+    );
+    assert!(
+        tokens.contains("400"),
+        "an explicitly empty token is still refused, and the note must say so: {tokens}"
+    );
+
+    // The GET reports the same three flags, so the two halves of the route
+    // cannot disagree.
+    let (status, fetched) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+    assert_eq!(status, 200);
+    let fetched: serde_json::Value = serde_json::from_str(&fetched).expect("a JSON body");
+    for field in ["persistent", "restart_reverts", "affects_running_agent"] {
+        assert_eq!(
+            fetched[field], body[field],
+            "{field} differs between GET and PUT"
+        );
+    }
+
+    // No filesystem path is leaked into a response body. The semantics prose
+    // names the file, which is fine; the directory it lives in is not.
+    let body_text = body.to_string();
+    assert!(
+        !body_text.contains(&dir.path().display().to_string()),
+        "a response body must not carry the configuration directory: {body_text}"
+    );
+}
+
+#[tokio::test]
+async fn an_outbound_update_reaches_the_running_call_a2a_agent_tool() {
+    // The property the shared handle exists for, and it is observed through the
+    // *tool*, never through the dashboard's own copy: reading
+    // `/api/a2a/outbound` back would pass against the old, unshared code.
+    use haos_green::tool_registry::ToolHandler;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_config_fixture(dir.path());
+
+    // `main.rs` builds one handle and hands it to both the tool and the state.
+    let config = a2a_config();
+    let outbound = shared_outbound(&config);
+    let tool = haos_green::a2a::CallA2aAgent::new(std::sync::Arc::clone(&outbound));
+    let state = a2a_state_with_handle(
+        dir.path(),
+        config,
+        a2a_started(),
+        std::sync::Arc::clone(&outbound),
+    );
+    let (base, _dir) = spawn_test_server_with_a2a_state(state, dir).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let before = tool.define();
+    assert_eq!(before.len(), 1, "the tool is offered while a peer exists");
+    assert!(
+        before[0].function.description.contains("beta"),
+        "the tool starts with the configured peer: {}",
+        before[0].function.description
+    );
+    assert!(!before[0].function.description.contains("gamma"));
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "gamma": { "url": "http://127.0.0.1:9", "token": "gamma-token" } }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    // The tool, asked again, describes the peers the PUT installed.
+    let after = tool.define();
+    assert_eq!(after.len(), 1);
+    assert!(
+        after[0].function.description.contains("gamma"),
+        "the tool must see the peer the dashboard installed: {}",
+        after[0].function.description
+    );
+    assert!(
+        !after[0].function.description.contains("beta"),
+        "the tool must not still see the peer the PUT removed: {}",
+        after[0].function.description
+    );
+
+    // A real invocation resolves the peer through that same handle. Getting
+    // past the lookup and failing at the network is the proof the lookup
+    // succeeded: nothing is listening on 127.0.0.1:9.
+    let error = tool
+        .execute(
+            "call_a2a_agent",
+            serde_json::json!({ "peer": "gamma", "prompt": "ping" }),
+            a2a_tool_context(),
+        )
+        .await
+        .expect_err("the peer is unreachable, so the call must fail");
+    let message = format!("{error:#}");
+    assert!(
+        !message.contains("Unknown or unconfigured"),
+        "the installed peer must be found by the tool: {message}"
+    );
+
+    // And the peer the PUT removed is unknown to the tool as well.
+    let error = tool
+        .execute(
+            "call_a2a_agent",
+            serde_json::json!({ "peer": "beta", "prompt": "ping" }),
+            a2a_tool_context(),
+        )
+        .await
+        .expect_err("a removed peer must not be callable");
+    assert!(
+        format!("{error:#}").contains("Unknown or unconfigured outbound A2A peer 'beta'"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn an_outbound_update_rewrites_only_the_outbound_table_of_a_real_config_file() {
+    let (base, dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let config_path = dir.path().join("config.toml");
+    let before = std::fs::read_to_string(&config_path).expect("the fixture");
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({
+            "delta": {
+                "url": "http://127.0.0.1:9100",
+                "token": "delta-token",
+                "timeout_secs": 7,
+                "poll_interval_ms": 111,
+                "poll_timeout_secs": 222,
+            },
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    let after = std::fs::read_to_string(&config_path).expect("the rewritten file");
+    assert_ne!(before, after, "the file must have been rewritten");
+
+    // Everything outside `[a2a.outbound.peers]` is byte-identical. This is what
+    // "surgical" means, and it is why the edit does not go through serde.
+    assert_eq!(
+        without_outbound_peers(&before),
+        without_outbound_peers(&after),
+        "the edit changed something other than [a2a.outbound.peers]\n--- after ---\n{after}"
+    );
+
+    for comment in [
+        "# HaosGreen configuration.",
+        "# The comments in this file belong to the operator; the dashboard must not eat them.",
+        "# inline comment, kept",
+        "# ── A2A ──",
+        "# The web dashboard.",
+    ] {
+        assert!(
+            after.contains(comment),
+            "the comment {comment:?} was lost:\n{after}"
+        );
+    }
+
+    // The new peer is there with the values that were sent, and the peer the
+    // PUT did not mention is gone rather than merged.
+    assert!(after.contains("[a2a.outbound.peers.delta]"), "{after}");
+    assert!(after.contains("timeout_secs = 7"), "{after}");
+    assert!(after.contains("poll_interval_ms = 111"), "{after}");
+    assert!(after.contains("poll_timeout_secs = 222"), "{after}");
+    assert!(
+        !after.contains(A2A_OUTBOUND_TOKEN),
+        "the replaced peer's token must be gone from the file:\n{after}"
+    );
+
+    // And the file loads back into the same type the process starts from, so
+    // "persistent" is a measurement rather than a claim.
+    assert_eq!(reloaded_peer_names(&config_path), vec!["delta".to_string()]);
+
+    // The atomic write left nothing behind.
+    assert!(
+        temporary_files(dir.path()).is_empty(),
+        "a temporary file survived a successful write: {:?}",
+        temporary_files(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn a_failed_write_leaves_the_file_and_the_running_agent_unchanged() {
+    let (base, dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let config_path = dir.path().join("config.toml");
+
+    // A file the route cannot parse is a write that cannot happen. The route
+    // must not guess at it, must not partially apply it, and must not report
+    // success.
+    let unparseable = "# a config this route cannot understand\n[a2a\nenabled =\n";
+    std::fs::write(&config_path, unparseable).expect("write the fixture");
+    let before_bytes = std::fs::read(&config_path).expect("read the fixture");
+
+    let (_, live_before) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "gamma": { "url": "http://127.0.0.1:9", "token": "gamma-token" } }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        500,
+        "a write that did not happen must not be reported as saved"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        !body.contains(&dir.path().display().to_string()),
+        "the failure body must not carry a path: {body}"
+    );
+    assert!(
+        body.contains("nothing was changed"),
+        "the failure must say the configuration was left alone: {body}"
+    );
+
+    assert_eq!(
+        std::fs::read(&config_path).expect("read the fixture"),
+        before_bytes,
+        "a failed write must leave the file byte-identical"
+    );
+
+    let (_, live_after) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+    assert_eq!(
+        live_before, live_after,
+        "a failed write must leave the in-memory configuration unchanged too"
+    );
+
+    assert!(
+        temporary_files(dir.path()).is_empty(),
+        "a failed write must leave no temporary file: {:?}",
+        temporary_files(dir.path())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_outbound_update_keeps_the_configuration_files_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base, dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let config_path = dir.path().join("config.toml");
+
+    // `config.toml` holds the Telegram token, the OpenRouter key and every peer
+    // token, so an owner-only file is the normal case.
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod the fixture");
+    assert_eq!(
+        std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "the fixture must start owner-only for this test to mean anything"
+    );
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "gamma": { "url": "http://127.0.0.1:9", "token": "gamma-token" } }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    let mode = std::fs::metadata(&config_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the replacement must carry the original file's mode, got {mode:o}"
+    );
+}
+
+#[tokio::test]
+async fn two_concurrent_outbound_updates_produce_a_valid_file_and_a_matching_memory() {
+    let (base, dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let config_path = dir.path().join("config.toml");
+
+    // Both requests are in flight before either is awaited, twice, so the
+    // read-modify-write really does race.
+    for round in 0..2 {
+        let first = put_outbound(
+            &base,
+            &cookie,
+            serde_json::json!({ "alpha": { "url": "http://127.0.0.1:9", "token": "alpha-token" } }),
+        );
+        let second = put_outbound(
+            &base,
+            &cookie,
+            serde_json::json!({ "omega": { "url": "http://127.0.0.1:9", "token": "omega-token" } }),
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.status(), 200, "round {round}");
+        assert_eq!(second.status(), 200, "round {round}");
+
+        // The file is still valid TOML that loads back, and it holds exactly one
+        // of the two outcomes — never a mixture, never a truncation.
+        let names = reloaded_peer_names(&config_path);
+        assert!(
+            names == vec!["alpha".to_string()] || names == vec!["omega".to_string()],
+            "round {round}: the file must hold one of the two peer sets, got {names:?}"
+        );
+
+        // And the running configuration agrees with the file. This is the part
+        // the mutex is for: without it the last in-memory swap and the last
+        // rename can be different requests.
+        let (_, body) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+        let body: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let mut live: Vec<String> = body["peers"]
+            .as_array()
+            .expect("a peers array")
+            .iter()
+            .filter_map(|peer| peer["name"].as_str().map(str::to_string))
+            .collect();
+        live.sort();
+        assert_eq!(
+            live, names,
+            "round {round}: the running configuration and the file must agree"
+        );
+    }
+
+    assert!(
+        temporary_files(dir.path()).is_empty(),
+        "no temporary file may survive: {:?}",
+        temporary_files(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn an_outbound_update_keeps_a_token_that_was_not_supplied() {
+    let (base, _dir) = spawn_test_server_with_a2a(a2a_config()).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let (_, before) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+    let before: serde_json::Value = serde_json::from_str(&before).expect("a JSON body");
+    let fingerprint = before["peers"][0]["token_fingerprint"].clone();
+
+    let response = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "beta": { "url": "http://127.0.0.1:9000" } }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("a JSON body");
+
+    assert_eq!(
+        body["peers"][0]["url"],
+        serde_json::json!("http://127.0.0.1:9000")
+    );
+    assert_eq!(
+        body["peers"][0]["token_fingerprint"], fingerprint,
+        "an omitted token must keep the stored one rather than clearing it"
+    );
+
+    // An *explicitly* empty token is not "keep the existing one": it is an
+    // empty credential, and it must be refused rather than silently clearing a
+    // working one.
+    let emptied = put_outbound(
+        &base,
+        &cookie,
+        serde_json::json!({ "beta": { "url": "http://127.0.0.1:9000", "token": "" } }),
+    )
+    .await;
+    assert_eq!(emptied.status(), 400, "an empty token must be refused");
+
+    let (_, after) = get_body(&base, &cookie, "/api/a2a/outbound").await;
+    let after: serde_json::Value = serde_json::from_str(&after).expect("a JSON body");
+    assert_eq!(
+        after["peers"][0]["token_fingerprint"], fingerprint,
+        "a refused update must leave the stored token in place"
+    );
+}
+
+#[tokio::test]
+async fn the_test_route_refuses_an_unknown_peer_or_a_url_shaped_body() {
+    let (recorder, connections) = spawn_connection_recorder().await;
+    let mut config = a2a_config();
+    config
+        .outbound
+        .peers
+        .get_mut("beta")
+        .expect("the beta peer")
+        .url = recorder.clone();
+    config
+        .outbound
+        .peers
+        .get_mut("beta")
+        .expect("the beta peer")
+        .timeout_secs = 5;
+
+    let (base, _dir) = spawn_test_server_with_a2a(config).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    let post = |body: serde_json::Value| {
+        let request = client
+            .post(format!("{base}/api/a2a/test"))
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::COOKIE, &cookie)
+            .json(&body);
+        async move { request.send().await.unwrap() }
+    };
+
+    // 1. A URL in the `peer` field is a *name* that does not exist.
+    let url_shaped = post(serde_json::json!({ "peer": recorder.clone() })).await;
+    let url_shaped_status = url_shaped.status();
+    let url_shaped_body = url_shaped.text().await.unwrap();
+
+    // 2. A body that carries a `url` at all is rejected outright.
+    let with_url = post(serde_json::json!({ "peer": "beta", "url": recorder.clone() })).await;
+    let with_url_status = with_url.status();
+
+    // 3. A body with no peer at all.
+    let no_peer = post(serde_json::json!({ "url": recorder.clone() })).await;
+    let no_peer_status = no_peer.status();
+
+    // 4. An unknown name, plainly.
+    let unknown = post(serde_json::json!({ "peer": "gamma" })).await;
+    let unknown_status = unknown.status();
+
+    // The network assertion comes first on purpose: it is the property that
+    // matters, and a mutation that let the caller choose the URL would fail
+    // here rather than on an HTTP status assertion.
+    use std::sync::atomic::Ordering;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "no refused request may reach the network"
+    );
+
+    assert_eq!(
+        url_shaped_status, 404,
+        "a URL-shaped peer name must not be treated as an address"
+    );
+    assert!(
+        !url_shaped_body.contains("127.0.0.1"),
+        "the refusal must not reflect the caller's input: {url_shaped_body:?}"
+    );
+    assert!(
+        with_url_status.is_client_error(),
+        "a body carrying a url must be refused, got {with_url_status}"
+    );
+    assert!(
+        no_peer_status.is_client_error(),
+        "a body with no peer must be refused, got {no_peer_status}"
+    );
+    assert_eq!(unknown_status, 404);
+
+    // …and the recorder does count a real request, so the zero above is a
+    // measurement rather than a broken counter.
+    let real = post(serde_json::json!({ "peer": "beta" })).await;
+    assert_eq!(real.status(), 200);
+    let real: serde_json::Value = real.json().await.unwrap();
+    assert_eq!(
+        real["ok"],
+        serde_json::json!(false),
+        "the recorder answers 404, so discovery fails: {real}"
+    );
+    assert!(
+        real["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("404")),
+        "the failure must name the HTTP status: {real}"
+    );
+    assert!(
+        connections.load(Ordering::SeqCst) >= 1,
+        "the recorder must have observed the one request that was made"
+    );
+}
+
+#[tokio::test]
+async fn a_black_holed_peer_cannot_pin_the_connection_test() {
+    // The peer's own `timeout_secs` is operator-controlled and may be a day;
+    // the dashboard's cap is what bounds the request. The elapsed time is
+    // asserted, not just the message, because "timed out" could also be the
+    // peer's own timeout firing.
+    let black_hole = spawn_black_hole().await;
+    let mut config = a2a_config();
+    {
+        let peer = config
+            .outbound
+            .peers
+            .get_mut("beta")
+            .expect("the beta peer");
+        peer.url = black_hole;
+        peer.timeout_secs = 3600;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    write_config_fixture(dir.path());
+    let state = a2a_state_in(dir.path(), config, a2a_started())
+        .with_connection_test_timeout(std::time::Duration::from_secs(1));
+    let (base, _dir) = spawn_test_server_with_a2a_state(state, dir).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let started = std::time::Instant::now();
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/a2a/test"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "peer": "beta" }))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "a black-holed peer must be reported as a timeout: {body}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the test must be bounded by the dashboard's cap, not the peer's 3600s \
+         setting; it took {elapsed:?}"
+    );
 }

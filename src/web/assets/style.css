@@ -2180,6 +2180,293 @@ input:disabled {
   }
 }
 
+/* ── A2A connection manager ──────────────────────────────────────────────── */
+
+/*
+ * The A2A surface (design spec §5.4, plan Task 20).
+ *
+ * The rules below introduce no colour of their own: every value is a custom
+ * property from `:root`, no rule draws a border, and separation is shadow and
+ * space, as everywhere else in this file. Three of them carry meaning rather
+ * than decoration:
+ *
+ *  * `.a2a-caution` reuses the default-password banner's accent gradient —
+ *    attention without alarm — because the outbound editor is in memory only
+ *    and an operator who missed that would believe the running agent had been
+ *    reconfigured.
+ *  * `.a2a-peer-danger` tints a whole peer card, and `.a2a-danger` raises a
+ *    warning inside it, for a wildcard tool policy: the one setting on this
+ *    page that can hand a remote host shell execution. It is the only peer
+ *    surface that is tinted at all, so it cannot be mistaken for the others.
+ *  * `.a2a-semantics` is a sunken well for the API's own prose, which is quoted
+ *    verbatim rather than paraphrased into a wording of the client's own.
+ */
+
+.a2a-head-chip {
+  margin-left: auto;
+}
+
+.a2a-status .card-head,
+.a2a-outbound .card-head {
+  flex-wrap: wrap;
+}
+
+.a2a-failure:empty,
+.a2a-notes:empty,
+.a2a-result:empty,
+.a2a-editor-slot:empty {
+  display: none;
+}
+
+/* The failure reason sits directly under the card head: when the listener is
+   down, the reason is the card. */
+.a2a-failure-box {
+  margin-top: 0;
+  margin-bottom: 16px;
+}
+
+.a2a-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.a2a-facts {
+  margin-top: 14px;
+}
+
+.a2a-semantics {
+  padding: 14px 18px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+}
+
+.a2a-semantics-title {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.a2a-semantics-body {
+  margin-top: 6px;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+/* ── A2A peer rows ───────────────────────────────────────────────────────── */
+
+.a2a-peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.a2a-peer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 20px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  box-shadow: var(--shadow-out-sm);
+}
+
+/* A wildcard peer. The tint is the second signal; the tag, the raised warning
+   and its text are the first, so the meaning survives without colour. */
+.a2a-peer-danger {
+  background: var(--danger-tint);
+}
+
+.a2a-peer-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+}
+
+.a2a-peer-name {
+  font-size: 1rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.a2a-sub-label {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.a2a-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.a2a-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.a2a-more,
+.a2a-warn-note {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.a2a-empty {
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.a2a-danger {
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-out-sm);
+}
+
+.a2a-danger .icon {
+  color: var(--danger);
+}
+
+.a2a-danger-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.a2a-danger-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.a2a-danger-text {
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.a2a-row-actions {
+  margin-top: 0;
+}
+
+.a2a-result .status {
+  margin-top: 0;
+}
+
+.a2a-result .facts {
+  margin-top: 12px;
+}
+
+/* ── A2A outbound editor ─────────────────────────────────────────────────── */
+
+.a2a-caution {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 20px;
+  border-radius: var(--radius);
+  background-image: linear-gradient(145deg, var(--accent-bright), var(--accent-tint));
+  box-shadow: var(--shadow-out);
+}
+
+.a2a-caution-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* The global reset removes list markers; this list is a list of consequences,
+   so it gets them back. */
+.a2a-caution-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 20px;
+  list-style: disc;
+  font-size: 0.92rem;
+}
+
+.a2a-caution-workflow {
+  font-size: 0.92rem;
+  font-weight: 500;
+}
+
+.a2a-editor {
+  margin-top: 20px;
+  padding: 20px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  box-shadow: var(--shadow-out-sm);
+}
+
+.a2a-editor-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.a2a-field-note {
+  padding-left: 4px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * The number inputs the peer editor needs. Same treatment as the text and
+ * password fields above, so a numeric field is not the one control on the page
+ * wearing the platform's own chrome.
+ */
+input[type="number"] {
+  width: 100%;
+  padding: 12px 15px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text);
+  font: inherit;
+  transition: var(--ease);
+}
+
+input[type="number"]:focus {
+  outline: none;
+  box-shadow: var(--shadow-in-deep), var(--ring);
+}
+
+@media (max-width: 420px) {
+  /* At 380px a peer's three actions each take a full row rather than being
+     squeezed into a stub, and the state pill stops being pushed to the edge of
+     a head it no longer shares a line with. */
+  .a2a-head-chip {
+    margin-left: 0;
+  }
+
+  .a2a-peer {
+    padding: 15px 16px;
+  }
+
+  .a2a-editor {
+    padding: 16px 15px;
+  }
+
+  .a2a-caution {
+    padding: 15px 16px;
+  }
+
+  .a2a-row-actions .btn {
+    flex: 1 1 100%;
+  }
+}
+
 /* ── Reduced motion ──────────────────────────────────────────────────────── */
 
 @media (prefers-reduced-motion: reduce) {
