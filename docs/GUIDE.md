@@ -32,7 +32,6 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 | | `dimensions` | Vector dimensions | — |
 | | `base_url` | Embedding API base URL | — |
 | | `api_key` | Embedding API key | — |
-| `[ocr]` | `enabled` | Enable OCR for image processing | `true` |
 | `[skills]` | `directory` | Instance skill files directory | `<home>/skills/` |
 | `[agents]` | `directory` | Instance agent files directory | `<home>/agents/` |
 | `[subagents]` | `default_tools` | Default tool list for subagents | — |
@@ -249,7 +248,7 @@ agents/
 
 ### File & Image Processing
 
-Photos and documents (PDF, DOCX, images) are processed via vision API or OCR (`ocrs` pure Rust OCR engine), then injected as multi-modal content or text into the conversation.
+Photos and documents (PDF, DOCX, images) are processed via vision API (when supported by the model), then injected as multi-modal content or text into the conversation.
 
 ### RAG & Vector Search
 

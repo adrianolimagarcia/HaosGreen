@@ -125,12 +125,6 @@ Be concise and helpful."""
 # model = "qwen/qwen3-embedding-8b"
 # dimensions = 1536
 
-# OCR configuration (optional)
-# Used to extract text from images when supports_vision = false.
-# Models are downloaded automatically on first use.
-# [ocr]
-# model_dir = "~/.cache/ocrs"  # Where OCR model files are cached (downloaded on first use)
-
 # MCP Server Configurations
 # Each [[mcp_servers]] block defines an MCP server to connect to
 # The bot will discover and register tools from each server

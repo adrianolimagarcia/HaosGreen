@@ -11,21 +11,21 @@ const LONG_CONTEXT_THRESHOLD: usize = 6000;
 const CHUNK_SIZE: usize = 1000;
 const CHUNK_OVERLAP: usize = 100;
 
-/// Returned by `process_image` to indicate whether we got a vision part or OCR text.
+/// Returned by `process_image` to indicate whether we got a vision part or fallback message.
 pub enum ImageResult {
     VisionPart(ContentPart),
-    OcrText(String),
+    Message(String),
 }
 
 /// Process all attachments for a message.
-/// - Images: base64 vision part (if supports_vision) OR OCR text (if not)
+/// - Images: base64 vision part (if supports_vision) OR descriptive message (if not)
 /// - PDFs: text extraction
 /// - DOCXs: text extraction
 /// - Long text (>6000 chars): chunked into knowledge store, RAG-retrieved
 pub async fn process_attachments(
     attachments: &[Attachment],
     user_query: &str,
-    config: &Config,
+    _config: &Config,
     memory: &MemoryStore,
     supports_vision: bool,
 ) -> (String, Vec<ContentPart>) {
@@ -35,18 +35,18 @@ pub async fn process_attachments(
     for attachment in attachments {
         match attachment.kind {
             AttachmentKind::Image => {
+                let fname = attachment.file_name.as_deref().unwrap_or("image");
                 match process_image(
                     &attachment.path,
                     &attachment.mime_type,
                     supports_vision,
-                    &config.ocr.model_dir,
+                    fname,
                 )
                 .await
                 {
                     Ok(ImageResult::VisionPart(part)) => image_parts.push(part),
-                    Ok(ImageResult::OcrText(text)) => {
-                        let fname = attachment.file_name.as_deref().unwrap_or("image");
-                        text_parts.push(format!("[Image: {}]\n{}", fname, text));
+                    Ok(ImageResult::Message(msg)) => {
+                        text_parts.push(msg);
                     }
                     Err(e) => {
                         tracing::warn!("Image processing failed: {}", e);
@@ -89,12 +89,12 @@ pub async fn process_attachments(
     (text_parts.join("\n\n"), image_parts)
 }
 
-/// Returns either a vision ContentPart (base64) or extracted OCR text.
+/// Returns either a vision ContentPart (base64) or a descriptive message when vision is unsupported.
 async fn process_image(
     path: &Path,
     mime_type: &str,
     supports_vision: bool,
-    ocr_model_dir: &Path,
+    file_name: &str,
 ) -> Result<ImageResult> {
     if supports_vision {
         let bytes = tokio::fs::read(path).await?;
@@ -104,79 +104,11 @@ async fn process_image(
             image_url: ImageUrlContent { url: data_url },
         }))
     } else {
-        let text = ocr_image(path, ocr_model_dir).await?;
-        Ok(ImageResult::OcrText(text))
+        Ok(ImageResult::Message(format!(
+            "[Image: {} - model does not support vision and local OCR is disabled]",
+            file_name
+        )))
     }
-}
-
-/// Perform OCR on an image using the ocrs neural-network engine.
-/// Downloads model files on first use to `model_dir`.
-async fn ocr_image(path: &Path, model_dir: &Path) -> Result<String> {
-    ensure_ocr_models(model_dir).await?;
-
-    let det_path = model_dir.join("text-detection.rten");
-    let rec_path = model_dir.join("text-recognition.rten");
-
-    let path_owned = path.to_path_buf();
-
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        let detection_model =
-            rten::Model::load_file(&det_path).context("Failed to load OCR detection model")?;
-        let recognition_model =
-            rten::Model::load_file(&rec_path).context("Failed to load OCR recognition model")?;
-
-        let engine = ocrs::OcrEngine::new(ocrs::OcrEngineParams {
-            detection_model: Some(detection_model),
-            recognition_model: Some(recognition_model),
-            ..Default::default()
-        })?;
-
-        let img = image::open(&path_owned)
-            .context("Failed to open image for OCR")?
-            .into_rgb8();
-        let img_source = ocrs::ImageSource::from_bytes(img.as_raw(), img.dimensions())?;
-        let ocr_input = engine.prepare_input(img_source)?;
-        let text = engine.get_text(&ocr_input)?;
-        Ok(text)
-    })
-    .await
-    .context("OCR task panicked")?
-}
-
-/// Download OCR model files to model_dir if they don't exist.
-async fn ensure_ocr_models(model_dir: &Path) -> Result<()> {
-    tokio::fs::create_dir_all(model_dir).await?;
-
-    let det = model_dir.join("text-detection.rten");
-    let rec = model_dir.join("text-recognition.rten");
-
-    const DET_URL: &str = "https://ocrs-models.s3.us-east-1.amazonaws.com/text-detection.rten";
-    const REC_URL: &str = "https://ocrs-models.s3.us-east-1.amazonaws.com/text-recognition.rten";
-
-    if !det.exists() {
-        tracing::info!("Downloading OCR detection model to {}", det.display());
-        download_model(DET_URL, &det).await?;
-    }
-    if !rec.exists() {
-        tracing::info!("Downloading OCR recognition model to {}", rec.display());
-        download_model(REC_URL, &rec).await?;
-    }
-    Ok(())
-}
-
-async fn download_model(url: &str, dest: &Path) -> Result<()> {
-    let response = reqwest::get(url)
-        .await
-        .context("Failed to fetch OCR model")?;
-    let bytes = response
-        .bytes()
-        .await
-        .context("Failed to read OCR model bytes")?;
-    tokio::fs::write(dest, &bytes)
-        .await
-        .context("Failed to write OCR model")?;
-    tracing::info!("OCR model saved: {} bytes", bytes.len());
-    Ok(())
 }
 
 /// Extract text content from a PDF file.

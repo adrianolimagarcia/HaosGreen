@@ -27,8 +27,6 @@ pub struct Config {
     pub embedding: Option<EmbeddingApiConfig>,
     #[serde(default)]
     pub langsmith: Option<LangSmithConfig>,
-    #[serde(default = "default_ocr_config")]
-    pub ocr: OcrConfig,
     #[serde(default = "default_learning_config")]
     pub learning: LearningConfig,
     #[serde(default)]
@@ -468,7 +466,7 @@ pub struct OpenRouterConfig {
     pub system_prompt: String,
     /// Whether the configured model supports vision (image inputs).
     /// When true, images are sent as base64-encoded content parts.
-    /// When false, OCR is used to extract text from images.
+    /// When false, a fallback message is returned indicating vision is not supported.
     #[serde(default)]
     pub supports_vision: bool,
 }
@@ -513,14 +511,6 @@ pub struct ProviderSection {
 pub struct FallbackConfig {
     #[serde(default)]
     pub chain: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct OcrConfig {
-    /// Directory where OCR model files are cached.
-    /// Models are downloaded automatically on first OCR use.
-    #[serde(default = "default_ocr_model_dir")]
-    pub model_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -861,19 +851,6 @@ fn default_langsmith_project() -> String {
 
 fn default_langsmith_base_url() -> String {
     "https://api.smith.langchain.com".to_string()
-}
-
-fn default_ocr_model_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".cache/ocrs")
-}
-
-fn default_ocr_config() -> OcrConfig {
-    OcrConfig {
-        model_dir: default_ocr_model_dir(),
-    }
 }
 
 fn default_context_window() -> usize {
@@ -1278,21 +1255,6 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.openrouter.supports_vision);
-    }
-
-    #[test]
-    fn test_ocr_config_default_model_dir() {
-        let toml = r#"
-            [telegram]
-            bot_token = "tok"
-            allowed_user_ids = [1]
-            [openrouter]
-            api_key = "key"
-            [sandbox]
-            allowed_directory = "/tmp"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(cfg.ocr.model_dir.to_string_lossy().contains("ocrs"));
     }
 
     #[test]

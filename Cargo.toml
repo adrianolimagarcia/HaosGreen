@@ -66,13 +66,6 @@ axum = "0.8"
 # Embed bundled skills/agents into the binary for cargo install
 include_dir = "0.7"
 
-# OCR (pure Rust, neural-network based)
-ocrs = "0.12"
-rten = { version = "0.24", features = ["rten_format"] }
-
-# Image loading/processing
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-
 # Document processing
 pdf-extract = "0.10"
 docx-rs = "0.4"

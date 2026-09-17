@@ -727,7 +727,6 @@ const state = {
   skills_dir: '',
   agents_dir: '',
   home_dir: '',
-  ocr_model_dir: '',
   query_rewriter_enabled: false,
   max_iterations: 25,
   empty_response_retry_limit: 3,
@@ -861,7 +860,6 @@ function collectStep(n) {
     state.skills_dir                 = (document.getElementById('f-skills-dir')?.value            || '').trim();
     state.agents_dir                 = (document.getElementById('f-agents-dir')?.value            || '').trim();
     state.home_dir                   = (document.getElementById('f-home-dir')?.value              || '').trim();
-    state.ocr_model_dir              = (document.getElementById('f-ocr-model-dir')?.value         || '').trim();
     state.query_rewriter_enabled     = !!document.getElementById('f-query-rewriter')?.checked;
     state.max_iterations             = parseInt(document.getElementById('f-max-iterations')?.value || state.max_iterations, 10) || 25;
     state.empty_response_retry_limit = parseInt(document.getElementById('f-empty-retry')?.value     || state.empty_response_retry_limit, 10) || 3;
@@ -959,13 +957,6 @@ function generateToml() {
     toml += 'api_key = "' + esc(state.langsmith_key) + '"\n';
     toml += 'project = "' + esc(state.langsmith_project || 'rustfox') + '"\n';
     toml += 'base_url = "https://api.smith.langchain.com"\n';
-    toml += '\n';
-  }
-
-  // [ocr] — only emit if user overrode the default
-  if (state.ocr_model_dir) {
-    toml += '[ocr]\n';
-    toml += 'model_dir = "' + esc(state.ocr_model_dir) + '"\n';
     toml += '\n';
   }
 
@@ -1074,7 +1065,6 @@ function renderSummary() {
     row('Skills dir',     state.skills_dir || '(default)'),
     row('Agents dir',     state.agents_dir || '(default)'),
     row('Home dir',       state.home_dir),
-    row('OCR model dir',  state.ocr_model_dir),
     row('Query rewriting', state.query_rewriter_enabled ? 'enabled' : 'disabled'),
     row('Max iterations', state.max_iterations),
     row('Empty retries',  state.empty_response_retry_limit),
@@ -1204,7 +1194,6 @@ async function loadExistingConfig() {
     if (cfg.skills_dir)       state.skills_dir       = cfg.skills_dir;
     if (cfg.agents_dir)       state.agents_dir       = cfg.agents_dir;
     if (cfg.home_dir)         state.home_dir         = cfg.home_dir;
-    if (cfg.ocr_model_dir)    state.ocr_model_dir    = cfg.ocr_model_dir;
     if (typeof cfg.query_rewriter_enabled === 'boolean') state.query_rewriter_enabled = cfg.query_rewriter_enabled;
     if (cfg.agent_max_iterations)              state.max_iterations             = cfg.agent_max_iterations;
     if (cfg.agent_empty_response_retry_limit)  state.empty_response_retry_limit = cfg.agent_empty_response_retry_limit;
@@ -1263,7 +1252,6 @@ function syncStateToForm() {
     'f-skills-dir':         state.skills_dir,
     'f-agents-dir':         state.agents_dir,
     'f-home-dir':           state.home_dir,
-    'f-ocr-model-dir':      state.ocr_model_dir,
     'f-max-iterations':     state.max_iterations,
     'f-empty-retry':        state.empty_response_retry_limit,
     'f-langsmith-key':      state.langsmith_key,
@@ -1522,10 +1510,6 @@ function buildSteps() {
       <div class="field">
         <label>Home Directory <span class="hint">— overrides the default <code>~/.rustfox</code></span></label>
         <input type="text" id="f-home-dir" placeholder="/path/to/.rustfox" value="${escHtml(state.home_dir)}">
-      </div>
-      <div class="field">
-        <label>OCR Model Directory <span class="hint">— where OCR model files are cached</span></label>
-        <input type="text" id="f-ocr-model-dir" placeholder="~/.cache/ocrs" value="${escHtml(state.ocr_model_dir)}">
       </div>
       <div class="field">
         <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">

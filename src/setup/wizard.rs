@@ -89,7 +89,6 @@ pub struct ExistingConfig {
     pub home_dir: String,
     pub skills_dir: String,
     pub agents_dir: String,
-    pub ocr_model_dir: String,
     pub agent_max_iterations: u32,
     pub agent_empty_response_retry_limit: u32,
     pub langsmith_key: String,
@@ -124,7 +123,6 @@ pub struct RawConfig {
     pub agent: Option<RawAgent>,
     pub langsmith: Option<RawLangSmith>,
     pub embedding: Option<RawEmbedding>,
-    pub ocr: Option<RawOcr>,
     pub learning: Option<RawLearning>,
     pub supervisor: Option<RawSupervisor>,
     pub subagents: Option<RawSubagents>,
@@ -180,11 +178,6 @@ pub struct RawEmbedding {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub dimensions: Option<u32>,
-}
-
-#[derive(Deserialize, Default, Clone)]
-pub struct RawOcr {
-    pub model_dir: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -857,9 +850,6 @@ pub fn parse_existing_config(content: &str) -> ExistingConfig {
         cfg.embedding_base_url = embedding.base_url.clone().unwrap_or_default();
         cfg.embedding_model = embedding.model.clone().unwrap_or_default();
         cfg.embedding_dimensions = embedding.dimensions.unwrap_or(0);
-    }
-    if let Some(ref ocr) = raw.ocr {
-        cfg.ocr_model_dir = ocr.model_dir.clone().unwrap_or_default();
     }
     if let Some(ref learning) = raw.learning {
         cfg.learning_skill_extraction_enabled = learning.skill_extraction_enabled.unwrap_or(false);
