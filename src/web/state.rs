@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::auth::{Credentials, IpGate, LoginLimiter, SessionStore};
+use super::chat::ChatSessionStore;
 use super::logs::LogBuffer;
 
 #[derive(Clone)]
@@ -39,6 +40,13 @@ pub struct WebState {
     /// Where `Credentials` is persisted. Kept here so the settings routes can
     /// save a password change without re-deriving the home directory.
     pub credentials_path: PathBuf,
+    /// Chat histories, one per dashboard session.
+    ///
+    /// Lives here rather than behind the `agent` handle because it is pure
+    /// in-memory bookkeeping: `POST /api/chat/sessions` and the history read
+    /// work on a dashboard that was started without an agent, and only the
+    /// routes that actually *run* the agent return 503.
+    pub chat: Arc<ChatSessionStore>,
     /// Bounded ring buffer of recent tracing events (Phase 4 feeds it; the
     /// handle lives here so `WebState` does not have to change again).
     pub logs: Arc<LogBuffer>,
@@ -97,6 +105,7 @@ mod tests {
             agent: None,
             supervisor: None,
             credentials_path: PathBuf::from("/nonexistent/web-auth.toml"),
+            chat: Arc::new(ChatSessionStore::new()),
             logs: Arc::new(LogBuffer::new(16)),
         }
     }

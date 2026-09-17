@@ -2,7 +2,9 @@
 //!
 //! Phase 1 (foundation) lives here: the `[web]` configuration, credential
 //! storage, sessions, the source-IP/login gates, the request guard, and the
-//! listener. The route modules are added by the later tasks of
+//! listener. Phase 2 adds [`chat`] (the bounded chat session store) and
+//! [`routes::chat`] (chat sessions and the SSE message stream). The remaining
+//! route modules are added by the later tasks of
 //! `docs/superpowers/plans/2026-09-16-haos-green-web-dashboard.md`.
 //!
 //! Two properties of this module are load-bearing:
@@ -15,6 +17,7 @@
 //!   extractor. Without it every request fails with a 500.
 
 pub mod auth;
+pub mod chat;
 pub mod logs;
 pub mod middleware;
 pub mod routes;
@@ -136,6 +139,7 @@ fn build_state(
         limiter: Arc::new(Mutex::new(LoginLimiter::new())),
         credentials: Arc::new(Mutex::new(credentials)),
         credentials_path,
+        chat: Arc::new(chat::ChatSessionStore::new()),
         logs: Arc::new(logs::LogBuffer::new(LOG_BUFFER_CAPACITY)),
         config,
         agent,
@@ -227,9 +231,24 @@ pub async fn spawn_for_test(home: PathBuf) -> Result<(SocketAddr, ())> {
 /// `127.0.0.1:0` — a fixed port would make the suite flaky — but `public_url`,
 /// `allow_ips` and `session_ttl_hours` are honoured exactly as given.
 #[doc(hidden)]
-pub async fn spawn_for_test_with(home: PathBuf, mut config: WebConfig) -> Result<(SocketAddr, ())> {
+pub async fn spawn_for_test_with(home: PathBuf, config: WebConfig) -> Result<(SocketAddr, ())> {
+    spawn_for_test_with_agent(home, config, None).await
+}
+
+/// [`spawn_for_test_with`] with an agent attached.
+///
+/// The live SSE test needs a dashboard whose `agent` handle is `Some`: the send
+/// route answers 503 without one, so a test that never wires an agent would
+/// prove nothing about streaming. `Supervisor` stays `None` — no chat route
+/// touches it.
+#[doc(hidden)]
+pub async fn spawn_for_test_with_agent(
+    home: PathBuf,
+    mut config: WebConfig,
+    agent: Option<Arc<Agent>>,
+) -> Result<(SocketAddr, ())> {
     config.enabled = true;
-    let state = build_state(config, home, None, None)?;
+    let state = build_state(config, home, agent, None)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {

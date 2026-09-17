@@ -322,7 +322,20 @@ dashboard cannot dispatch subagents.
 Cancel tokens are namespaced `web:{session_id}` so they cannot collide with
 Telegram's `/stop` or A2A task cancellation.
 
-SSE event kinds: `token`, `tool_call`, `tool_result`, `done`, `error`.
+SSE event kinds actually emitted: `token`, `done`, `error`.
+
+> **Correction (verified against the code).** This spec originally also listed
+> `tool_call` and `tool_result`. They cannot be sourced through
+> `run_with_policy_streaming_history`: it builds its `LoopConfig` via
+> `policy_loop_config`, which hardcodes `tool_event_tx: None`
+> (`src/agent.rs:1890`), and the loop's only other channel is `stream_token_tx`,
+> whose item type is `String` (`src/loop_runner.rs:36`). Emitting those kinds
+> would mean fabricating them. The UI must not expect them.
+>
+> A related limitation worth knowing: the streamed tokens are coarser than they
+> appear. Only the **final** response text is chunked and streamed; any text the
+> model emits alongside a tool call never reaches the channel, so a run that
+> uses tools shows a pause and then the answer rather than live progress.
 
 ### 5.2 Supervisor
 

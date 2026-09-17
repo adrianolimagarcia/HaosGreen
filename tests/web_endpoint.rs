@@ -218,7 +218,7 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
     // header is sent on all of them so the request reaches the authentication
     // check rather than being stopped by the CSRF gate first: this test is
     // about authentication.
-    let cases: [(&str, &str, Option<serde_json::Value>); 5] = [
+    let cases: [(&str, &str, Option<serde_json::Value>); 10] = [
         ("GET", "/api/settings", None),
         (
             "POST",
@@ -236,6 +236,18 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
             Some(serde_json::json!({"allow_ips": []})),
         ),
         ("POST", "/api/auth/logout", None),
+        // The chat surface. `POST /api/chat/sessions` mints a session, so it is
+        // the one route where a missing guard would be a real hole rather than
+        // an information leak.
+        ("POST", "/api/chat/sessions", None),
+        ("GET", "/api/chat/sessions", None),
+        ("GET", "/api/chat/sessions/nope/messages", None),
+        (
+            "POST",
+            "/api/chat/sessions/nope/messages",
+            Some(serde_json::json!({"message": "hi"})),
+        ),
+        ("POST", "/api/chat/sessions/nope/cancel", None),
     ];
 
     for (method, path, body) in cases {
@@ -1173,4 +1185,666 @@ async fn the_security_headers_are_on_static_and_authenticated_responses() {
         .unwrap();
     assert_eq!(login.status(), 200);
     assert_security_headers(&login);
+}
+
+// ── Chat sessions ───────────────────────────────────────────────────────────
+
+/// Log in and create a chat session, returning the session cookie and the id.
+///
+/// The test harness starts the dashboard **without** an agent (`spawn_for_test`
+/// passes `None`), which is exactly what makes the session CRUD routes testable:
+/// they are pure in-memory bookkeeping. The routes that actually run the agent
+/// answer 503 here, and that is asserted on purpose.
+async fn chat_session(base: &str) -> (String, String) {
+    let cookie = login_and_get_cookie(base, "admin").await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "creating a session must succeed");
+    let body: serde_json::Value = response.json().await.unwrap();
+    let id = body["id"]
+        .as_str()
+        .expect("creating a session must return its id")
+        .to_string();
+    assert!(!id.is_empty());
+    (cookie, id)
+}
+
+#[tokio::test]
+async fn chat_requires_authentication() {
+    let (base, _dir) = spawn_test_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions"))
+        .header("x-haos-green-csrf", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn creating_a_chat_session_without_the_csrf_header_is_forbidden() {
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn creating_a_chat_session_returns_an_id_that_the_listing_reports() {
+    let (base, _dir) = spawn_test_server().await;
+    let (cookie, id) = chat_session(&base).await;
+
+    let listing = reqwest::Client::new()
+        .get(format!("{base}/api/chat/sessions"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), 200);
+    let body: serde_json::Value = listing.json().await.unwrap();
+    let sessions = body["sessions"]
+        .as_array()
+        .expect("the listing must carry a `sessions` array");
+    assert_eq!(sessions.len(), 1, "got {sessions:?}");
+    assert_eq!(sessions[0]["id"], serde_json::json!(id));
+    assert_eq!(sessions[0]["turns"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn a_new_chat_session_has_an_empty_history() {
+    let (base, _dir) = spawn_test_server().await;
+    let (cookie, id) = chat_session(&base).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["messages"],
+        serde_json::json!([]),
+        "a fresh session must have no history"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_chat_session_is_not_found_on_every_route() {
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    // A typo must be a 404, never a silently created conversation. The send and
+    // cancel routes are checked too: both run the session check before the
+    // agent check, so the answer is "not found" rather than "unavailable".
+    let cases: [(&str, &str, Option<serde_json::Value>); 3] = [
+        ("GET", "/api/chat/sessions/missing/messages", None),
+        (
+            "POST",
+            "/api/chat/sessions/missing/messages",
+            Some(serde_json::json!({"message": "hello"})),
+        ),
+        ("POST", "/api/chat/sessions/missing/cancel", None),
+    ];
+
+    for (method, path, body) in cases {
+        let mut request = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{base}{path}"),
+            )
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::COOKIE, &cookie);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "{method} {path} with an unknown session id"
+        );
+    }
+
+    // And nothing was created behind the caller's back.
+    let listing = client
+        .get(format!("{base}/api/chat/sessions"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = listing.json().await.unwrap();
+    assert_eq!(body["sessions"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn sending_a_message_without_an_agent_is_unavailable() {
+    let (base, _dir) = spawn_test_server().await;
+    let (cookie, id) = chat_session(&base).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "message": "hello" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        503,
+        "a dashboard started without an agent must degrade, not panic"
+    );
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("agent"),
+        "the 503 body must say what is missing, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_without_an_agent_is_unavailable() {
+    let (base, _dir) = spawn_test_server().await;
+    let (cookie, id) = chat_session(&base).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions/{id}/cancel"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+}
+
+#[tokio::test]
+async fn an_empty_chat_message_is_rejected() {
+    let (base, _dir) = spawn_test_server().await;
+    let (cookie, id) = chat_session(&base).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "message": "   " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        400,
+        "a whitespace-only message must be refused before the agent is consulted"
+    );
+}
+
+// ── Live chat streaming (opt-in) ────────────────────────────────────────────
+//
+// Nothing on the agent path is stubbed here. The test builds a real
+// `haos_green::agent::Agent` (the same 17-argument construction
+// `tests/a2a_e2e_live.rs` uses), attaches it to the real dashboard router,
+// serves it on an ephemeral loopback port, and drives it with a real HTTP
+// request over a real SSE stream.
+//
+// Two gates, because this cannot pass on a machine without the endpoint:
+//
+// 1. `#[ignore]` — plain `cargo test` never picks it up.
+// 2. A runtime check of `HAOS_GREEN_WEB_LIVE=1` — even an explicit `--ignored`
+//    run exits early with a printed message when it is unset, so CI passes with
+//    the variable unset.
+//
+// Run it with:
+//
+// ```text
+// HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint -- --ignored --nocapture
+// ```
+//
+// The provider is an OpenAI-compatible server at `LIVE_LLM_BASE_URL` accepting
+// any non-empty `Bearer` token.
+
+/// OpenAI-compatible endpoint the live test talks to.
+const LIVE_LLM_BASE_URL: &str = "http://127.0.0.1:8790/v1";
+/// Verified-working model on that endpoint.
+const LIVE_LLM_MODEL: &str = "a6api_DeepSeek-V4-Flash-0731";
+/// Trivial prompt: no tool call is needed, so the loop terminates on its first
+/// iteration with a final text response.
+const LIVE_PROMPT: &str = "Reply with the single word: pong";
+
+/// A `PlatformSender` that drops everything on the floor.
+///
+/// `Agent::new` needs one; the trivial prompt calls no tool.
+struct LiveNoopSender;
+
+#[async_trait::async_trait]
+impl haos_green::platform::sender::PlatformSender for LiveNoopSender {
+    async fn send_message(
+        &self,
+        _chat_id: &str,
+        _text: &str,
+        _format: haos_green::platform::sender::MessageFormat,
+    ) -> anyhow::Result<haos_green::platform::sender::PlatformMessageId> {
+        Ok("noop:1".to_string())
+    }
+
+    async fn send_file(
+        &self,
+        _chat_id: &str,
+        _path: &std::path::Path,
+        _caption: Option<&str>,
+    ) -> anyhow::Result<haos_green::platform::sender::PlatformMessageId> {
+        Ok("noop:1".to_string())
+    }
+
+    async fn show_cancel_button(
+        &self,
+        _chat_id: &str,
+        _text: &str,
+        _cancel_id: &str,
+    ) -> anyhow::Result<haos_green::platform::sender::PlatformMessageId> {
+        Ok("noop:1".to_string())
+    }
+
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &haos_green::platform::sender::PlatformMessageId,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &haos_green::platform::sender::PlatformMessageId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn notify_shutdown(&self, _chat_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Write a `config.toml` whose home directory lives inside `dir`.
+///
+/// `[general].home` is an absolute path inside the temp dir, so `Config::resolve`
+/// materializes the whole home tree there and no global state is touched — this
+/// file never calls `std::env::set_var`, which is process-global and would race
+/// with the other tests in this binary.
+fn write_live_config(dir: &std::path::Path) -> std::path::PathBuf {
+    let home = dir.join("home");
+    let workspace = home.join("workspace");
+    let path = dir.join("config.toml");
+    let toml = format!(
+        r#"
+[general]
+home = "{home}"
+
+[telegram]
+bot_token = "test-token"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "test-key"
+base_url = "{LIVE_LLM_BASE_URL}"
+model = "{LIVE_LLM_MODEL}"
+max_tokens = 512
+
+[agent]
+max_iterations = 4
+
+[sandbox]
+allowed_directory = "{workspace}"
+"#,
+        home = home.display(),
+        workspace = workspace.display(),
+    );
+    std::fs::write(&path, toml).expect("write config.toml");
+    path
+}
+
+/// Construct the real `Agent` exactly as `src/main.rs` does, minus the pieces
+/// that need a live Telegram bot.
+async fn build_live_agent(
+    config_path: &std::path::Path,
+    memory: &haos_green::memory::MemoryStore,
+) -> std::sync::Arc<haos_green::agent::Agent> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let config = haos_green::config::Config::load(config_path).expect("load generated config");
+
+    let (sections, default_provider, _fallback) = config.build_providers();
+    let registry = Arc::new(
+        haos_green::provider::build_registry(
+            &sections,
+            &default_provider,
+            config.parse_retry_limit(),
+        )
+        .expect("build the provider registry"),
+    );
+
+    let skills_rw = Arc::new(tokio::sync::RwLock::new(
+        haos_green::skills::SkillRegistry::new(),
+    ));
+    let agents_rw = Arc::new(tokio::sync::RwLock::new(
+        haos_green::skills::SkillRegistry::new(),
+    ));
+    let restart_pending = Arc::new(AtomicBool::new(false));
+    let soul_updated = Arc::new(AtomicBool::new(false));
+
+    let mut tool_registry = haos_green::tool_registry::ToolRegistry::new();
+    tool_registry.register(Box::new(haos_green::builtin_tools::BuiltinTools::new(
+        config.skills.directory.clone(),
+        skills_rw.clone(),
+        restart_pending.clone(),
+        soul_updated.clone(),
+    )));
+    tool_registry.register(Box::new(haos_green::memory_tools::MemoryTools::new(
+        memory.clone(),
+    )));
+    tool_registry.register(Box::new(haos_green::skill_tools::SkillTools::new(
+        config.skills.directory.clone(),
+        config.agents.directory.clone(),
+        skills_rw.clone(),
+        agents_rw.clone(),
+    )));
+    // `execute_command` lives in its own handler; without it the registry would
+    // not match what `src/main.rs` builds.
+    tool_registry.register(Box::new(haos_green::command_tool::CommandTool::new(
+        config.sandbox.allowed_directory.clone(),
+        Arc::new(haos_green::cancel_registry::CancelRegistry::new()),
+        Arc::new(LiveNoopSender),
+    )));
+
+    let task_store = haos_green::scheduler::reminders::ScheduledTaskStore::new(memory.connection());
+    let scheduler = Arc::new(
+        haos_green::scheduler::Scheduler::new()
+            .await
+            .expect("create the scheduler"),
+    );
+    let (job_tx, _job_rx) =
+        tokio::sync::mpsc::unbounded_channel::<haos_green::agent::ScheduledJobRequest>();
+    let langsmith = Arc::new(haos_green::langsmith::LangSmithClient::new(None));
+    let cancel_registry = Arc::new(haos_green::cancel_registry::CancelRegistry::new());
+    let sender: Arc<dyn haos_green::platform::sender::PlatformSender> = Arc::new(LiveNoopSender);
+
+    // `Arc::new_cyclic` so the agent can hold a `Weak<Agent>` without leaking.
+    Arc::new_cyclic(|weak| {
+        haos_green::agent::Agent::new(
+            config,
+            registry,
+            haos_green::mcp::McpManager::new(),
+            memory.clone(),
+            haos_green::skills::SkillRegistry::new(),
+            haos_green::skills::SkillRegistry::new(),
+            task_store,
+            Arc::clone(&scheduler),
+            weak.clone(),
+            job_tx,
+            langsmith,
+            config_path.to_path_buf(),
+            cancel_registry,
+            tool_registry,
+            sender,
+            restart_pending,
+            soul_updated,
+        )
+    })
+}
+
+/// The `(event, data)` pairs in an SSE body.
+///
+/// Comment lines (`:` — the keep-alive) and unknown fields are ignored, and a
+/// frame's `data:` lines are joined with newlines exactly as the SSE spec
+/// specifies.
+fn parse_sse(body: &str) -> Vec<(String, String)> {
+    let mut events = Vec::new();
+    let mut kind = String::new();
+    let mut data: Vec<String> = Vec::new();
+
+    let flush = |kind: &mut String, data: &mut Vec<String>, events: &mut Vec<(String, String)>| {
+        if !kind.is_empty() || !data.is_empty() {
+            events.push((std::mem::take(kind), data.join("\n")));
+            data.clear();
+        }
+    };
+
+    for line in body.lines() {
+        if line.is_empty() {
+            flush(&mut kind, &mut data, &mut events);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            kind = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            data.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+    }
+    flush(&mut kind, &mut data, &mut events);
+    events
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a live OpenAI-compatible LLM on 127.0.0.1:8790; \
+            run with: HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint -- --ignored --nocapture"]
+async fn a_live_chat_message_streams_tokens_and_exactly_one_done_event() {
+    if std::env::var("HAOS_GREEN_WEB_LIVE").as_deref() != Ok("1") {
+        println!(
+            "SKIP: HAOS_GREEN_WEB_LIVE is not set to 1 — this test needs a live LLM at \
+             {LIVE_LLM_BASE_URL}.\nRun it with:\n    \
+             HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint -- --ignored --nocapture"
+        );
+        return;
+    }
+
+    // The temp dir must outlive the whole test: the config, the resolved home
+    // and the sandbox all live inside it.
+    let tmp = tempfile::tempdir().expect("create a temp dir");
+    let config_path = write_live_config(tmp.path());
+    let memory = haos_green::memory::MemoryStore::open_in_memory().expect("open a memory store");
+    let agent = build_live_agent(&config_path, &memory).await;
+
+    // The policy, checked against a real agent rather than a stub. An empty
+    // policy means "no tools" to the loop, and the wildcard trap the design spec
+    // fell into would produce exactly that — silently.
+    let policy = haos_green::web::routes::chat::web_tool_policy_for(&agent);
+    let live: Vec<String> = agent
+        .all_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.function.name)
+        .collect();
+    assert!(
+        !policy.is_empty(),
+        "the live agent's policy must not be empty: {policy:?}"
+    );
+    assert_eq!(
+        policy, live,
+        "the policy must be exactly the registry plus MCP definitions"
+    );
+    assert!(
+        !policy
+            .iter()
+            .any(|tool| tool == "invoke_agent" || tool == "spawn_agents"),
+        "subagent dispatch must not be reachable from the dashboard: {policy:?}"
+    );
+    println!("live tool policy: {} tools", policy.len());
+
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_agent(
+        tmp.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        Some(agent),
+    )
+    .await
+    .expect("the dashboard should start with an agent");
+    let base = format!("http://{addr}");
+
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let (_, id) = {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/api/chat/sessions"))
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        (
+            cookie.clone(),
+            body["id"].as_str().expect("an id").to_string(),
+        )
+    };
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "message": LIVE_PROMPT }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the send route must start a stream");
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "the send route must answer with SSE, got {content_type:?}"
+    );
+
+    let body = response.text().await.expect("read the SSE body");
+    println!("--- SSE body ---\n{body}\n--- end ---");
+    let events = parse_sse(&body);
+    assert!(!events.is_empty(), "the stream must carry events");
+
+    let tokens: Vec<&str> = events
+        .iter()
+        .filter(|(kind, _)| kind == "token")
+        .map(|(_, data)| data.as_str())
+        .collect();
+    let done: Vec<&(String, String)> = events.iter().filter(|(kind, _)| kind == "done").collect();
+    let errors: Vec<&(String, String)> =
+        events.iter().filter(|(kind, _)| kind == "error").collect();
+
+    assert!(
+        errors.is_empty(),
+        "a live run must not report an error: {errors:?}"
+    );
+    assert!(
+        !tokens.is_empty(),
+        "the stream must contain at least one token event, got {events:?}"
+    );
+    assert_eq!(
+        done.len(),
+        1,
+        "the stream must contain exactly one terminal done event, got {events:?}"
+    );
+
+    let done_payload: serde_json::Value =
+        serde_json::from_str(&done[0].1).expect("the done event carries JSON");
+    let final_text = done_payload["text"].as_str().unwrap_or_default();
+    assert!(
+        !final_text.is_empty(),
+        "the done event must carry the assistant's text: {done_payload}"
+    );
+    // Every streamed chunk must be part of the final answer: a `select!` that
+    // raced the join handle would truncate the stream and this would catch it.
+    assert_eq!(
+        tokens.concat(),
+        final_text,
+        "the concatenated tokens must reconstruct the final response"
+    );
+
+    // The run is persisted: the user turn and the assistant reply.
+    let history = reqwest::Client::new()
+        .get(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(history.status(), 200);
+    let history: serde_json::Value = history.json().await.unwrap();
+    let messages = history["messages"].as_array().expect("a messages array");
+    assert_eq!(messages.len(), 2, "got {history}");
+    assert_eq!(messages[0]["role"], serde_json::json!("user"));
+    assert_eq!(messages[0]["content"], serde_json::json!(LIVE_PROMPT));
+    assert_eq!(messages[1]["role"], serde_json::json!("assistant"));
+    assert_eq!(messages[1]["content"], serde_json::json!(final_text));
+
+    println!("live assistant reply: {final_text}");
+
+    // A second message on the same session must be accepted. This is the only
+    // place that can observe that the "a run is in flight" claim is released
+    // when a stream ends: a leaked claim would answer 409 here forever.
+    let second = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "message": LIVE_PROMPT }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        200,
+        "the run claim must be released when a stream ends"
+    );
+    let second_body = second.text().await.expect("read the second SSE body");
+    let second_events = parse_sse(&second_body);
+    assert!(
+        second_events.iter().any(|(kind, _)| kind == "done"),
+        "the second run must also terminate with a done event, got {second_events:?}"
+    );
+    assert!(
+        !second_events.iter().any(|(kind, _)| kind == "error"),
+        "the second run must not report an error, got {second_events:?}"
+    );
+
+    let history = reqwest::Client::new()
+        .get(format!("{base}/api/chat/sessions/{id}/messages"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    let history: serde_json::Value = history.json().await.unwrap();
+    let messages = history["messages"].as_array().expect("a messages array");
+    assert_eq!(
+        messages.len(),
+        4,
+        "both turns of the conversation must be retained: {history}"
+    );
+    assert_eq!(messages[2]["role"], serde_json::json!("user"));
+    assert_eq!(messages[3]["role"], serde_json::json!("assistant"));
+
+    // The cancel route, against a real agent with no run in flight: it must
+    // answer rather than 404/503, and it must report that there was nothing to
+    // cancel. (A run that is actually in flight is not exercised here: it would
+    // need a prompt that reliably takes long enough to cancel, which is a
+    // timing-dependent test.)
+    let cancel = reqwest::Client::new()
+        .post(format!("{base}/api/chat/sessions/{id}/cancel"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), 200);
+    let cancel: serde_json::Value = cancel.json().await.unwrap();
+    assert_eq!(cancel["cancelled"], serde_json::json!(false));
 }

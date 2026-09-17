@@ -18,6 +18,7 @@
 //! is added.
 
 pub mod auth_routes;
+pub mod chat;
 pub mod settings;
 
 use axum::Router;
@@ -33,6 +34,7 @@ use crate::web::state::WebState;
 pub fn router() -> Router<WebState> {
     Router::new()
         .merge(auth_routes::router())
+        .merge(chat::router())
         .merge(settings::router())
 }
 
