@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod card;
+pub mod client;
 pub mod executor;
 pub mod policy;
 pub mod server;

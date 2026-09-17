@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -118,6 +119,9 @@ pub struct A2aConfig {
     /// Known peers, keyed by peer name. A request whose token matches no entry
     /// here is rejected. An empty map means nobody can connect.
     pub peers: HashMap<String, A2aPeerConfig>,
+    /// Outbound peers this agent may contact.
+    #[serde(default)]
+    pub outbound: A2aOutboundConfig,
 }
 
 impl Default for A2aConfig {
@@ -132,6 +136,7 @@ impl Default for A2aConfig {
             tls_key: None,
             card: A2aCardConfig::default(),
             peers: HashMap::new(),
+            outbound: A2aOutboundConfig::default(),
         }
     }
 }
@@ -155,6 +160,7 @@ impl A2aConfig {
         self.validate_public_url()?;
         self.validate_tls()?;
         self.validate_peers()?;
+        self.validate_outbound()?;
         if self.max_concurrent_tasks == 0 {
             anyhow::bail!(
                 "[a2a] max_concurrent_tasks must be at least 1 (0 would refuse every task)"
@@ -175,13 +181,11 @@ impl A2aConfig {
             .map(str::trim)
             .filter(|u| !u.is_empty())
         {
-            let lower = url.to_ascii_lowercase();
-            if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-                bail!(
-                    "[a2a].public_url = {url:?} is not an http(s) URL; the Agent Card advertises \
-                     it verbatim, so peers could not reach this agent. Use e.g. \
-                     \"https://rustfox.example.com:8443\"."
-                );
+            let parsed = url
+                .parse::<reqwest::Url>()
+                .map_err(|e| anyhow::anyhow!("[a2a].public_url = {url:?} is malformed: {e}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                bail!("[a2a].public_url = {url:?} must be an http(s) URL with a host");
             }
         }
         Ok(())
@@ -261,6 +265,14 @@ impl A2aConfig {
         Ok(())
     }
 
+    fn validate_outbound(&self) -> Result<()> {
+        let mut names: Vec<&String> = self.outbound.peers.keys().collect();
+        names.sort();
+        for name in names {
+            self.outbound.peers[name].validate(name)?;
+        }
+        Ok(())
+    }
     fn warn_on_non_loopback_bind(&self) {
         match self.bind.parse::<SocketAddr>() {
             Ok(addr) if !addr.ip().is_loopback() => {
@@ -300,6 +312,71 @@ impl Default for A2aCardConfig {
             description: "Self-hosted Telegram AI assistant".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct A2aOutboundConfig {
+    #[serde(default)]
+    pub peers: HashMap<String, A2aOutboundPeerConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default)]
+pub struct A2aOutboundPeerConfig {
+    pub url: String,
+    pub token: String,
+    pub timeout_secs: u64,
+    pub poll_interval_ms: u64,
+    pub poll_timeout_secs: u64,
+}
+
+impl fmt::Debug for A2aOutboundPeerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("A2aOutboundPeerConfig")
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .field("timeout_secs", &self.timeout_secs)
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("poll_timeout_secs", &self.poll_timeout_secs)
+            .finish()
+    }
+}
+impl Default for A2aOutboundPeerConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
+            timeout_secs: 30,
+            poll_interval_ms: 250,
+            poll_timeout_secs: 60,
+        }
+    }
+}
+
+impl A2aOutboundPeerConfig {
+    pub fn validate(&self, name: &str) -> Result<()> {
+        let parsed = self
+            .url
+            .trim()
+            .parse::<reqwest::Url>()
+            .map_err(|e| anyhow::anyhow!("A2A outbound peer '{name}' url is malformed: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!("A2A outbound peer '{name}' url must be an http(s) URL with a host");
+        }
+        if self.token.trim().is_empty() {
+            bail!("A2A outbound peer '{name}' token must not be empty");
+        }
+        if self.timeout_secs < 1 {
+            bail!("A2A outbound peer '{name}' timeout_secs must be at least 1");
+        }
+        if self.poll_interval_ms < 1 {
+            bail!("A2A outbound peer '{name}' poll_interval_ms must be at least 1");
+        }
+        if self.poll_timeout_secs < 1 {
+            bail!("A2A outbound peer '{name}' poll_timeout_secs must be at least 1");
+        }
+        Ok(())
     }
 }
 
