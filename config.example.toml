@@ -337,7 +337,31 @@ Be concise and helpful."""
 # [web]
 # enabled = false
 # bind = "127.0.0.1:8787"
-# public_url = ""            # e.g. "https://haos.example.com"; enables Secure cookies
+# public_url = ""            # e.g. "https://haos.example.com"
+#                            # https here adds `Secure` to the session cookie.
+#                            # Leave it unset and the cookie has NO Secure flag,
+#                            # even behind a TLS proxy. It is also the host the
+#                            # dashboard answers to: a request whose Host header
+#                            # is neither this host nor the bound address (nor
+#                            # localhost / 127.0.0.1 / [::1] on the bound port)
+#                            # is refused with 403, so a non-loopback bind that
+#                            # is reached by name must set this.
 # session_ttl_hours = 12
 # allow_ips = []             # empty = any source IP; non-empty = strict allowlist
 #                            # entries may be single IPs or CIDR ranges
+#
+# WARNING — allow_ips, read this before setting it:
+#
+#  * The list is enforced before authentication, on every route including the
+#    login page and the static assets. A source outside it gets 403 and nothing
+#    else. That includes bearer-token callers: the IP gate runs BEFORE bearer
+#    auth, so a valid token from a non-listed address is still refused.
+#  * A non-empty list can lock YOU out. If you save one from the dashboard that
+#    does not cover the address you are browsing from, the next request — the
+#    one that would fix it — is the one that gets 403, and the dashboard is
+#    unreachable until the process restarts and reloads this file.
+#  * Editing the list from the dashboard (`PUT /api/settings/allow-ips`) is
+#    IN-MEMORY ONLY. It does not rewrite this file, so a restart restores
+#    whatever is written here. To make a change permanent, edit this file.
+#  * Entries are matched by address family: an IPv4 rule never matches an IPv6
+#    source and vice versa, so `::/0` does not admit an IPv4 client.

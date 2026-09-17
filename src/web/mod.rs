@@ -42,12 +42,33 @@ const STYLE_CSS: &str = include_str!("assets/style.css");
 /// Build the dashboard router. Separated from `spawn` so tests can drive the
 /// router without binding a socket.
 ///
-/// `routes::public_router()` is merged **outside** the guard layer: a route
-/// mounted there is reachable without a session, which is exactly what login
-/// needs and exactly what every other route must not have. `/api/auth/login`
-/// is the only route on it, and it re-applies the source-IP gate and the CSRF
-/// check itself — the guard does not run for it at all.
-pub fn router(state: WebState) -> Router {
+/// Three layers, and where each one is applied is a security boundary:
+///
+/// * `host_and_headers` wraps **everything**, so no route — static, login or
+///   protected — answers a request whose `Host` is not this dashboard's.
+/// * `public_router` (login) and the static assets are wrapped in their own
+///   gates. Login is reachable without a session because it *mints* sessions,
+///   so it re-applies the source-IP gate and the CSRF check as a layer. The
+///   static assets are compile-time constants, so they take the IP gate alone.
+/// * Everything else is mounted **inside** `guard`, which adds the
+///   session/bearer check on top of the same IP and CSRF gates.
+///
+/// `bound` is the address the listener actually holds, not `config.bind`:
+/// tests bind `127.0.0.1:0`, so the accepted `Host` port has to come from the
+/// bound `SocketAddr` or it would be `0`.
+pub fn router(state: WebState, bound: SocketAddr) -> Router {
+    let allowed_hosts = middleware::AllowedHosts::new(&state.config, bound);
+
+    // Static assets: no session, no CSRF, but the allowlist still applies.
+    let assets = Router::new()
+        .route("/", get(serve_index))
+        .route("/app.js", get(serve_app_js))
+        .route("/style.css", get(serve_style_css))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::ip_gate,
+        ));
+
     let protected =
         Router::new()
             .merge(routes::router())
@@ -57,11 +78,13 @@ pub fn router(state: WebState) -> Router {
             ));
 
     Router::new()
-        .route("/", get(serve_index))
-        .route("/app.js", get(serve_app_js))
-        .route("/style.css", get(serve_style_css))
-        .merge(routes::public_router())
+        .merge(assets)
+        .merge(routes::public_router(state.clone()))
         .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_hosts,
+            middleware::host_and_headers,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -151,11 +174,29 @@ pub async fn spawn(
         );
     }
 
+    // A non-loopback bind is only reachable by name, and a name is not in the
+    // accepted `Host` set unless `public_url` says so. Warn rather than reject:
+    // the operator may legitimately be using a literal address.
+    let has_public_url = state
+        .config
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty());
+    if !addr.ip().is_loopback() && !has_public_url {
+        tracing::warn!(
+            %addr,
+            "web: the dashboard is bound to a non-loopback address with no [web].public_url set; \
+             requests whose Host is not the bound address, localhost, 127.0.0.1 or [::1] are \
+             refused with 403, so a browser reaching it by name will be rejected"
+        );
+    }
+
     tracing::info!("  Web dashboard: http://{addr}");
     tokio::spawn(async move {
         if let Err(e) = axum::serve(
             listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
         {
@@ -167,25 +208,34 @@ pub async fn spawn(
 }
 
 /// Build and bind a dashboard for tests, with a throwaway home directory and
-/// without an `Agent` or a `Supervisor`.
+/// without an `Agent` or a `Supervisor`, using the default configuration.
 ///
 /// `into_make_service_with_connect_info` is not optional: the guard's
 /// `ConnectInfo<SocketAddr>` extractor fails without it, and every request
 /// would answer 500.
 #[doc(hidden)]
 pub async fn spawn_for_test(home: PathBuf) -> Result<(SocketAddr, ())> {
-    let config = WebConfig {
-        enabled: true,
-        bind: "127.0.0.1:0".to_string(),
-        ..Default::default()
-    };
+    spawn_for_test_with(home, WebConfig::default()).await
+}
+
+/// [`spawn_for_test`] with a caller-supplied configuration.
+///
+/// This exists because `spawn_for_test` hardcodes the default `WebConfig`: a
+/// regression that hardcoded, say, `secure = false` on the session cookie would
+/// keep every integration test green, since not one of them could configure a
+/// `public_url`. `enabled` is forced on and the listener always binds
+/// `127.0.0.1:0` — a fixed port would make the suite flaky — but `public_url`,
+/// `allow_ips` and `session_ttl_hours` are honoured exactly as given.
+#[doc(hidden)]
+pub async fn spawn_for_test_with(home: PathBuf, mut config: WebConfig) -> Result<(SocketAddr, ())> {
+    config.enabled = true;
     let state = build_state(config, home, None, None)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await;
     });

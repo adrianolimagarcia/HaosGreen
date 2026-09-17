@@ -835,12 +835,72 @@
     }
 
     /**
-     * Warn when a non-empty draft has no loopback entry.
+     * The address family of the address this browser is talking to, or null
+     * when the host is a name rather than a literal address.
+     *
+     * `IpGate::permits` is family-strict: an IPv4 rule can never match an IPv6
+     * peer and vice versa. A literal host settles the question, because the
+     * browser has to reach it over that family; a name (`localhost`, a DNS
+     * name) does not, because it may resolve to either.
+     */
+    function peerFamily() {
+      const host = String(window.location.hostname || "").replace(/^\[|\]$/g, "");
+      if (host.indexOf(":") !== -1) {
+        return 6;
+      }
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+        return 4;
+      }
+      return null;
+    }
+
+    /**
+     * The address family an allowlist entry applies to, or null when the
+     * server would refuse to parse it at all.
+     *
+     * `IpGate::new` accepts only an `IpNet` or an `IpAddr`, so `localhost` is
+     * not an entry that covers anything — it is a 400 on save.
+     */
+    function entryFamily(entry) {
+      const value = String(entry).trim();
+      const slash = value.indexOf("/");
+      const address = slash === -1 ? value : value.slice(0, slash);
+      if (address.indexOf(":") !== -1) {
+        return 6;
+      }
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(address)) {
+        return 4;
+      }
+      return null;
+    }
+
+    /**
+     * Warn when a non-empty draft cannot cover the address family this browser
+     * is using.
      *
      * Saving such a list locks out a browser running on the same machine until
      * the process restarts, which is exactly the asymmetry the note above
-     * describes. It is a warning derived from what the operator typed, not a
-     * claim about the network.
+     * describes. It is a warning derived from what the operator typed and from
+     * the address this page was loaded from, not a claim about the network.
+     *
+     * The earlier version of this check listed `::/0` and `127.0.0.0/8` in one
+     * "loopback" set, which hid the lockout in both directions: an operator
+     * browsing over IPv4 who saved only `::/0` saw no warning and was locked
+     * out, because an IPv6 rule never matches an IPv4 peer. It also treated
+     * `localhost` as coverage, which is wrong twice over — the server cannot
+     * parse it, so the save returned 400 instead of locking anyone out.
+     *
+     * What this checks is *family* coverage, which is the strongest statement
+     * the browser can make: it knows the family of the address it connected to
+     * (a literal host settles it, a name does not) but not its own source
+     * address, which is the address `IpGate::permits` actually compares. So a
+     * draft holding `10.0.0.0/8` while this page is loaded from `127.0.0.1`
+     * does not warn: an IPv4 entry is present, and whether it covers this
+     * source is a question only the server can answer.
+     *
+     * When the family cannot be determined (a name, not a literal address) the
+     * warning fires unless the draft covers both families: a missed warning
+     * costs a restart, a spurious one costs a sentence.
      */
     function renderCaution() {
       const draft = state.allowDraft;
@@ -848,18 +908,34 @@
         setStatus(caution, null, "");
         return;
       }
-      const loopback = ["127.0.0.1", "127.0.0.0/8", "::1", "localhost", "0.0.0.0/0", "::/0"];
-      const covered = draft.some(function (entry) {
-        return loopback.indexOf(String(entry).trim().toLowerCase()) !== -1;
-      });
+
+      const family = peerFamily();
+      const families = draft.map(entryFamily);
+      const covered =
+        family === null
+          ? families.indexOf(4) !== -1 && families.indexOf(6) !== -1
+          : families.indexOf(family) !== -1;
+
       if (covered) {
         setStatus(caution, null, "");
         return;
       }
+
       setStatus(
         caution,
         "warn",
-        "No loopback entry in this list. If you are browsing from this machine, saving it locks this browser out until HaosGreen is restarted."
+        family === null
+          ? "This page was loaded from " +
+              window.location.hostname +
+              ", which is a name, so this browser's address family cannot be determined here. " +
+              "Allowlist rules match one address family only, so a list with entries of a single " +
+              "family may lock this browser out until HaosGreen is restarted."
+          : "No IPv" +
+              family +
+              " entry in this list. Allowlist rules match one address family only — an IPv4 rule " +
+              "never matches an IPv6 source, and an IPv6 rule never matches an IPv4 source — so if " +
+              "you are browsing from this machine, saving this list locks this browser out until " +
+              "HaosGreen is restarted."
       );
     }
 
@@ -872,6 +948,17 @@
       const value = input.value.trim();
       if (!value) {
         setStatus(status, "error", "Enter an address or a CIDR range before adding it.");
+        return;
+      }
+      // The server parses entries with `ipnet`: an `IpNet` or an `IpAddr`, and
+      // nothing else. `localhost` is a host name, so accepting it here only
+      // guaranteed a 400 on save.
+      if (String(value).toLowerCase() === "localhost") {
+        setStatus(
+          status,
+          "error",
+          "localhost is a host name, not an address. Use 127.0.0.1 or ::1."
+        );
         return;
       }
       if (state.allowDraft.indexOf(value) !== -1) {

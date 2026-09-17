@@ -17,11 +17,98 @@
 /// The `TempDir` is returned so it outlives the server: dropping it would
 /// delete `web-auth.toml` underneath a running listener.
 async fn spawn_test_server() -> (String, tempfile::TempDir) {
+    spawn_test_server_with(haos_green::config::WebConfig::default()).await
+}
+
+/// Start the dashboard with a caller-supplied configuration.
+///
+/// `spawn_for_test` hardcodes the default `WebConfig`, so without this entry
+/// point no test in this file could set a `public_url` — and a regression that
+/// hardcoded `secure = false` on the session cookie would keep all of them
+/// green.
+async fn spawn_test_server_with(
+    config: haos_green::config::WebConfig,
+) -> (String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let (addr, _handle) = haos_green::web::spawn_for_test(dir.path().to_path_buf())
+    let (addr, _handle) = haos_green::web::spawn_for_test_with(dir.path().to_path_buf(), config)
         .await
         .expect("dashboard should start");
     (format!("http://{addr}"), dir)
+}
+
+/// The socket address behind a `http://host:port` base URL.
+fn socket_addr(base: &str) -> std::net::SocketAddr {
+    base.strip_prefix("http://")
+        .expect("the test base URL is http://")
+        .parse()
+        .expect("the test base URL carries a socket address")
+}
+
+/// Send a hand-written HTTP/1.1 request and return the raw response text.
+///
+/// `reqwest` derives `Host` from the URL and offers no way to lie about it, so
+/// the only way to exercise the `Host` check is to write the request by hand.
+/// `Connection: close` makes the server close, which is what ends the read.
+async fn raw_request(addr: std::net::SocketAddr, request: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+/// The status code from the first line of a raw HTTP response.
+fn raw_status(response: &str) -> u16 {
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {response:?}"))
+}
+
+/// Assert the four headers every response must carry.
+fn assert_security_headers(response: &reqwest::Response) {
+    let headers = response.headers();
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    assert_eq!(
+        header("content-security-policy"),
+        "default-src 'self'; frame-ancestors 'none'",
+        "every response must carry the CSP"
+    );
+    assert_eq!(header("x-frame-options"), "DENY");
+    assert_eq!(header("x-content-type-options"), "nosniff");
+    assert_eq!(header("referrer-policy"), "no-referrer");
+}
+
+/// Replace the live allowlist with `entries` and assert the update succeeded.
+///
+/// Every test that needs a denied source has to get there through this: the
+/// gate is only reachable from an authenticated request while the list is still
+/// empty.
+async fn replace_allow_ips(base: &str, cookie: &str, entries: &[&str]) {
+    let resp = reqwest::Client::new()
+        .put(format!("{base}/api/settings/allow-ips"))
+        .header("x-haos-green-csrf", "1")
+        .header(reqwest::header::COOKIE, cookie)
+        .json(&serde_json::json!({ "allow_ips": entries }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the allowlist update itself must be allowed"
+    );
 }
 
 /// The session cookie (name=value only) from a login response.
@@ -119,6 +206,56 @@ async fn a_mutating_request_with_the_csrf_header_still_needs_a_session() {
         401,
         "passing the CSRF check must not bypass authentication"
     );
+}
+
+#[tokio::test]
+async fn every_protected_route_refuses_an_unauthenticated_caller() {
+    let (base, _dir) = spawn_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Every route on the guarded router — including the two that were never
+    // exercised without a session before (`logout` and `bearer`). The CSRF
+    // header is sent on all of them so the request reaches the authentication
+    // check rather than being stopped by the CSRF gate first: this test is
+    // about authentication.
+    let cases: [(&str, &str, Option<serde_json::Value>); 5] = [
+        ("GET", "/api/settings", None),
+        (
+            "POST",
+            "/api/settings/password",
+            Some(serde_json::json!({"current": "admin", "new": "x"})),
+        ),
+        (
+            "POST",
+            "/api/settings/bearer",
+            Some(serde_json::json!({"enabled": true})),
+        ),
+        (
+            "PUT",
+            "/api/settings/allow-ips",
+            Some(serde_json::json!({"allow_ips": []})),
+        ),
+        ("POST", "/api/auth/logout", None),
+    ];
+
+    for (method, path, body) in cases {
+        let mut request = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{base}{path}"),
+            )
+            .header("x-haos-green-csrf", "1");
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            401,
+            "{method} {path} without a session must be 401, got {}",
+            response.status()
+        );
+    }
 }
 
 // ── Login and logout ────────────────────────────────────────────────────────
@@ -227,6 +364,50 @@ async fn the_session_cookie_is_httponly_strict_and_path_scoped() {
     );
 }
 
+/// An https `public_url` must put `Secure` on the session cookie.
+///
+/// This is the only test that can catch it: every other test in this file runs
+/// on the default configuration, where `public_url` is unset, so a regression
+/// that hardcoded `secure = false` — or that ignored `public_url` entirely —
+/// would leave all of them green. It is also the reason
+/// `spawn_for_test_with` exists.
+#[tokio::test]
+async fn an_https_public_url_puts_secure_on_the_session_cookie() {
+    let config = haos_green::config::WebConfig {
+        public_url: Some("https://haos.example.com".to_string()),
+        ..Default::default()
+    };
+    let (base, _dir) = spawn_test_server_with(config).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/auth/login"))
+        .header("x-haos-green-csrf", "1")
+        .json(&serde_json::json!({"username": "admin", "password": "admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "login must still work behind the proxy");
+
+    let raw = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("haos_session="))
+        .expect("login must set haos_session")
+        .to_string();
+
+    assert!(
+        raw.contains("; Secure"),
+        "an https public_url must mark the session cookie Secure, got {raw:?}"
+    );
+    assert!(raw.contains("HttpOnly"), "cookie must stay HttpOnly: {raw}");
+    assert!(
+        raw.contains("SameSite=Strict"),
+        "cookie must stay SameSite=Strict: {raw}"
+    );
+}
+
 #[tokio::test]
 async fn logout_invalidates_the_session() {
     let (base, _dir) = spawn_test_server().await;
@@ -258,7 +439,7 @@ async fn logout_invalidates_the_session() {
 async fn repeated_wrong_passwords_lock_the_source_out() {
     let (base, _dir) = spawn_test_server().await;
     let client = reqwest::Client::new();
-    let mut last = 0;
+    let mut statuses = Vec::new();
     for _ in 0..6 {
         let resp = client
             .post(format!("{base}/api/auth/login"))
@@ -267,11 +448,21 @@ async fn repeated_wrong_passwords_lock_the_source_out() {
             .send()
             .await
             .unwrap();
-        last = resp.status().as_u16();
+        statuses.push(resp.status().as_u16());
     }
+
+    // The first five attempts must be answered 401, not 429. Asserting only the
+    // sixth status would also pass for a limiter that refused everything from
+    // the first request — a denial of service on the operator, and a change no
+    // one would notice from the last element alone.
     assert_eq!(
-        last, 429,
-        "the source must be rate limited after repeated failures"
+        &statuses[..5],
+        [401, 401, 401, 401, 401],
+        "the attempts below the threshold must be 401: {statuses:?}"
+    );
+    assert_eq!(
+        statuses[5], 429,
+        "the source must be rate limited after repeated failures: {statuses:?}"
     );
 }
 
@@ -481,8 +672,10 @@ async fn enabling_bearer_returns_the_token_exactly_once() {
         .await
         .unwrap();
     assert!(
-        again["token"].is_null(),
-        "the bearer token must not be readable"
+        again.get("token").is_none(),
+        "the bearer token must not be readable. `again[\"token\"].is_null()` would \
+         also pass for a response carrying an explicit `\"token\": null`, which is \
+         a shape no client should have to handle: {again}"
     );
 }
 
@@ -732,6 +925,68 @@ async fn a_source_outside_the_allowlist_cannot_attempt_a_login() {
     );
 }
 
+/// A denied source must be refused before its body is parsed.
+///
+/// The IP gate and the CSRF check used to live in the login handler, and every
+/// extractor runs before a handler body — so a denied source got its 415/400/422
+/// from `Json` first, including a 422 whose body names the expected fields, and
+/// could make the server parse up to 2 MB of JSON per request without consuming
+/// a rate-limit slot. As a layer, the gate runs first and the answer is 403 for
+/// whatever was sent.
+#[tokio::test]
+async fn a_disallowed_source_is_refused_before_its_body_is_parsed() {
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    replace_allow_ips(&base, &cookie, &["10.0.0.0/8"]).await;
+
+    let client = reqwest::Client::new();
+    let bodies = [
+        // Valid JSON, wrong shape: without the layer this is a 422 naming the
+        // fields the handler expects.
+        ("application/json", "{}".to_string()),
+        // Not JSON at all: without the layer this is a 400.
+        ("application/json", "not json".to_string()),
+        // No content type: without the layer this is a 415.
+        ("text/plain", "username=admin&password=admin".to_string()),
+    ];
+
+    for (content_type, body) in bodies {
+        let response = client
+            .post(format!("{base}/api/auth/login"))
+            .header("x-haos-green-csrf", "1")
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "a denied source must get 403 for {content_type} {body:?}, not an \
+             extractor error, got {}",
+            response.status()
+        );
+    }
+}
+
+/// The same ordering for CSRF: a missing header is a 403, not a 422.
+#[tokio::test]
+async fn a_login_without_the_csrf_header_is_forbidden_before_parsing() {
+    let (base, _dir) = spawn_test_server().await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/auth/login"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        403,
+        "the CSRF layer must run before the Json extractor"
+    );
+}
+
 // ── Static assets ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -776,4 +1031,146 @@ async fn the_embedded_assets_are_served_with_their_content_types() {
         css_type.contains("text/css"),
         "style.css must be served as text/css, got {css_type:?}"
     );
+}
+
+/// The static assets are behind the source-IP allowlist too.
+///
+/// They are merged on the root router rather than on the guarded one — they
+/// need no session and no CSRF header, because they are compile-time constants
+/// with no per-user data — so without an explicit gate a source outside
+/// `allow_ips` still received the whole dashboard shell. The UI states that a
+/// non-empty list refuses "every other source … before authentication runs —
+/// including the login page", and design spec §4.4 claims strict enforcement;
+/// both claims were overstated while `/` answered 200.
+#[tokio::test]
+async fn the_static_assets_are_refused_to_a_source_outside_the_allowlist() {
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    replace_allow_ips(&base, &cookie, &["10.0.0.0/8"]).await;
+
+    let client = reqwest::Client::new();
+    for path in ["/", "/app.js", "/style.css"] {
+        let response = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "GET {path} must be refused to a source outside allow_ips, got {}",
+            response.status()
+        );
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("HaosGreen") && !body.contains("haos_session"),
+            "GET {path} must not leak the shell to a refused source: {body:?}"
+        );
+    }
+}
+
+// ── Host validation and security headers ────────────────────────────────────
+
+/// A request whose `Host` is not this dashboard's is refused.
+///
+/// The DNS-rebinding case: the dashboard binds to loopback and ships with
+/// `admin`/`admin`, so an attacker page whose hostname re-resolves to
+/// `127.0.0.1` reaches it from the operator's own browser. The request arrives
+/// over loopback, so `allow_ips` cannot see it, and the CSRF header is no
+/// obstacle because the attacker's JavaScript is same-origin with the rebound
+/// hostname. `Host` is the one thing the browser will not let the attacker
+/// forge — so it is the check.
+#[tokio::test]
+async fn a_request_with_a_foreign_host_header_is_forbidden() {
+    let (base, _dir) = spawn_test_server().await;
+    let addr = socket_addr(&base);
+
+    // The rebound page is served on the same port, which is what makes it
+    // same-origin with the dashboard it is attacking.
+    for host in [
+        format!("evil.example:{}", addr.port()),
+        "evil.example".to_string(),
+        // Neither a suffix nor a prefix of an accepted host may match.
+        format!("127.0.0.1.evil.example:{}", addr.port()),
+        format!("evil.example.127.0.0.1:{}", addr.port()),
+        // A loopback literal on the wrong port is a different origin.
+        "127.0.0.1:1".to_string(),
+    ] {
+        let response = raw_request(
+            addr,
+            &format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(
+            raw_status(&response),
+            403,
+            "Host: {host} must be refused, got {response:?}"
+        );
+    }
+}
+
+/// ...and the hosts a browser actually sends for this listener are accepted.
+#[tokio::test]
+async fn a_request_with_an_accepted_host_header_succeeds() {
+    let (base, _dir) = spawn_test_server().await;
+    let addr = socket_addr(&base);
+
+    for host in [
+        format!("127.0.0.1:{}", addr.port()),
+        format!("localhost:{}", addr.port()),
+        format!("[::1]:{}", addr.port()),
+    ] {
+        let response = raw_request(
+            addr,
+            &format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(
+            raw_status(&response),
+            200,
+            "Host: {host} must be accepted, got {response:?}"
+        );
+    }
+}
+
+/// A request with no `Host` at all cannot be checked, so it is refused.
+#[tokio::test]
+async fn a_request_without_a_host_header_is_forbidden() {
+    let (base, _dir) = spawn_test_server().await;
+    let addr = socket_addr(&base);
+    let response = raw_request(addr, "GET / HTTP/1.0\r\n\r\n").await;
+    assert_eq!(
+        raw_status(&response),
+        403,
+        "a request with no Host cannot be validated and must be refused: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_security_headers_are_on_static_and_authenticated_responses() {
+    let (base, _dir) = spawn_test_server().await;
+    let client = reqwest::Client::new();
+
+    // A static asset, with no session.
+    let shell = client.get(&base).send().await.unwrap();
+    assert_eq!(shell.status(), 200);
+    assert_security_headers(&shell);
+
+    // An authenticated API response.
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let settings = client
+        .get(format!("{base}/api/settings"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(settings.status(), 200);
+    assert_security_headers(&settings);
+
+    // The login response itself, which is the one that carries a credential.
+    let login = client
+        .post(format!("{base}/api/auth/login"))
+        .header("x-haos-green-csrf", "1")
+        .json(&serde_json::json!({"username": "admin", "password": "admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    assert_security_headers(&login);
 }

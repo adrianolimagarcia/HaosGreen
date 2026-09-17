@@ -43,7 +43,11 @@ optional features:
 
 - Default bind is `127.0.0.1`. Exposing the dashboard requires an explicit
   `bind` change, and a non-loopback bind logs a startup warning.
-- Login is rate limited per source IP with exponential backoff and lockout.
+- Login is rate limited per source IP: the first five failures are answered
+  `401`, the sixth starts a 5 s lockout that doubles on every further failure
+  and saturates at the 300 s window (§4.5). A successful login clears it.
+- Every request must carry a `Host` header naming this dashboard, and every
+  response carries a restrictive CSP and `X-Frame-Options: DENY` (§4.5.1).
 - A persistent, non-dismissible banner is shown in the UI while the password
   equals the default.
 - A warning is logged at every startup while the password equals the default.
@@ -131,7 +135,10 @@ shows a fingerprint, never the value.
 - Session id: 256 bits from a CSPRNG.
 - Server-side store with TTL (`session_ttl_hours`, default 12).
 - Cookie: `HttpOnly; SameSite=Strict; Path=/`, plus `Secure` when `public_url`
-  is https.
+  is https. An unset `public_url` means **no** `Secure` flag — the bound
+  address cannot settle whether the deployment is https (the same loopback
+  listener is https behind a TLS proxy and plain HTTP without one), so an https
+  deployment must set `public_url`.
 - Logout removes the session server-side; expiry is enforced on every request.
 
 ### 4.3 CSRF
@@ -157,10 +164,89 @@ A2A fails closed on an empty list because it has no other credential. The
 dashboard has a password, so an empty list is not a silent hole — but the UI
 states the difference explicitly so an operator is never misled.
 
+"Denied before authentication runs" covers **every** route, not only the
+protected ones: `/api/auth/login` and the three static assets (`/`, `/app.js`,
+`/style.css`) are each wrapped in the gate as a layer of their own, so a source
+outside the list receives 403 and no body — not the login page, not the shell,
+and not an extractor error describing the expected request shape. The gate also
+runs **before bearer authentication**, so a valid bearer token presented from a
+non-listed address is refused like any other request from that address.
+
+Entries are matched by **address family**: `ipnet` never matches an IPv4 rule
+against an IPv6 peer, and `IpGate::permits` makes that explicit for
+IPv4-mapped addresses (`::ffff:10.0.0.1` does not match `10.0.0.0/8`). An
+operator who lists only `::/0` and browses over IPv4 is locked out.
+
+Changing the list from the dashboard is **in-memory only**: `PUT
+/api/settings/allow-ips` replaces the live gate and does not rewrite
+`config.toml`, so a restart restores the configured list. A list that excludes
+the operator's own address locks them out until that restart.
+
+#### 4.4.1 The reverse-proxy caveat
+
+The gate keys on the **real socket peer address** (`ConnectInfo<SocketAddr>`),
+never on `X-Forwarded-For` or any other client-supplied header — a header an
+attacker can set is not an access control. The consequence is that behind a
+TLS-terminating reverse proxy every client arrives from the proxy's address:
+
+- the allowlist cannot distinguish one client from another; it either admits
+  the proxy (and therefore everyone it serves) or refuses all of them;
+- the login limiter has the same blind spot — see §4.5.
+
+Running the dashboard behind a proxy therefore does not narrow access; the
+password and the bearer token remain the only per-client controls. If the
+proxy is the deployment model, treat the allowlist as a proxy-level control and
+enforce it there instead.
+
 ### 4.5 Login rate limiting
 
-Per source IP: exponential backoff after repeated failures, with a lockout
-window. Successful authentication clears the counter. Lockouts are logged.
+Per source IP, keyed on the same real socket peer address as §4.4. The
+implementation (`web::auth`), stated exactly:
+
+- The first **five** failed attempts from one source are answered `401`.
+- The **sixth** attempt is answered `429`: the lockout is 5 s, and it **doubles
+  on every further failure** (10 s, 20 s, 40 s, 80 s, 160 s, …), saturating at
+  the **300 s** lockout window from the eleventh failure onward. The check runs
+  before the password is verified, so a locked-out source cannot spend Argon2
+  work or probe passwords.
+- The failure counter is cleared by a successful login, or by 300 s passing
+  with no failures at all. Serving a lockout does **not** reset it — resetting
+  would flatten the backoff into "five guesses every five seconds", which is
+  weaker than a flat lockout.
+- The limiter remembers at most 1024 distinct sources, evicting the least
+  recently failed one, so varying the source cannot grow it without bound.
+- Lockouts are logged, and the `429` body reports the remaining delay in
+  seconds.
+
+**Behind a reverse proxy every client shares one address**, so this limiter is
+per *proxy*, not per client: five bad passwords from anyone lock out everyone,
+including the operator. That is the price of keying on an address the client
+cannot forge, and it is the reason §4.4.1 recommends enforcing the allowlist at
+the proxy instead.
+
+### 4.5.1 Host validation and response headers
+
+Two controls apply to every response, on every route:
+
+- **`Host` validation.** A request whose `Host` header is neither the
+  configured `public_url` host nor the bound address (`localhost`,
+  `127.0.0.1` and `[::1]` are accepted on the bound port) is refused with 403,
+  including a request with no `Host` at all. This is the DNS-rebinding defence:
+  the dashboard binds to loopback and ships with `admin`/`admin`, so an attacker
+  page whose hostname re-resolves to `127.0.0.1` reaches it from the operator's
+  own browser over loopback — where the allowlist sees nothing — and its
+  JavaScript is same-origin with the rebound hostname, so the CSRF header is no
+  obstacle. `Host` is derived from the URL and is the one thing the browser will
+  not let that page forge.
+- **Response headers.** `Content-Security-Policy: default-src 'self';
+  frame-ancestors 'none'`, `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`, on
+  every response including 403s. The CSP is compatible with the shipped shell
+  because it contains no inline script, style, or event-handler attribute.
+
+A non-loopback `bind` without `public_url` logs a startup warning: the listener
+answers only to the bound address and the loopback names, so a browser reaching
+it by name is refused.
 
 ### 4.6 Chat privilege — stated plainly
 
@@ -365,6 +451,13 @@ allow_ips = []             # empty = any source IP; non-empty = strict allowlist
 `public_url` without a scheme, `session_ttl_hours` of 0, and an unparseable
 allowlist entry. Validation failure means the listener is **not** started; the
 Telegram bot still runs. Secrets live in `<home>/web-auth.toml`, never here.
+
+`allow_ips` set from the dashboard (`PUT /api/settings/allow-ips`) is held **in
+memory only** — it never rewrites this file, so a restart restores the
+configured list, and a list that excludes the operator's own address locks them
+out until that restart (§4.4). `public_url` is both the `Secure`-cookie switch
+and the host the dashboard answers to (§4.5.1); a non-loopback `bind` without it
+logs a startup warning.
 
 ---
 

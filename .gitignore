@@ -1,5 +1,12 @@
 /target
 config.toml
+
+# Dashboard credentials (Argon2 password hash + bearer token hash). Lives in
+# the home directory, which `general.home = "."` resolves to the working
+# directory — so it would otherwise be one `git add -A` away from being
+# committed.
+web-auth.toml
+
 *.swp
 *.swo
 .env

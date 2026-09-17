@@ -5,19 +5,24 @@
 //! * [`router`] holds everything that requires an authenticated session. It is
 //!   mounted **inside** the `guard` layer.
 //! * [`public_router`] holds everything that must be reachable without a
-//!   session. It is mounted **outside** the `guard` layer, which means a
-//!   handler mounted there is responsible for its own CSRF check.
+//!   session. It takes the `WebState` because it wraps itself in
+//!   `middleware::public_guard` — the source-IP gate and the CSRF check — before
+//!   returning. That guard is a layer, not a call inside each handler, so it
+//!   runs *before* axum's extractors: a denied source is refused without the
+//!   request body being parsed at all.
 //!
 //! The only route on the public router is `/api/auth/login`: it mints sessions
-//! and therefore cannot require one. Adding a route to `public_router` without
-//! its own `middleware::csrf_ok` check silently reopens CSRF on a route that
-//! hands out credentials.
+//! and therefore cannot require one. The layering lives in this module rather
+//! than at the call site so that adding a route here cannot accidentally skip
+//! the gate — a handler mounted on the public router is covered the moment it
+//! is added.
 
 pub mod auth_routes;
 pub mod settings;
 
 use axum::Router;
 
+use crate::web::middleware;
 use crate::web::state::WebState;
 
 /// Guarded routes: everything that requires a session or a bearer token.
@@ -31,7 +36,11 @@ pub fn router() -> Router<WebState> {
         .merge(settings::router())
 }
 
-/// Routes reachable without a session.
-pub fn public_router() -> Router<WebState> {
-    auth_routes::public_router()
+/// Routes reachable without a session, already wrapped in the IP and CSRF
+/// gates.
+pub fn public_router(state: WebState) -> Router<WebState> {
+    auth_routes::public_router().layer(axum::middleware::from_fn_with_state(
+        state,
+        middleware::public_guard,
+    ))
 }

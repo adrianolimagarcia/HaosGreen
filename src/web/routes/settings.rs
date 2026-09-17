@@ -22,7 +22,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::web::auth::{verify_password, IpGate};
+use crate::web::auth::{hash_password_async, verify_password_async, IpGate};
 use crate::web::state::WebState;
 
 pub fn router() -> Router<WebState> {
@@ -130,31 +130,63 @@ async fn change_password(
             .into_response();
     }
 
-    let Ok(mut creds) = state.credentials.lock() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "credentials unavailable").into_response();
+    // Clone the stored hash out of the guard and drop the guard *before*
+    // awaiting. Two independent reasons: `std::sync::MutexGuard` is not `Send`,
+    // so a guard alive across the `.await` does not compile; and the guard's
+    // bearer path takes this same mutex on every request, so holding it across
+    // ~100 ms of Argon2 (verify + hash) stalled every concurrent request.
+    let stored_hash = {
+        let Ok(creds) = state.credentials.lock() else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "credentials unavailable").into_response();
+        };
+        let stored_hash = creds.password_hash.clone();
+        drop(creds);
+        stored_hash
     };
 
-    if !verify_password(&body.current, &creds.password_hash) {
+    if !verify_password_async(&body.current, &stored_hash).await {
         // No secret material in the message: not the hash, and not the
         // submitted password.
         tracing::warn!("web: rejected a password change, the current password did not match");
         return (StatusCode::FORBIDDEN, "current password is incorrect").into_response();
     }
 
-    // Snapshot first so a hashing or persistence failure leaves memory and the
-    // credential file agreeing with each other. Sessions are deliberately left
-    // alone: the plan requires a password change to keep the operator logged in.
-    let previous = creds.clone();
+    // Hashed outside the lock, then installed under it: `set_password_hash`
+    // exists for exactly this split.
+    let new_hash = match hash_password_async(&body.new).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            tracing::error!(error = %e, "web: password hashing failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not change the password",
+            )
+                .into_response();
+        }
+    };
 
-    if let Err(e) = creds.set_password(&body.new) {
-        *creds = previous;
-        tracing::error!(error = %e, "web: password hashing failed");
+    let Ok(mut creds) = state.credentials.lock() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "credentials unavailable").into_response();
+    };
+
+    // Compare-and-swap. The verification above ran outside the lock, so the
+    // stored hash could have changed between it and this acquisition; without
+    // this check a caller holding only the *old* password could overwrite the
+    // new one. A changed hash means the `current` we verified is stale.
+    if creds.password_hash != stored_hash {
+        tracing::warn!("web: rejected a password change, the password changed underneath it");
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not change the password",
+            StatusCode::CONFLICT,
+            "the password changed while this request was in flight",
         )
             .into_response();
     }
+
+    // Snapshot first so a persistence failure leaves memory and the credential
+    // file agreeing with each other. Sessions are deliberately left alone: the
+    // plan requires a password change to keep the operator logged in.
+    let previous = creds.clone();
+    creds.set_password_hash(&body.new, new_hash);
 
     if let Err(e) = creds.save(&state.credentials_path) {
         *creds = previous;

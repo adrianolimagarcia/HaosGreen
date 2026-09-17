@@ -2307,6 +2307,26 @@ Expected: FAIL — 404.
 
 - [ ] **Step 3: Implement the routes**
 
+**Prerequisites — verified gaps in the current `Supervisor` API.** Before the
+routes below can exist, three things must be added; none of them exist today:
+
+| Missing | Evidence | Needed for |
+|---|---|---|
+| `Supervisor::store()` accessor | `store` is a private field (`src/supervisor/mod.rs:54`); no public getter | `list_recent`, task detail (jobs, transitions) |
+| `Supervisor::cancel(task_id)` | No `cancel` anywhere in `src/supervisor/mod.rs` | `POST .../cancel` |
+| `Supervisor::approve(task_id)` | No `approve` anywhere in `src/supervisor/mod.rs` | `POST .../approve` |
+
+`cancel` and `approve` must go through `state.rs::transition_allowed()` rather
+than writing the state directly — that function is the documented single source
+of truth for the state machine, and a route that bypasses it would let the
+dashboard drive the supervisor into a state the rest of the code treats as a
+bug. Add a unit test per new method proving an illegal transition is refused.
+
+Note that the Telegram dispatcher does not call any supervisor method today
+(CLAUDE.md marks that integration as pending), so these routes are the first
+real caller of `pause`/`resume`/`cancel`/`approve`. Treat that as a signal to
+test the transitions carefully rather than assuming the methods are exercised.
+
 ```
 GET  /api/supervisor/tasks
 GET  /api/supervisor/tasks/{id}

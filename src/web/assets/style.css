@@ -15,11 +15,11 @@
  * Accessibility notes, measured rather than assumed (WCAG 2.1 contrast):
  *   --text        on --bg/--surface : 12.2:1 / 13.1:1   (AAA)
  *   --text        on --accent       :  6.6:1            (AA)
- *   --text-muted  on --surface      :  4.3:1            (below AA 4.5:1)
- *   --danger      on --surface      :  3.5:1            (below AA 4.5:1)
- * Muted and danger are therefore used for marks, tints and non-essential
- * metadata; the text that carries a status message stays in --text and the
- * colour signal comes from the mark and the tinted surface behind it.
+ *   --text-muted  on --bg/--surface :  5.02:1 / 5.37:1  (AA)
+ *   --danger      on --bg/--surface :  5.02:1 / 5.36:1  (AA)
+ * All four clear AA (4.5:1) for body text; the two tokens below the first
+ * block are the darkened ones described next to the palette, not the spec's
+ * original values (4.04:1 and 3.25:1, which did not).
  */
 
 :root {

@@ -311,8 +311,20 @@ pub struct WebConfig {
     /// appear because a config file omitted a key.
     pub enabled: bool,
     pub bind: String,
-    /// Externally reachable URL. When it is https, session cookies get the
-    /// `Secure` flag. Unset means "derive from the bound address".
+    /// Externally reachable URL.
+    ///
+    /// When it is https, session cookies get the `Secure` flag. **Unset means
+    /// no `Secure` flag** — not "derive from the bound address", which is what
+    /// this comment used to claim and what the code has never done. The bound
+    /// address cannot settle it: a listener on `127.0.0.1:8787` behind a
+    /// TLS-terminating proxy is served over https, and the same address
+    /// without a proxy is not, so the only honest default is to leave the flag
+    /// off. An https deployment that omits `public_url` therefore gets a
+    /// session cookie without `Secure`; set it.
+    ///
+    /// It is also the host this dashboard answers to: a request whose `Host`
+    /// header is neither this host nor the bound address (nor `localhost`,
+    /// `127.0.0.1`, `[::1]` on the bound port) is refused with 403.
     pub public_url: Option<String>,
     pub session_ttl_hours: u64,
     /// Empty means any source IP may attempt login. Non-empty is a strict

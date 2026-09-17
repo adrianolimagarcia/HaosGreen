@@ -2,8 +2,10 @@
 //!
 //! The split between [`public_router`] and [`router`] is the whole point of
 //! this module: login mints a session and therefore cannot require one, so it
-//! is mounted outside the `guard` layer and re-applies the CSRF check itself.
-//! Logout requires a session like every other protected route.
+//! is mounted outside the `guard` layer. `routes::public_router` wraps it in
+//! `middleware::public_guard` — the source-IP gate and the CSRF check — as a
+//! *layer*, so both run before axum extracts the JSON body. Logout requires a
+//! session like every other protected route.
 
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -13,8 +15,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use crate::web::auth::verify_password;
-use crate::web::middleware::{csrf_ok, ip_permitted, session_from_cookies, SESSION_COOKIE};
+use crate::web::auth::verify_password_async;
+use crate::web::middleware::{session_from_cookies, SESSION_COOKIE};
 use crate::web::state::WebState;
 
 #[derive(Deserialize)]
@@ -33,8 +35,10 @@ pub struct LoginResponse {
 
 /// Routes reachable **without** a session.
 ///
-/// Mounted outside the `guard` layer by `web::router`, which is why every
-/// handler here has to enforce CSRF for itself.
+/// The caller (`web::routes::public_router`) wraps the result in the IP and
+/// CSRF layers. This function deliberately does not apply them itself: it has
+/// no `WebState` to give the middleware, and the wrapping lives one level up so
+/// that a route added here cannot be mounted without it.
 pub fn public_router() -> Router<WebState> {
     Router::new().route("/api/auth/login", post(login))
 }
@@ -68,27 +72,16 @@ fn expired_session_cookie() -> String {
 async fn login(
     State(state): State<WebState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let ip = addr.ip();
 
-    // This route is outside `guard`, so it re-applies the source-IP gate and
-    // the CSRF check itself, in the order the guard uses them.
-    //
-    // The IP gate first: without it a source outside `allow_ips` could still
-    // reach the one endpoint where passwords are guessed, which is exactly what
-    // design spec §4.4 says must not happen.
-    if !ip_permitted(&state, ip) {
-        tracing::warn!(%ip, "web: rejected a login from a source outside allow_ips");
-        return (StatusCode::FORBIDDEN, "source address not permitted").into_response();
-    }
-
-    // Forgetting this check would silently reopen CSRF on the one route that
-    // hands out sessions.
-    if !csrf_ok(&headers) {
-        return (StatusCode::FORBIDDEN, "missing CSRF header").into_response();
-    }
+    // The source-IP gate and the CSRF check are **not** here: they are applied
+    // by `web::routes::public_router` as a layer, so they run before axum's
+    // `Json` extractor. Written here they would run after it, which handed a
+    // source outside `allow_ips` a 415/400/422 — a 422 that names the expected
+    // fields — and let it make the server parse up to 2 MB of JSON per request
+    // without ever consuming a rate-limit slot.
 
     // The limiter runs before the password is verified, so a locked-out source
     // cannot keep spending Argon2 work (or probing passwords) from here.
@@ -103,18 +96,32 @@ async fn login(
         }
     }
 
-    let (ok, uses_default_password) = {
+    // Copy everything the comparison needs out of the guard, then drop it
+    // before awaiting. Two reasons, in order of severity: `std::sync::MutexGuard`
+    // is not `Send`, so holding it across the `.await` below does not compile;
+    // and the password check is Argon2 on the blocking pool (~50 ms), so a lock
+    // held across it would stall the guard's bearer path — which takes the same
+    // mutex — for every concurrent request.
+    let (user_ok, password_hash, uses_default_password) = {
         let Ok(creds) = state.credentials.lock() else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "credentials unavailable").into_response();
         };
-        let user_ok = creds.username == body.username;
-        let pass_ok = verify_password(&body.password, &creds.password_hash);
-        // `&`, not `&&`: both comparisons always run, so a wrong username and a
-        // wrong password cost the same. With `&&` a wrong username would skip
-        // the Argon2 verification entirely and answer in microseconds, which is
-        // an oracle for "this username is the right one".
-        (user_ok & pass_ok, creds.uses_default_password)
+        // Constant-time, unlike `creds.username == body.username`; see
+        // `Credentials::verify_username`.
+        let user_ok = creds.verify_username(&body.username);
+        let password_hash = creds.password_hash.clone();
+        let uses_default_password = creds.uses_default_password;
+        drop(creds);
+        (user_ok, password_hash, uses_default_password)
     };
+
+    let pass_ok = verify_password_async(&body.password, &password_hash).await;
+
+    // `&`, not `&&`: both comparisons always run, so a wrong username and a
+    // wrong password cost the same. With `&&` a wrong username would skip the
+    // Argon2 verification entirely and answer in microseconds, which is an
+    // oracle for "this username is the right one".
+    let ok = user_ok & pass_ok;
 
     if !ok {
         if let Ok(mut limiter) = state.limiter.lock() {
@@ -129,7 +136,25 @@ async fn login(
         limiter.record_success(ip);
     }
 
-    let session = state.sessions.create();
+    // The store fails closed on a poisoned mutex. Honour the caller contract on
+    // `SessionStore::create`: answer 500 and send **no** `Set-Cookie`. A 200
+    // carrying a session id the store never recorded is an unexplained login
+    // loop — the browser holds a cookie that can never authenticate and every
+    // retry fails the same way.
+    let session = match state.sessions.create() {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "web: the session could not be recorded; refusing to hand out a session"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not create a session",
+            )
+                .into_response();
+        }
+    };
     let secure = state
         .config
         .public_url
