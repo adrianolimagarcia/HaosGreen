@@ -138,7 +138,12 @@ shows a fingerprint, never the value.
 
 `SameSite=Strict` alone is insufficient for a dashboard that mutates state, so
 every mutating method additionally requires the header
-`X-HaosGreen-CSRF: 1`. Requests missing it are rejected before any handler runs.
+`X-Haos-Green-CSRF: 1`. Requests missing it are rejected before any handler runs.
+
+Header names are case-insensitive but hyphens are significant, so the spelling
+is fixed by the server constant `web::middleware::CSRF_HEADER`
+(`x-haos-green-csrf`) and every client must match it exactly. This follows the
+existing A2A peer header convention (`x-haos-green-a2a-peer`).
 
 ### 4.4 IP allowlist
 
@@ -274,13 +279,20 @@ from hard borders.
 | Raised surface | `#f7faf7` |
 | Sunken surface | `#e6ece6` |
 | Primary text | `#243027` |
-| Muted text | `#6b7a6d` |
+| Muted text | `#5c6b5e` |
 | Accent (soft green) | `#7cc47f` |
 | Accent highlight (toward white) | `#b8e6bb` |
-| Danger | `#c96a6a` |
+| Danger | `#a34d4d` |
 
 No saturated neon. The green reads as a calm, light mint, brightening toward
 white at interactive highlights.
+
+**Contrast:** `--text-muted` and `--danger` were darkened from the values first
+proposed (`#6b7a6d` at 4.04:1 and `#c96a6a` at 3.25:1) because both failed WCAG
+AA for body text against `--bg`. The values above measure 5.02:1 and 5.02:1
+respectively. `--accent` is intentionally left at 1.86:1: it is used only for
+fills and decorative marks that always sit beside a text label, never as the
+sole carrier of meaning.
 
 **Neuromorphic treatment**
 

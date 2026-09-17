@@ -1,22 +1,237 @@
 <!DOCTYPE html>
 <!--
-  Placeholder shell. Task 9 replaces this file with the real dashboard: the
-  neuromorphic light design system, the sidebar, and the default-password
-  banner. It exists now so `include_str!` is wired and the "the login page is
-  reachable without authentication" test can assert on real bytes.
+  HaosGreen dashboard shell (Phase 1).
+
+  Three structural notes the rest of the frontend depends on:
+
+  * The icon set is one inline `<symbol>` sprite. `app.js` never writes markup:
+    it clones `#icon-template` and points the `<use>` element at a symbol, so
+    there is no `innerHTML` anywhere in the client code.
+  * `#login-overlay` and `#app` both start hidden. `#boot` covers the window
+    between "the document is parsed" and "GET /api/settings answered", so the
+    page never flashes an empty shell before it knows whether a session exists.
+  * No element here references an off-origin resource: the stylesheet and the
+    script are same-origin paths and every icon is inline SVG. With networking
+    disabled the page still renders completely.
 -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
     <title>HaosGreen</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main>
-      <h1>HaosGreen</h1>
-      <p>The dashboard shell is not implemented yet.</p>
-    </main>
-    <script src="/app.js"></script>
+    <!--
+      Icon sprite. Taken out of flow by a class rather than the `hidden`
+      attribute: `display: none` on a sprite host is unreliable for `<use>`
+      references in some engines.
+    -->
+    <svg class="icon-sprite" aria-hidden="true" focusable="false">
+      <symbol
+        id="i-leaf"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M4.75 19.25C4.75 11.5 11.5 4.75 19.5 4.75 19.5 12.5 12.75 19.25 4.75 19.25Z" />
+        <path d="M5.5 18.5 18.5 5.5" />
+        <path d="M8.75 15.25h3.5" />
+      </symbol>
+      <symbol
+        id="i-shield"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M12 3.75 5.5 6.4v5.1c0 4.4 2.8 7.5 6.5 8.75 3.7-1.25 6.5-4.35 6.5-8.75V6.4Z" />
+        <path d="M9.25 12.1 11.2 14.1 14.9 10.2" />
+      </symbol>
+      <symbol
+        id="i-bars"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M4.5 7.25h15" />
+        <path d="M4.5 12h10.5" />
+        <path d="M4.5 16.75h6.5" />
+      </symbol>
+      <symbol
+        id="i-node"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <circle cx="12" cy="5.25" r="2.25" />
+        <circle cx="5.5" cy="18" r="2.25" />
+        <circle cx="18.5" cy="18" r="2.25" />
+        <path d="M10.6 7.2 6.9 15.9" />
+        <path d="M13.4 7.2 17.1 15.9" />
+        <path d="M7.75 18h8.5" />
+      </symbol>
+      <symbol
+        id="i-gear"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <circle cx="12" cy="12" r="4.25" />
+        <path d="M12 3.5v2.4" />
+        <path d="M12 18.1v2.4" />
+        <path d="M3.5 12h2.4" />
+        <path d="M18.1 12h2.4" />
+        <path d="M6.05 6.05 7.75 7.75" />
+        <path d="M16.25 16.25 17.95 17.95" />
+        <path d="M17.95 6.05 16.25 7.75" />
+        <path d="M7.75 16.25 6.05 17.95" />
+      </symbol>
+      <symbol
+        id="i-copy"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <rect x="9" y="9" width="11" height="11" rx="3.2" />
+        <path d="M15 9V6.6A2.6 2.6 0 0 0 12.4 4H6.6A2.6 2.6 0 0 0 4 6.6v5.8A2.6 2.6 0 0 0 6.6 15H9" />
+      </symbol>
+    </svg>
+
+    <p id="boot" class="boot" role="status">Loading the dashboard…</p>
+
+    <!-- Sign-in surface, shown when GET /api/settings answers 401. -->
+    <div
+      id="login-overlay"
+      class="overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="login-title"
+      hidden
+    >
+      <form id="login-form" class="card login-card" novalidate>
+        <span class="login-mark" aria-hidden="true">
+          <svg class="icon icon-lg"><use href="#i-leaf"></use></svg>
+        </span>
+        <h1 id="login-title" class="login-title">HaosGreen</h1>
+        <p class="login-sub">Sign in to the dashboard.</p>
+
+        <div class="field">
+          <label class="field-label" for="login-username">Username</label>
+          <input
+            id="login-username"
+            name="username"
+            type="text"
+            autocomplete="username"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+            required
+          />
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="login-password">Password</label>
+          <input
+            id="login-password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            required
+          />
+        </div>
+
+        <p id="login-error" class="status" role="alert" hidden></p>
+
+        <button id="login-submit" class="btn btn-accent btn-block" type="submit">
+          Sign in
+        </button>
+
+        <p class="hint">
+          The session lives in an HttpOnly cookie and expires on its own. Failed
+          attempts are rate limited per source address.
+        </p>
+      </form>
+    </div>
+
+    <!-- Authenticated shell. -->
+    <div id="app" class="app" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg class="icon icon-lg"><use href="#i-leaf"></use></svg>
+          </span>
+          <span class="brand-text">
+            <strong>HaosGreen</strong>
+            <small>dashboard</small>
+          </span>
+        </div>
+
+        <nav id="nav" class="nav" aria-label="Dashboard sections">
+          <a class="nav-item" href="#/chat" data-route="/chat">
+            <svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg>
+            <span class="nav-label">Chat</span>
+          </a>
+          <a class="nav-item" href="#/supervisor" data-route="/supervisor">
+            <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
+            <span class="nav-label">Supervisor</span>
+          </a>
+          <a class="nav-item" href="#/logs" data-route="/logs">
+            <svg class="icon" aria-hidden="true"><use href="#i-bars"></use></svg>
+            <span class="nav-label">Logs</span>
+          </a>
+          <a class="nav-item" href="#/a2a" data-route="/a2a">
+            <svg class="icon" aria-hidden="true"><use href="#i-node"></use></svg>
+            <span class="nav-label">A2A</span>
+          </a>
+          <a class="nav-item" href="#/settings" data-route="/settings">
+            <svg class="icon" aria-hidden="true"><use href="#i-gear"></use></svg>
+            <span class="nav-label">Settings</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-foot">
+          <p id="whoami" class="whoami"></p>
+          <button id="logout" class="btn btn-ghost" type="button">Sign out</button>
+        </div>
+      </aside>
+
+      <main class="main" id="main">
+        <!--
+          The default-password banner is rendered into this slot for every view.
+          It has no dismiss control anywhere in this file, by design.
+        -->
+        <div id="banner-slot" class="banner-slot"></div>
+        <header class="topbar">
+          <h1 id="view-title" class="view-title">Chat</h1>
+        </header>
+        <section id="view" class="view" tabindex="-1"></section>
+      </main>
+    </div>
+
+    <!-- Source of every icon `app.js` instantiates. -->
+    <template id="icon-template">
+      <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-leaf"></use></svg>
+    </template>
+
+    <script src="/app.js" defer></script>
   </body>
 </html>
