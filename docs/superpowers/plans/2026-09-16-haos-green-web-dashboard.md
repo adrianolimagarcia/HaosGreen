@@ -2008,15 +2008,29 @@ git commit -m "feat(web): add chat session store"
 Unit test for the policy, in `src/web/routes/chat.rs`:
 
 ```rust
-/// Build the tool policy for the web chat from the live registry.
+/// Build the tool policy for the web chat from the live sources.
 ///
 /// The registry is the single source of truth: a hand-written list would drift
 /// the moment someone registers a new tool, and would either silently withhold
 /// it or silently grant a tool that was meant to be withheld.
-pub fn web_tool_policy(registry: &crate::tool_registry::ToolRegistry) -> Vec<String> {
+///
+/// MCP tools are included because the loop offers them too
+/// (`src/loop_runner.rs:111`). Omitting them would silently withhold every MCP
+/// tool from the dashboard while the Telegram bot kept them.
+///
+/// Do NOT return `vec!["*".to_string()]`. The wildcard is expanded only by
+/// `a2a::policy::resolve_allowed_tools`; the loop itself filters with a literal
+/// `whitelist.contains(&d.function.name)` (`src/loop_runner.rs:113`), so a
+/// wildcard here would match nothing and hand the operator a chat with no tools
+/// and no error.
+pub fn web_tool_policy(
+    registry: &crate::tool_registry::ToolRegistry,
+    mcp: &crate::mcp::McpManager,
+) -> Vec<String> {
     registry
         .all_definitions()
         .iter()
+        .chain(mcp.tool_definitions().iter())
         .map(|d| d.function.name.clone())
         .collect()
 }
@@ -2095,8 +2109,10 @@ POST /api/chat/sessions/{id}/messages → SSE stream
 
 The send handler:
 1. Validates the session exists; 404 otherwise.
-2. Builds `allowed_tools` from the **live registry** via `all_definitions()`.
-   Do not call `a2a::policy::resolve_allowed_tools` — it takes an
+2. Builds `allowed_tools` from the **live sources** via `web_tool_policy()`
+   (registry `all_definitions()` **plus** `McpManager::tool_definitions()`).
+   Never `vec!["*".to_string()]` — see the doc comment on `web_tool_policy`.
+   Do not call `a2a::policy::resolve_allowed_tools` either: it takes an
    `A2aPeerConfig` and would couple the dashboard to A2A policy types.
 3. Creates a `tokio::sync::mpsc` channel, passes the sender as
    `stream_token_tx`, and forwards each received chunk as an SSE `token` event.

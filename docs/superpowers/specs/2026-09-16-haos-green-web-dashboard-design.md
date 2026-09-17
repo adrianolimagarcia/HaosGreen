@@ -195,12 +195,43 @@ Streaming reuses `Agent::run_with_policy_streaming_history`
 (`src/agent.rs:1578`), passing prior user/assistant turns, a token channel
 (`stream_token_tx`) that the SSE handler drains, and an explicit tool policy.
 
-**Tool policy:** the operator gets the full registry tool set, expressed as the
-existing wildcard form `vec!["*".to_string()]`, which `a2a::policy` expands
-against the live registry — never a hand-written list, which would silently
-drift as tools are added. An empty policy means "no tools" and is the
-fail-closed default; the web route must never pass an empty policy by accident,
-and a test must prove that it does not.
+**Tool policy:** the operator gets the full tool set the loop would otherwise
+offer, computed from the live sources rather than a hand-written list, which
+would silently drift as tools are added.
+
+> **Correction (verified against the code).** An earlier draft of this spec said
+> the policy should be the wildcard `vec!["*".to_string()]`, on the assumption
+> that the wildcard expands wherever it is consumed. It does not. `"*"` is
+> expanded only by `a2a::policy::resolve_allowed_tools`; the agentic loop itself
+> filters with a literal membership test:
+>
+> ```rust
+> // src/loop_runner.rs:109-114
+> let tool_defs = if let Some(ref whitelist) = self.config.allowed_tools {
+>     let mut all = self.tools.all_definitions();
+>     all.extend(self.mcp.tool_definitions());
+>     all.into_iter()
+>         .filter(|d| whitelist.contains(&d.function.name))
+>         .collect()
+> ```
+>
+> Passing `vec!["*".to_string()]` would therefore match no tool at all and hand
+> the operator a chat that silently cannot use a single tool — a silent
+> capability failure with no error anywhere.
+
+The policy is the union of the two sources the loop draws from:
+
+1. `ToolRegistry::all_definitions()` — the built-in tools.
+2. `McpManager::tool_definitions()` — MCP tools, which the loop also offers
+   (`src/loop_runner.rs:111`). Omitting these would silently withhold every MCP
+   tool from the dashboard while the Telegram bot kept them.
+
+An empty policy means "no tools" and is the fail-closed default; the web route
+must never pass an empty policy by accident, and a test must prove that it does
+not. `invoke_agent` and `spawn_agents` are not registry tools and are
+unreachable here in any case: `run_with_policy_streaming_history` passes
+`special_tool_handler: None` deliberately (`src/agent.rs:1637-1649`), so the
+dashboard cannot dispatch subagents.
 
 Cancel tokens are namespaced `web:{session_id}` so they cannot collide with
 Telegram's `/stop` or A2A task cancellation.
