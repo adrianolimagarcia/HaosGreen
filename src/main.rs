@@ -20,7 +20,8 @@ use haos_green::tool_registry::ToolUiMode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // The dashboard's log view reads from this buffer; the layer below is what
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let shutdown_tx = Arc::new(shutdown_tx);
     // fills it. It is built before the subscriber because the layer needs the
     // handle, and it is shared with `web::spawn` so the routes read the same
     // ring the layer writes to.
@@ -550,11 +551,12 @@ async fn main() -> Result<()> {
         // down.
         let a2a_executor = haos_green::a2a::A2aExecutor::new(agent.clone());
         let a2a_store = haos_green::a2a::SqliteTaskStore::new(agent.memory.connection());
-        haos_green::web::routes::a2a::start_listener(
+        haos_green::web::routes::a2a::start_listener_with_shutdown(
             &config.a2a,
             a2a_skills,
             a2a_executor,
             a2a_store,
+            shutdown_tx.subscribe(),
         )
         .await
     } else {
@@ -588,13 +590,17 @@ async fn main() -> Result<()> {
                 .resolved_home
                 .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            match haos_green::web::spawn(
+            match haos_green::web::spawn_with_shutdown(
                 config.web.clone(),
                 home,
                 Arc::clone(&agent),
                 Arc::clone(&_supervisor),
                 Arc::clone(&logs),
                 Some(Arc::clone(&a2a_web)),
+                {
+                    let tx = Arc::clone(&shutdown_tx);
+                    Arc::new(move || tx.subscribe())
+                },
             )
             .await
             {
@@ -635,13 +641,44 @@ async fn main() -> Result<()> {
             info!("SIGTERM received, shutting down...");
         }
         result = &mut dispatch_handle => {
-            result??;
+            // The dispatcher can finish with an error (or fail to join).  The
+            // process still owns the other listeners, so always broadcast
+            // shutdown and give the notification its bounded cleanup window
+            // before propagating the dispatch outcome.
+            let dispatch_result = result;
+            let _ = shutdown_tx.send(());
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                platform::telegram::notify_shutdown(&bot, &config.telegram.allowed_user_ids),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(_) => warn!("Telegram shutdown notification timed out"),
+            }
+            dispatch_result??;
             return Ok(());
         }
     };
 
+    // Stop Telegram dispatch before the grace period so no detached work remains.
+    dispatch_handle.abort();
+    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut dispatch_handle).await {
+        Ok(Ok(Ok(()))) | Ok(Ok(Err(_))) | Ok(Err(_)) => {}
+        Err(_) => warn!("Telegram dispatch did not stop within shutdown timeout"),
+    }
+
     // Send shutdown notification
-    platform::telegram::notify_shutdown(&bot, &config.telegram.allowed_user_ids).await;
+    let _ = shutdown_tx.send(());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        platform::telegram::notify_shutdown(&bot, &config.telegram.allowed_user_ids),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => warn!("Telegram shutdown notification timed out"),
+    }
 
     // Brief grace period for message delivery
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

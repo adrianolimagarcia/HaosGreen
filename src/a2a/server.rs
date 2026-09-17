@@ -212,6 +212,22 @@ pub async fn spawn(
     executor: impl a2a_server::AgentExecutor,
     store: impl a2a_server::TaskStore,
 ) -> Result<SocketAddr> {
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    let addr = spawn_with_shutdown(config, skills, executor, store, rx).await?;
+    // The receiver treats a closed compatibility channel as "never", so no
+    // sender needs to be leaked or kept alive.
+    drop(tx);
+    Ok(addr)
+}
+
+/// Start the listener with a process shutdown subscription.
+pub async fn spawn_with_shutdown(
+    config: A2aConfig,
+    skills: SkillRegistry,
+    executor: impl a2a_server::AgentExecutor,
+    store: impl a2a_server::TaskStore,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<SocketAddr> {
     let addr = config.bind.clone();
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -228,12 +244,22 @@ pub async fn spawn(
     let app = router(build_state(config, skills, &endpoint_url, executor, store));
 
     tokio::spawn(async move {
-        // `into_make_service_with_connect_info` is required for the
-        // `ConnectInfo<SocketAddr>` extractor the auth path depends on.
+        // `into_make_service_with_connect_info` the auth path depends on.
         if let Err(e) = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            loop {
+                match shutdown_rx.recv().await {
+                    Ok(()) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        })
         .await
         {
             warn!(error = %e, "A2A listener stopped with an error");

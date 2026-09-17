@@ -69,6 +69,9 @@ pub struct WebState {
     /// never serialized; the route module builds its responses from structs
     /// that have no field able to hold one.
     pub a2a: Option<Arc<super::routes::a2a::A2aWebState>>,
+    /// Factory for process-shutdown subscriptions shared with active SSE streams.
+    /// The sender remains owned by the process supervisor, never by routes.
+    pub shutdown: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<()> + Send + Sync>,
 }
 
 /// Number of tracing events retained for the dashboard log view.
@@ -161,6 +164,7 @@ mod tests {
             chat: Arc::new(ChatSessionStore::new()),
             logs: Some(Arc::new(LogBuffer::new(16))),
             a2a: None,
+            shutdown: Arc::new(|| tokio::sync::broadcast::channel(1).0.subscribe()),
         }
     }
 

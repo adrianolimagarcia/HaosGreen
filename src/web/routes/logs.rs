@@ -313,6 +313,7 @@ async fn stream_logs(State(state): State<WebState>, headers: HeaderMap) -> Respo
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(STREAM_CHANNEL_CAPACITY);
 
+    let mut shutdown = (state.shutdown)();
     let mut tail = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         // A tick missed while the runtime was busy must not be followed by a
@@ -324,6 +325,12 @@ async fn stream_logs(State(state): State<WebState>, headers: HeaderMap) -> Respo
 
         loop {
             tokio::select! {
+                shutdown_result = shutdown.recv() => {
+                    match shutdown_result {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                },
                 // The response body holds the only receiver. When the client
                 // disconnects the body is dropped, this resolves, and the task
                 // ends — whether or not it had anything to send.

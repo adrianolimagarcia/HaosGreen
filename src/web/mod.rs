@@ -22,6 +22,12 @@ pub mod logs;
 pub mod middleware;
 pub mod routes;
 pub mod state;
+pub type ShutdownFactory = Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<()> + Send + Sync>;
+
+fn make_shutdown_factory(sender: &tokio::sync::broadcast::Sender<()>) -> ShutdownFactory {
+    let sender = sender.clone();
+    Arc::new(move || sender.subscribe())
+}
 
 use anyhow::{bail, Context, Result};
 use axum::routing::get;
@@ -31,6 +37,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tower_http::trace::TraceLayer;
+
+async fn wait_for_shutdown(mut rx: tokio::sync::broadcast::Receiver<()>) {
+    loop {
+        match rx.recv().await {
+            Ok(()) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            // Compatibility helpers may have no external sender owner. A
+            // closed channel must not make their listener exit immediately.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
 
 use crate::agent::Agent;
 use crate::config::WebConfig;
@@ -123,6 +143,7 @@ fn build_state(
     supervisor: Option<Arc<Supervisor>>,
     logs: Option<Arc<logs::LogBuffer>>,
     a2a: Option<Arc<routes::a2a::A2aWebState>>,
+    shutdown: ShutdownFactory,
 ) -> Result<WebState> {
     config.validate()?;
     let credentials_path = home.join("web-auth.toml");
@@ -149,6 +170,7 @@ fn build_state(
         config,
         agent,
         supervisor,
+        shutdown,
     })
 }
 
@@ -173,6 +195,24 @@ pub async fn spawn(
     logs: Arc<logs::LogBuffer>,
     a2a: Option<Arc<routes::a2a::A2aWebState>>,
 ) -> Result<SocketAddr> {
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let shutdown_tx = Arc::new(shutdown_tx);
+    let shutdown_factory: ShutdownFactory = {
+        let tx = shutdown_tx.clone();
+        Arc::new(move || tx.subscribe())
+    };
+    spawn_with_shutdown(config, home, agent, supervisor, logs, a2a, shutdown_factory).await
+}
+
+pub async fn spawn_with_shutdown(
+    config: WebConfig,
+    home: PathBuf,
+    agent: Arc<Agent>,
+    supervisor: Arc<Supervisor>,
+    logs: Arc<logs::LogBuffer>,
+    a2a: Option<Arc<routes::a2a::A2aWebState>>,
+    shutdown: ShutdownFactory,
+) -> Result<SocketAddr> {
     // The flag is authoritative here too, not only at the call site: a caller
     // that forgets to check `enabled` must not be able to open the port.
     if !config.enabled {
@@ -180,7 +220,15 @@ pub async fn spawn(
     }
 
     let bind = config.bind.clone();
-    let state = build_state(config, home, Some(agent), Some(supervisor), Some(logs), a2a)?;
+    let state = build_state(
+        config,
+        home,
+        Some(agent),
+        Some(supervisor),
+        Some(logs),
+        a2a,
+        shutdown.clone(),
+    )?;
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("failed to bind web dashboard to {bind}"))?;
@@ -212,12 +260,15 @@ pub async fn spawn(
         );
     }
 
-    tracing::info!("  Web dashboard: http://{addr}");
+    let serve_shutdown = shutdown.clone();
     tokio::spawn(async move {
         if let Err(e) = axum::serve(
             listener,
             router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown((serve_shutdown)()).await;
+        })
         .await
         {
             tracing::error!(error = %e, "web dashboard listener stopped");
@@ -238,7 +289,40 @@ pub async fn spawn_for_test(home: PathBuf) -> Result<(SocketAddr, ())> {
     spawn_for_test_with(home, WebConfig::default()).await
 }
 
-/// [`spawn_for_test`] with a caller-supplied configuration.
+#[doc(hidden)]
+pub async fn spawn_for_test_with_shutdown(
+    home: PathBuf,
+) -> Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
+    let (tx, _) = tokio::sync::broadcast::channel(1);
+    let state = build_state(
+        WebConfig {
+            enabled: true,
+            ..WebConfig::default()
+        },
+        home,
+        None,
+        None,
+        None,
+        None,
+        make_shutdown_factory(&tx),
+    )?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let serve_tx = tx.clone();
+    tokio::spawn(async move {
+        let rx = serve_tx.subscribe();
+        let _ = axum::serve(
+            listener,
+            router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(rx).await;
+        })
+        .await;
+    });
+    Ok((addr, tx))
+}
+
 ///
 /// This exists because `spawn_for_test` hardcodes the default `WebConfig`: a
 /// regression that hardcoded, say, `secure = false` on the session cookie would
@@ -300,6 +384,41 @@ pub async fn spawn_for_test_with_logs(
     spawn_for_test_with_handles(home, config, None, None, Some(logs), None).await
 }
 
+/// Test helper exposing the process shutdown sender for live log SSE tests.
+#[doc(hidden)]
+pub async fn spawn_for_test_with_logs_and_shutdown(
+    home: PathBuf,
+    mut config: WebConfig,
+    logs: Arc<logs::LogBuffer>,
+) -> Result<(SocketAddr, tokio::sync::broadcast::Sender<()>)> {
+    config.enabled = true;
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let shutdown_factory = make_shutdown_factory(&shutdown_tx);
+    let state = build_state(
+        config,
+        home,
+        None,
+        None,
+        Some(logs),
+        None,
+        shutdown_factory.clone(),
+    )?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let serve_shutdown = shutdown_factory.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown((serve_shutdown)()).await;
+        })
+        .await;
+    });
+    Ok((addr, shutdown_tx))
+}
+
 /// [`spawn_for_test_with`] with the A2A surface attached.
 ///
 /// The A2A routes answer 503 without one, and the state carries the listener
@@ -327,14 +446,28 @@ async fn spawn_for_test_with_handles(
     a2a: Option<Arc<routes::a2a::A2aWebState>>,
 ) -> Result<(SocketAddr, ())> {
     config.enabled = true;
-    let state = build_state(config, home, agent, supervisor, logs, a2a)?;
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let shutdown_factory = make_shutdown_factory(&shutdown_tx);
+    let state = build_state(
+        config,
+        home,
+        agent,
+        supervisor,
+        logs,
+        a2a,
+        shutdown_factory.clone(),
+    )?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let serve_shutdown = shutdown_factory.clone();
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,
             router(state, addr).into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown((serve_shutdown)()).await;
+        })
         .await;
     });
     Ok((addr, ()))

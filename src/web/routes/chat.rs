@@ -101,6 +101,38 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_ITERATIONS_MESSAGE: &str =
     "the agent reached its maximum number of iterations without producing a final response";
 
+/// One result from the chat SSE producer/join/shutdown multiplexor.
+enum ChatStreamItem {
+    Token(String),
+    Shutdown,
+    Finished(Result<anyhow::Result<LoopOutcome>, tokio::task::JoinError>),
+}
+
+/// Wait for the next token, process shutdown, or agent completion.
+///
+/// This is deliberately separate from the route generator: the cancellation
+/// boundary is then exercised with a synthetic producer, without an LLM.
+async fn next_chat_stream_item(
+    token_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+    handle: &mut tokio::task::JoinHandle<anyhow::Result<LoopOutcome>>,
+) -> ChatStreamItem {
+    loop {
+        let item = tokio::select! {
+            biased;
+            Some(token) = token_rx.recv() => return ChatStreamItem::Token(token),
+            shutdown_result = shutdown.recv() => shutdown_result,
+            result = &mut *handle => return ChatStreamItem::Finished(result),
+        };
+        match item {
+            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return ChatStreamItem::Shutdown;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+        }
+    }
+}
+
 /// The tool policy for the dashboard chat: every tool the loop would offer.
 ///
 /// The union of the two sources `src/loop_runner.rs:109-114` draws from —
@@ -313,19 +345,23 @@ async fn send_message(
         session_id: session_id.clone(),
     };
 
+    let mut shutdown = (state.shutdown)();
     let stream = async_stream::stream! {
         let outcome = loop {
-            let next = tokio::select! {
-                // `biased` so a buffered token is always taken before the join
-                // handle is observed: without it `select!` picks at random
-                // among ready branches, and a completed run whose last chunks
-                // are still in the channel would be truncated.
-                biased;
-                Some(token) = token_rx.recv() => Some(token),
-                result = cleanup.handle.as_mut().expect("the agent handle is taken exactly once") => break result,
-            };
-            if let Some(token) = next {
-                yield token_event(token);
+            match next_chat_stream_item(
+                &mut token_rx,
+                &mut shutdown,
+                cleanup.handle.as_mut().expect("the agent handle is taken exactly once"),
+            ).await {
+                ChatStreamItem::Token(token) => yield token_event(token),
+                ChatStreamItem::Shutdown => {
+                    if let Some(handle) = cleanup.handle.take() {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                    break Ok(Ok(LoopOutcome::Cancelled));
+                }
+                ChatStreamItem::Finished(result) => break result,
             }
         };
         cleanup.handle.take();
@@ -747,6 +783,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn chat_stream_select_returns_shutdown_without_an_llm() {
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(1);
+        drop(token_tx);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut shutdown = shutdown_tx.subscribe();
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<_, anyhow::Error>(LoopOutcome::FinalResponse("unexpected".to_string()))
+        });
+
+        shutdown_tx.send(()).unwrap();
+        let item = next_chat_stream_item(&mut token_rx, &mut shutdown, &mut handle).await;
+        assert!(matches!(item, ChatStreamItem::Shutdown));
+        handle.abort();
+    }
     #[test]
     fn an_error_event_is_redacted() {
         // An agent error can quote the provider response, which can quote the

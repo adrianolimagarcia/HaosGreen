@@ -20,7 +20,33 @@ async fn spawn_test_server() -> (String, tempfile::TempDir) {
     spawn_test_server_with(haos_green::config::WebConfig::default()).await
 }
 
-/// Start the dashboard with a caller-supplied configuration.
+#[tokio::test]
+async fn web_listener_stops_on_broadcast_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, tx) = haos_green::web::spawn_for_test_with_shutdown(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(reqwest::get(format!("http://{addr}/"))
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    tx.send(()).unwrap();
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if reqwest::get(format!("http://{addr}/")).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        refused.is_ok(),
+        "listener must refuse connections after shutdown"
+    );
+}
+
 ///
 /// `spawn_for_test` hardcodes the default `WebConfig`, so without this entry
 /// point no test in this file could set a `public_url` — and a regression that
@@ -2564,6 +2590,35 @@ async fn a_wrapped_log_read_is_bounded_and_ordered() {
     );
 }
 
+#[tokio::test]
+async fn the_log_stream_ends_on_process_shutdown_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = std::sync::Arc::new(haos_green::web::logs::LogBuffer::new(16));
+    let (addr, shutdown) = haos_green::web::spawn_for_test_with_logs_and_shutdown(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        buffer,
+    )
+    .await
+    .unwrap();
+    let cookie = login_and_get_cookie(&format!("http://{addr}"), "admin").await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/logs/stream"))
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap();
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    shutdown.send(()).unwrap();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "shutdown must end the SSE stream");
+}
 #[tokio::test]
 async fn the_log_stream_delivers_entries_pushed_after_it_connects() {
     let (base, _dir, buffer) = spawn_test_server_with_logs(16).await;

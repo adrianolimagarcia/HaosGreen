@@ -339,6 +339,17 @@ pub async fn start_listener(
     executor: impl a2a_server::AgentExecutor,
     store: impl a2a_server::TaskStore,
 ) -> A2aListenerOutcome {
+    let (_tx, rx) = tokio::sync::broadcast::channel(1);
+    start_listener_with_shutdown(config, skills, executor, store, rx).await
+}
+
+pub async fn start_listener_with_shutdown(
+    config: &A2aConfig,
+    skills: SkillRegistry,
+    executor: impl a2a_server::AgentExecutor,
+    store: impl a2a_server::TaskStore,
+    shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> A2aListenerOutcome {
     if !config.enabled {
         tracing::debug!("A2A disabled");
         return A2aListenerOutcome::Disabled;
@@ -358,7 +369,9 @@ pub async fn start_listener(
         };
     }
 
-    match crate::a2a::server::spawn(config.clone(), skills, executor, store).await {
+    match crate::a2a::server::spawn_with_shutdown(config.clone(), skills, executor, store, shutdown)
+        .await
+    {
         Ok(bound) => {
             // The same function the Agent Card is built from, so the URL
             // reported here is the URL peers are told to use. `spawn` calls it

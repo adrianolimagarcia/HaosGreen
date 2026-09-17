@@ -6,7 +6,7 @@ use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::types::{Task, TaskState, TaskStatus};
 use a2a_server::{AgentExecutor, ExecutorContext};
 use futures::stream::BoxStream;
-use haos_green::a2a::server::{build_state, router, spawn};
+use haos_green::a2a::server::{build_state, router, spawn, spawn_with_shutdown};
 use haos_green::a2a::NoopExecutor;
 use haos_green::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
 use haos_green::skills::SkillRegistry;
@@ -100,6 +100,41 @@ async fn start_with<E: AgentExecutor>(executor: E) -> (String, tokio::task::Join
 
 async fn start() -> (String, tokio::task::JoinHandle<()>) {
     start_with(NoopExecutor).await
+}
+
+#[tokio::test]
+async fn listener_stops_on_broadcast_shutdown() {
+    let (tx, _) = tokio::sync::broadcast::channel(1);
+    let addr = spawn_with_shutdown(
+        config(),
+        SkillRegistry::new(),
+        NoopExecutor,
+        a2a_server::InMemoryTaskStore::new(),
+        tx.subscribe(),
+    )
+    .await
+    .unwrap();
+    let response = reqwest::get(format!("http://{addr}/.well-known/agent-card.json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    tx.send(()).unwrap();
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if reqwest::get(format!("http://{addr}/.well-known/agent-card.json"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        refused.is_ok(),
+        "listener must refuse connections after shutdown"
+    );
 }
 
 #[tokio::test]
