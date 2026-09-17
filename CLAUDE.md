@@ -9,8 +9,9 @@ MCP (Model Context Protocol) servers for extensible tool integration, and runs
 an agentic loop that iterates tool calls until a final text response is produced
 (`[agent] max_iterations`, default **25**).
 
-It also carries an autonomous supervisor (see [Supervisor](#supervisor-autopilot-v2))
-and an optional Agent2Agent listener (see [A2A](#a2a-agent2agent-protocol)).
+It also carries an autonomous supervisor (see [Supervisor](#supervisor-autopilot-v2)),
+an optional Agent2Agent listener (see [A2A](#a2a-agent2agent-protocol)), and an
+optional embedded web dashboard (see [Web Dashboard](#web-dashboard)).
 
 ## Build & Run
 
@@ -39,9 +40,10 @@ Copy `config.example.toml` to `config.toml` and fill in credentials.
 HaosGreen stores all state under a single home directory (default `~/.haos-green`),
 resolved as: `HAOS_GREEN_HOME` env (or `RUSTFOX_HOME`, absolute) → `[general].home` config → `~/.haos-green` (with fallback to `~/.rustfox`).
 Layout: `config.toml`, `haos-green.db`, `skills/`, `agents/`, `workspace/` (the
-sandbox), `artifacts/`, `user_model.md`. Each path can be pinned to an absolute
-location in `config.toml`; unset paths fall back to the home default. Run
-isolated instances with `HAOS_GREEN_HOME=...`. See
+sandbox), `artifacts/`, `user_model.md`, and `web-auth.toml` (the dashboard
+credentials, mode 0600, created on the first dashboard start). Each path can be
+pinned to an absolute location in `config.toml`; unset paths fall back to the
+home default. Run isolated instances with `HAOS_GREEN_HOME=...`. See
 `docs/persistent-home-directory.md`. Path resolution lives in `src/home.rs`
 (`Config::resolve` writes the resolved absolute paths back into the config).
 Bundled skills/agents are seed-copied on first run; `/update-skills` re-syncs
@@ -100,6 +102,21 @@ src/
 │   ├── server.rs       # axum listener: card + authenticated JSON-RPC routes
 │   ├── client.rs       # Outbound A2A client: card discovery, auth, message/poll
 │   └── tool.rs         # `call_a2a_agent` tool implementation and secret redaction
+├── web/                # Embedded dashboard (see "Web Dashboard" below)
+│   ├── mod.rs          # Router, layer order, and the fallible listener (`spawn`)
+│   ├── state.rs        # `WebState`: shared handles; a missing one answers 503
+│   ├── auth.rs         # Argon2id credentials, sessions, IP gate, login limiter
+│   ├── middleware.rs   # Host allowlist, security headers, IP/CSRF/session guard
+│   ├── chat.rs         # Bounded in-memory chat session store
+│   ├── logs.rs         # Bounded log ring + the tracing layer that feeds it
+│   └── routes/         # Route modules (guarded router + the public login router)
+│       ├── mod.rs        # Guarded router and the public (login) router
+│       ├── auth_routes.rs # Login/logout and the session cookie
+│       ├── settings.rs   # Password, bearer toggle, IP allowlist
+│       ├── chat.rs       # Chat sessions and the SSE message stream
+│       ├── supervisor.rs # Supervisor task list, detail and lifecycle
+│       ├── logs.rs       # Log history and the live SSE tail
+│       └── a2a.rs        # Listener status, peer listings, outbound editor, card test
 ├── supervisor/         # Autonomous task runner (see below)
 └── utils/
 ```
@@ -187,11 +204,13 @@ src/
 | `reqwest` | HTTP client (OpenRouter, MCP HTTP, integration tests) |
 | `serde` / `serde_json` | Serialization |
 | `toml` | Config parsing |
+| `toml_edit` | Format-preserving edits to `config.toml` (`PUT /api/a2a/outbound`) |
 | `rmcp` | Official MCP Rust SDK |
-| `axum` / `tower-http` | A2A listener; setup wizard's OAuth callback |
+| `axum` / `tower-http` | A2A listener; web dashboard; setup wizard's OAuth callback |
 | `a2a` (`a2a-lf`) | A2A protocol types |
-| `ipnet` | CIDR matching for the A2A peer IP allowlist |
-| `subtle` | Constant-time bearer-token comparison |
+| `argon2` | Argon2id password hashing for the dashboard |
+| `ipnet` | CIDR matching for the A2A peer IP allowlist and `[web].allow_ips` |
+| `subtle` | Constant-time bearer-token comparison (A2A and the dashboard) |
 | `rusqlite` + `sqlite-vec` | Memory store |
 | `tracing` / `tracing-subscriber` | Structured logging |
 | `anyhow` | Error handling |
@@ -215,16 +234,24 @@ and `cargo test` pass locally.
 
 ## Testing
 
-The suite is large and must stay green (~560 unit tests in `src/**` plus 11
+The suite is large and must stay green (~835 unit tests in `src/**` plus 13
 integration files in `tests/`). When adding tests:
 
 - Unit tests go in `#[cfg(test)] mod tests` blocks in the file under test.
 - Integration tests go in `tests/`.
 - Prefer testing through the public API. For HTTP surfaces, bind an ephemeral
-  port (`127.0.0.1:0`) and make real requests — see `tests/a2a_endpoint.rs`.
+  port (`127.0.0.1:0`) and make real requests — see `tests/a2a_endpoint.rs` and
+  `tests/web_endpoint.rs`.
 - A test that passes for the wrong reason is worse than no test. When a test
   guards a security property, **prove it has teeth** by mutating the
   implementation and confirming the test fails.
+- `tests/web_endpoint.rs` covers the dashboard end to end: the guard, the CSRF
+  and Host checks, the IP allowlist, login and rate limiting, chat SSE, the
+  supervisor lifecycle, the log routes and the A2A routes.
+- The live tests in `tests/web_endpoint.rs` and `tests/a2a_e2e_live.rs` are
+  `#[ignore]`d **and** re-checked at runtime against `HAOS_GREEN_WEB_LIVE=1` and
+  `RUSTFOX_A2A_LIVE=1` respectively, so plain `cargo test` passes with both
+  unset — which is how CI runs it.
 
 ## Common Tasks
 
@@ -336,6 +363,161 @@ Implementation plans: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-po
 >   `public_url`), never the raw `bind` string.
 > - **Redacted tokens**: Outbound peer tokens are never printed in debug representations (`A2aOutboundPeerConfig` redacts tokens), and error messages returned by `call_a2a_agent` sanitize configured tokens and bearer patterns before returning to the model or logs.
 > - **No automatic POST retries**: Outbound `SendMessage` calls are never automatically retried to avoid duplicate remote task creation; only `GetTask` polling retries up to `poll_timeout_secs`.
+
+## Web Dashboard
+
+Optional and **disabled by default** (`src/web/`). When `[web].enabled = true`,
+`main.rs` starts an embedded axum dashboard next to the Telegram bot — chat,
+supervisor, live logs, settings and an A2A manager — served from three
+compile-time assets embedded with `include_str!`. A listener failure is logged
+and the bot keeps running, exactly as for the A2A listener.
+
+```toml
+[web]
+enabled = false            # default. A dashboard that can run shell commands
+                           #   must never appear because a key was omitted.
+bind = "127.0.0.1:8787"    # default: loopback only
+# public_url = "https://haos.example.com"
+session_ttl_hours = 12     # default
+allow_ips = []             # default: EMPTY MEANS ANY SOURCE — see below
+```
+
+`WebConfig::validate()` runs before the bind and refuses to start the
+**listener** — never the bot — on an unparseable `bind`, `session_ttl_hours = 0`,
+a `public_url` without an `http://`/`https://` scheme, or an `allow_ips` entry
+that is neither an IP nor a CIDR range.
+
+### Endpoints
+
+| Route | Notes |
+|---|---|
+| `GET /`, `/app.js`, `/style.css` | Static shell. No session, no CSRF; the IP gate still applies. |
+| `POST /api/auth/login` | The only session-less API route. IP gate + CSRF, then the rate limiter. |
+| `POST /api/auth/logout` | Requires a session. |
+| `GET /api/settings`, `POST /api/settings/password`, `POST /api/settings/bearer`, `PUT /api/settings/allow-ips` | Credentials and the live allowlist. |
+| `POST`, `GET /api/chat/sessions`; `GET`, `POST /api/chat/sessions/{id}/messages`; `POST /api/chat/sessions/{id}/cancel` | The chat surface. The `POST` on messages is `text/event-stream`. |
+| `GET`, `POST /api/supervisor/tasks`; `GET /api/supervisor/tasks/{id}`; `POST /api/supervisor/tasks/{id}/{pause,resume,cancel,approve}` | Supervisor surface. |
+| `GET /api/logs`, `GET /api/logs/stream` | Log history, and a live tail that is not a replay. |
+| `GET /api/a2a/status`, `/peers`, `/outbound`; `PUT /api/a2a/outbound`; `POST /api/a2a/test` | A2A manager. |
+
+Everything except the three static assets and login is mounted **inside** the
+`guard` layer; `host_and_headers` wraps every response, including the rejected
+ones.
+
+### Authentication
+
+- **Session cookie.** `POST /api/auth/login` mints a 256-bit id in an
+  `HttpOnly; SameSite=Strict` cookie named `haos_session`. The `Secure` flag is
+  added only when `public_url` is `https://` — an https deployment that omits
+  `public_url` gets a cookie without it.
+- **CSRF header.** Every `POST`/`PUT`/`PATCH`/`DELETE`, login included, requires
+  `x-haos-green-csrf: 1`. `SameSite=Strict` is a browser behaviour; the header is
+  the server-side guarantee, and it is checked before the session.
+- **Optional bearer token.** `Authorization: Bearer <token>` authenticates
+  without a session. It is **off by default** and stored only as a lowercase-hex
+  SHA-256 digest: the token is returned exactly once, by the call that mints it,
+  and afterwards only a 6-character fingerprint of the digest is readable.
+  Enabling again rotates the token, which is the only recovery path.
+- **IP allowlist.** Enforced as a middleware layer *before* axum's extractors, so
+  a denied source is refused before a request body is parsed — and before the
+  login handler can spend Argon2 work on it.
+
+> **`[web].allow_ips` has the opposite semantics to an A2A peer's `ip` list.**
+> An empty `[web].allow_ips` permits **any** source; a non-empty list is a strict
+> allowlist. An empty `[a2a.peers.<name>].ip` list permits **no** source. The
+> dashboard can afford the permissive default because it has a password and A2A
+> does not; the UI states the asymmetry so an empty list is never misread as a
+> restriction.
+
+### Credentials file
+
+Passwords and bearer state live in `<home>/web-auth.toml`, **never** in
+`config.toml` — `config.toml` is the file users copy, share, and paste into
+issues. The file is created mode 0600 before any content is written, an existing
+file found wider is tightened (with a warning), and the name is in `.gitignore`.
+Editing the allowlist from the UI is **in-memory only**; it does not rewrite
+`config.toml`.
+
+### The accepted risk: `admin`/`admin`, no forced change
+
+A fresh install starts with `admin`/`admin` and there is deliberately **no forced
+password change**. This is an operator decision, not an oversight. The
+compensating controls are what make it tolerable:
+
+- loopback bind by default (`127.0.0.1:8787`);
+- a startup warning whenever the stored password is still the default;
+- a persistent, **non-dismissible** UI banner on every view;
+- per-source login rate limiting — five failures, then exponential backoff from
+  5 s doubling to a 300 s cap, with the counter deliberately *not* reset when a
+  lockout is served: only a successful login, or the stale-entry pruning that
+  runs once a source has been quiet for the full lockout window, clears it;
+- a settings page to change the password, and a process-wide gate that keeps at
+  most four Argon2 operations in flight so a login burst cannot starve the bot.
+
+**A non-loopback bind without changing the password is unsafe.** Anyone who can
+reach the port can sign in and run commands on the host.
+
+> **Web dashboard security invariants — do not weaken without a written reason:**
+> - **Any authenticated user has host shell execution.** The web chat runs the
+>   same agent as Telegram, with a tool policy derived from the live tool registry
+>   and MCP manager — `execute_command` included. This is intentional: the
+>   dashboard is a single-operator surface, not a multi-user one. Subagent
+>   dispatch is not reachable from it, because `invoke_agent` and `spawn_agents`
+>   are not registry tools and the web chat path passes
+>   `special_tool_handler: None`.
+> - **The chat tool policy is derived from those live sources, never
+>   hand-written, and must never be `["*"]`.** The loop filters with a literal
+>   membership test (`whitelist.contains(&d.function.name)`), so a wildcard
+>   policy offers it **no tool at all** — the chat would look functional and
+>   silently lose every tool, with no error anywhere.
+> - **The bearer token is never readable after generation.** Only the SHA-256
+>   digest is persisted, and only a 6-character fingerprint is ever returned.
+> - **Host checking is fail-closed.** A non-loopback bind with no `public_url`
+>   refuses every request whose `Host` is not the bound address, `localhost`,
+>   `127.0.0.1` or `[::1]` — so a browser reaching it by name gets 403. The `Host`
+>   header is the whole defence against DNS rebinding.
+> - **Sessions are in-memory only** and deliberately do not survive a restart: a
+>   restart is a cheap, complete revocation of every session.
+> - **The log ring redacts at capture**, before truncation, and `main.rs`
+>   registers every configured secret (Telegram token, OpenRouter key, A2A peer
+>   tokens, MCP tokens) as an exact value at startup — a shape rule cannot catch
+>   a credential that has no recognisable shape.
+> - **`PUT /api/a2a/outbound` can redirect a stored peer token to a new host**: an
+>   omitted `token` keeps the stored one, so changing a peer's `url` points the
+>   existing token at a new host without ever reading it. It is CSRF-guarded and
+>   reachable only with an operator session or the operator's bearer token.
+
+### Non-goals
+
+No dark mode. No WebSocket transport — SSE covers streaming. No multiple users,
+roles, or per-user permissions: one operator identity. No TLS termination inside
+the process; use a reverse proxy or Tailscale. No self-upgrade or binary reload
+from the UI. No chat persistence across restarts. `PUT /api/a2a/outbound` is the
+**only** route that writes `config.toml`, and only its `[a2a.outbound.peers]`
+table.
+
+### Supervisor lifecycle from the dashboard
+
+`pause`, `resume`, `cancel` and `approve` each pre-check the task's state through
+`supervisor::state::transition_allowed` and answer **409** without calling the
+supervisor at all. `resume` is deliberately stricter than the state table:
+`Paused -> Execute` is a legal edge, but only a task that is actually `Paused`
+may be resumed, or a task parked in `Route` awaiting approval would run without
+one. `Supervisor::pause` refuses the same way, because `record_transition`'s
+`debug_assert!` is compiled out of release builds.
+
+The pre-check cannot cover a task that moves between it and the call.
+`TaskStore::record_transition` is therefore a **compare-and-swap**: it inserts the
+audit row and updates `sup_tasks` in one transaction, conditioned on
+`WHERE id=?2 AND state=?3`, so whichever request arrives second finds the row no
+longer in `from` and is refused — the audit row rolls back with it and the route
+answers 409. A concurrent lifecycle request is **refused, never applied twice**.
+The same hazard is closed one level up by `Supervisor`'s per-task in-flight
+guard, which answers `AlreadyRunning` for a second `execute_now`: the
+compare-and-swap alone cannot catch it, because two `Execute -> Plan`
+transitions are both legal edges.
+
+Design spec: `docs/superpowers/specs/2026-09-16-haos-green-web-dashboard-design.md`.
 
 ## Files Not to Commit
 

@@ -36,6 +36,7 @@ Star the repo ⭐, fork to contribute, or open an issue for feedback.
 | 🧬 **Skills & Agents** | Folder-based skill instructions auto-loaded at startup; subagent skills with own model and tool whitelist |
 | 🤝 **Agent Layer** | Isolated agentic mini-loops in `agents/` with own model/tools; `invoke_agent`, `spawn_agents`, zero-trust verifier |
 | 🔄 **Task Scheduling** | Cron and one-shot task scheduler with SQLite persistence |
+| 🖥️ **Web Dashboard** | Optional embedded dashboard (off by default): chat with the same agent, supervisor tasks, live logs, A2A peers, settings |
 | 📦 **Self-Hosting** | Single binary, 2-min setup wizard, background service (systemd/launchd/Windows Service) |
 
 → Full feature reference: [docs/GUIDE.md](docs/GUIDE.md#advanced-features)
@@ -129,6 +130,32 @@ haos-green --service status
 | `openrouter.model` | LLM model ID (default: `moonshotai/kimi-k2.6`) |
 | `sandbox.allowed_directory` | Directory for sandboxed file/command operations |
 | `mcp_servers` | List of MCP servers to connect (see [GUIDE.md](docs/GUIDE.md#mcp-server-integration)) |
+| `web.enabled` | Enable the embedded web dashboard (default: `false`) — see below |
+
+### Web Dashboard (optional)
+
+HaosGreen ships an embedded web dashboard: chat with the same agent, submit and
+track supervisor tasks, tail the live log, manage A2A peers, and change the
+dashboard password. It is **off by default**.
+
+```toml
+[web]
+enabled = true
+bind = "127.0.0.1:8787"   # default; keep it on loopback unless you mean it
+```
+
+Then open <http://127.0.0.1:8787> and sign in with `admin` / `admin`.
+
+> ⚠️ **Change the password in Settings before exposing the port.** Anyone who can
+> sign in runs the same agent as the Telegram operator, shell execution included.
+> The dashboard binds to loopback by default, warns at startup and shows a
+> persistent banner while the default password is in use — but a non-loopback
+> bind without changing it is unsafe.
+
+Dashboard credentials live in `<home>/web-auth.toml` (mode 0600), never in
+`config.toml`. For the full security model — the auth flow, the IP allowlist, the
+bearer token, and the invariants that must not be weakened — see
+[CLAUDE.md → Web Dashboard](CLAUDE.md#web-dashboard).
 
 → Full configuration reference: [docs/GUIDE.md](docs/GUIDE.md#configuration)
 

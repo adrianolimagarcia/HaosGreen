@@ -334,13 +334,17 @@ Be concise and helpful."""
 # and starts with the password `admin`/`admin`. Change the password in the
 # dashboard Settings page before exposing the port to anything.
 #
+# There is no password or token key here on purpose: the dashboard credentials
+# are persisted in `<home>/web-auth.toml` (mode 0600), never in this file.
+#
 # [web]
 # enabled = false
 # bind = "127.0.0.1:8787"
 # public_url = ""            # e.g. "https://haos.example.com"
 #                            # https here adds `Secure` to the session cookie.
-#                            # Leave it unset and the cookie has NO Secure flag,
-#                            # even behind a TLS proxy. It is also the host the
+#                            # Leave it unset (or empty, which is treated the
+#                            # same) and the cookie has NO Secure flag, even
+#                            # behind a TLS proxy. It is also the host the
 #                            # dashboard answers to: a request whose Host header
 #                            # is neither this host nor the bound address (nor
 #                            # localhost / 127.0.0.1 / [::1] on the bound port)
