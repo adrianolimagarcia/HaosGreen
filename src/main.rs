@@ -20,12 +20,26 @@ use haos_green::tool_registry::ToolUiMode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The dashboard's log view reads from this buffer; the layer below is what
+    // fills it. It is built before the subscriber because the layer needs the
+    // handle, and it is shared with `web::spawn` so the routes read the same
+    // ring the layer writes to. Bounded (see `LOG_BUFFER_CAPACITY`), so an
+    // instance that never enables the dashboard pays only for the ring.
+    let logs = Arc::new(haos_green::web::logs::LogBuffer::new(
+        haos_green::web::state::LOG_BUFFER_CAPACITY,
+    ));
+
     // Initialize logging
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,haos_green=debug,rustfox=debug".into()),
-        )
+    //
+    // `web::logs::log_subscriber` is the stack that carries both the operator's
+    // `EnvFilter` and the dashboard's `LogLayer`, so an event the filter
+    // suppresses never reaches the buffer and the dashboard shows what the
+    // terminal shows. Keeping that composition in the library is what lets a
+    // test drive the same subscriber this binary installs.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,haos_green=debug,rustfox=debug".into());
+
+    haos_green::web::logs::log_subscriber(env_filter, Arc::clone(&logs))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -516,6 +530,7 @@ async fn main() -> Result<()> {
                 home,
                 Arc::clone(&agent),
                 Arc::clone(&_supervisor),
+                Arc::clone(&logs),
             )
             .await
             {

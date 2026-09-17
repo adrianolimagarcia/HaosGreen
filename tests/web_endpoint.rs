@@ -218,7 +218,7 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
     // header is sent on all of them so the request reaches the authentication
     // check rather than being stopped by the CSRF gate first: this test is
     // about authentication.
-    let cases: [(&str, &str, Option<serde_json::Value>); 17] = [
+    let cases: [(&str, &str, Option<serde_json::Value>); 19] = [
         ("GET", "/api/settings", None),
         (
             "POST",
@@ -262,6 +262,11 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
         ("POST", "/api/supervisor/tasks/nope/resume", None),
         ("POST", "/api/supervisor/tasks/nope/cancel", None),
         ("POST", "/api/supervisor/tasks/nope/approve", None),
+        // The log surface (Phase 4). The log is the most revealing thing the
+        // dashboard holds — targets, paths, task ids, error text — so a missing
+        // guard here would leak more than any other route.
+        ("GET", "/api/logs", None),
+        ("GET", "/api/logs/stream", None),
     ];
 
     for (method, path, body) in cases {
@@ -2279,6 +2284,437 @@ async fn a_supervisor_database_failure_is_500_not_409() {
             response.status()
         );
     }
+}
+
+// ── Logs (Phase 4) ──────────────────────────────────────────────────────────
+//
+// These run against a dashboard whose `logs` handle is `Some` and is the very
+// `Arc` the test holds. Pushing into that buffer and reading the result back
+// over HTTP is the only way to show that the route and the buffer are the same
+// object; a dashboard with a buffer of its own would answer 200 with an empty
+// list and every other assertion here would still pass.
+
+/// Start the dashboard with a log buffer of `capacity` and hand the buffer back.
+async fn spawn_test_server_with_logs(
+    capacity: usize,
+) -> (
+    String,
+    tempfile::TempDir,
+    std::sync::Arc<haos_green::web::logs::LogBuffer>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = std::sync::Arc::new(haos_green::web::logs::LogBuffer::new(capacity));
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_logs(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        buffer.clone(),
+    )
+    .await
+    .expect("the dashboard should start with a log buffer");
+    (format!("http://{addr}"), dir, buffer)
+}
+
+/// `GET /api/logs` with the session cookie attached.
+async fn get_logs(base: &str, cookie: &str, query: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base}/api/logs{query}"))
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Read the SSE body until `wanted` complete frames have arrived, then parse.
+///
+/// Reading the whole body is not an option — the stream never ends — and a
+/// timeout is required so a stream that produces nothing fails the test rather
+/// than hanging the suite.
+async fn read_sse_frames(
+    response: reqwest::Response,
+    wanted: usize,
+    timeout: std::time::Duration,
+) -> Vec<(String, String)> {
+    use futures::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut raw = String::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if raw.matches("\n\n").count() >= wanted {
+            return parse_sse(&raw);
+        }
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk))) => raw.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(error))) => panic!("the log stream failed: {error}"),
+            Ok(None) => return parse_sse(&raw),
+            Err(_) => {
+                panic!("timed out waiting for {wanted} SSE frames; the stream carried {raw:?}")
+            }
+        }
+    }
+}
+
+/// Log in over a raw socket, so this test owns every connection it opens.
+///
+/// `login_and_get_cookie` leaves a pooled `reqwest` connection behind, and the
+/// disconnect test counts `Arc` references to the buffer: a connection the
+/// server has not finished tearing down holds one, which would make the count
+/// ambiguous. `Connection: close` plus a socket the test reads to EOF leaves
+/// nothing open.
+async fn login_over_a_raw_socket(addr: std::net::SocketAddr) -> String {
+    let body = r#"{"username":"admin","password":"admin"}"#;
+    let request = format!(
+        "POST /api/auth/login HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         x-haos-green-csrf: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let response = raw_request(addr, &request).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "the raw-socket login must succeed: {response:?}"
+    );
+    response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|value| value.split(';').next())
+        .map(|value| value.trim().to_string())
+        .expect("login must set a session cookie")
+}
+
+#[tokio::test]
+async fn every_log_route_returns_503_without_a_buffer() {
+    // The default harness wires no log buffer, which is the contract every
+    // optional handle in `WebState` follows: an empty log is indistinguishable
+    // from a quiet process, so an unwired dashboard must say so.
+    let (base, _dir) = spawn_test_server().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    for path in ["/api/logs", "/api/logs/stream"] {
+        let response = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "GET {path} without a log buffer must be 503, got {}",
+            response.status()
+        );
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("log buffer"),
+            "the 503 body must name the missing handle, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_log_limit_is_clamped_and_never_trusted() {
+    // Capacity 4 and ten entries pushed: every request below is answered from a
+    // ring that holds exactly four, so "the limit was honoured" and "the ring
+    // was dumped" are different answers.
+    let (base, _dir, buffer) = spawn_test_server_with_logs(4).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    for i in 0..10 {
+        buffer.push(haos_green::web::logs::LogEntry::new(
+            "INFO",
+            "haos_green::test",
+            &format!("line {i}"),
+        ));
+    }
+
+    // A small limit is honoured.
+    let response = get_logs(&base, &cookie, "?limit=2").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["entries"].as_array().unwrap().len(), 2, "got {body}");
+    assert_eq!(body["capacity"], serde_json::json!(4), "got {body}");
+
+    // A huge limit is clamped by the ring, not honoured.
+    let response = get_logs(&base, &cookie, "?limit=100000").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["entries"].as_array().unwrap().len(),
+        4,
+        "a huge limit must not be able to ask for more than the ring holds: {body}"
+    );
+
+    // Zero is legal and returns nothing.
+    let response = get_logs(&base, &cookie, "?limit=0").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body["entries"].as_array().unwrap().is_empty(),
+        "limit=0 must return no entries: {body}"
+    );
+    assert_eq!(body["capacity"], serde_json::json!(4));
+
+    // Absent means the default, which is larger than the ring here.
+    let response = get_logs(&base, &cookie, "").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["entries"].as_array().unwrap().len(), 4);
+
+    // Garbage is rejected, never silently defaulted.
+    for query in ["?limit=abc", "?limit=-1", "?limit=", "?limit=1.5"] {
+        let response = get_logs(&base, &cookie, query).await;
+        assert_eq!(
+            response.status(),
+            400,
+            "GET /api/logs{query} must be rejected, got {}",
+            response.status()
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("limit"), "got {body:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_log_limit_has_a_hard_maximum_that_does_not_depend_on_the_ring() {
+    // A ring configured larger than the hard maximum must still not be
+    // dumpable in one request: the ceiling is the response size, not the
+    // buffer's capacity.
+    let (base, _dir, buffer) = spawn_test_server_with_logs(5000).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    for i in 0..1500 {
+        buffer.push(haos_green::web::logs::LogEntry::new(
+            "INFO",
+            "haos_green::test",
+            &format!("line {i}"),
+        ));
+    }
+
+    let response = get_logs(&base, &cookie, "?limit=100000").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        1000,
+        "the hard maximum must cap a response even when the ring is bigger: got {}",
+        entries.len()
+    );
+    assert_eq!(body["capacity"], serde_json::json!(5000));
+
+    // The entries are the newest 1000, oldest first: 500..1499.
+    assert_eq!(entries[0]["message"], serde_json::json!("line 500"));
+    assert_eq!(entries[999]["message"], serde_json::json!("line 1499"));
+}
+
+#[tokio::test]
+async fn a_wrapped_log_read_is_bounded_and_ordered() {
+    let (base, _dir, buffer) = spawn_test_server_with_logs(4).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    for i in 0..10 {
+        buffer.push(haos_green::web::logs::LogEntry::new(
+            "INFO",
+            "haos_green::test",
+            &format!("line {i}"),
+        ));
+    }
+
+    let response = get_logs(&base, &cookie, "").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let messages: Vec<&str> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["message"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        messages,
+        vec!["line 6", "line 7", "line 8", "line 9"],
+        "a wrapped ring must return the newest entries, oldest first: {body}"
+    );
+    assert_eq!(body["entries"][0]["level"], serde_json::json!("INFO"));
+    assert_eq!(
+        body["entries"][0]["target"],
+        serde_json::json!("haos_green::test")
+    );
+    assert!(
+        body["entries"][0]["timestamp"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "every entry carries a timestamp: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_log_stream_delivers_entries_pushed_after_it_connects() {
+    let (base, _dir, buffer) = spawn_test_server_with_logs(16).await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    // History: pushed before the stream exists, so it is not a live event.
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "INFO",
+        "haos_green::test",
+        "before the stream",
+    ));
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/logs/stream"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the stream route must answer 200");
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "the stream route must answer with SSE, got {content_type:?}"
+    );
+
+    // The response head is in, so the tail's cursor was read before it: both of
+    // these are guaranteed to be delivered.
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "INFO",
+        "haos_green::test",
+        "live one",
+    ));
+    // A message carrying everything that could break the SSE framing: a bare
+    // newline, a `data:` line and an `event:` line.
+    buffer.push(haos_green::web::logs::LogEntry::new(
+        "WARN",
+        "haos_green::test",
+        "live two\ndata: injected\n\nevent: injected",
+    ));
+
+    let events = read_sse_frames(response, 2, std::time::Duration::from_secs(5)).await;
+    let logs: Vec<serde_json::Value> = events
+        .iter()
+        .filter(|(kind, _)| kind == "log")
+        .map(|(_, data)| {
+            serde_json::from_str(data)
+                .unwrap_or_else(|e| panic!("the log event must carry JSON: {e}: {data:?}"))
+        })
+        .collect();
+
+    assert_eq!(
+        logs.len(),
+        2,
+        "exactly two log events, one per pushed entry — a message containing \
+         `data:`/`event:` lines must not be able to forge extra frames: {events:?}"
+    );
+    assert_eq!(
+        logs[0]["message"].as_str().unwrap(),
+        "live one",
+        "the stream must not replay history: {events:?}"
+    );
+    assert_eq!(
+        logs[1]["message"].as_str().unwrap(),
+        "live two\ndata: injected\n\nevent: injected",
+        "the newline must survive the round trip intact: {events:?}"
+    );
+    assert_eq!(logs[1]["level"].as_str().unwrap(), "WARN");
+    assert_eq!(logs[1]["target"].as_str().unwrap(), "haos_green::test");
+}
+
+/// A tail must not outlive the tab that opened it.
+///
+/// The stream's task holds its own `Arc<LogBuffer>`, so the buffer's strong
+/// count is a direct observation of whether that task is still alive: it is
+/// above the idle floor while the stream is open, and back at the floor once
+/// the client disconnects. Both connections are raw sockets the test owns, so
+/// nothing else can be holding a reference.
+#[tokio::test]
+async fn the_log_stream_task_stops_when_the_client_disconnects() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = std::sync::Arc::new(haos_green::web::logs::LogBuffer::new(16));
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_logs(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        buffer.clone(),
+    )
+    .await
+    .expect("the dashboard should start with a log buffer");
+    let base = format!("http://{addr}");
+
+    let cookie = login_over_a_raw_socket(addr).await;
+
+    // The login socket is closed by now (`Connection: close`, read to EOF).
+    // Wait for the count to settle so the baseline is the idle floor.
+    let mut baseline = std::sync::Arc::strong_count(&buffer);
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let now = std::sync::Arc::strong_count(&buffer);
+        if now == baseline {
+            break;
+        }
+        baseline = now;
+    }
+
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET /api/logs/stream HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut byte))
+            .await
+            .expect("the response head must arrive")
+            .unwrap();
+        assert_ne!(
+            read,
+            0,
+            "the connection closed before the head: {:?}",
+            String::from_utf8_lossy(&head)
+        );
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "the stream must open: {head:?}"
+    );
+
+    // The tail task is alive and holding the buffer.
+    let streaming = std::sync::Arc::strong_count(&buffer);
+    assert!(
+        streaming > baseline,
+        "the tail task must hold the buffer while the stream is open: \
+         {streaming} vs a baseline of {baseline}"
+    );
+
+    // Close the client. Nothing else in this test owns a connection.
+    drop(socket);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let now = std::sync::Arc::strong_count(&buffer);
+        if now == baseline {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tail task is still holding the log buffer {now} vs {baseline} \
+             ten seconds after the client disconnected — a leaked task per \
+             abandoned tab"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // The dashboard still works afterwards: the leaked task would not have
+    // broken this, but a stream that took the process down would.
+    let response = get_logs(&base, &cookie, "").await;
+    assert_eq!(response.status(), 200);
 }
 
 // ── Live chat streaming (opt-in) ────────────────────────────────────────────

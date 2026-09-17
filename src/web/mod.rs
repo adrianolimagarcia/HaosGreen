@@ -36,7 +36,7 @@ use crate::agent::Agent;
 use crate::config::WebConfig;
 use crate::supervisor::Supervisor;
 use auth::{Credentials, IpGate, LoginLimiter, SessionStore};
-use state::{WebState, LOG_BUFFER_CAPACITY};
+use state::WebState;
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
@@ -109,16 +109,19 @@ async fn serve_style_css() -> impl axum::response::IntoResponse {
 
 /// Assemble the shared state.
 ///
-/// `agent` and `supervisor` are optional so the foundation is testable without
-/// constructing either: `Agent::new` takes the whole configuration surface and
-/// `Supervisor` needs a live database connection. Routes that need them call
-/// `WebState::agent_or_unavailable` / `supervisor_or_unavailable`, which return
-/// 503 rather than panicking.
+/// `agent`, `supervisor` and `logs` are optional so the foundation is testable
+/// without constructing any of them: `Agent::new` takes the whole configuration
+/// surface, `Supervisor` needs a live database connection, and the log buffer
+/// only has content once the tracing layer that feeds it has been installed.
+/// Routes that need them call `WebState::agent_or_unavailable` /
+/// `supervisor_or_unavailable` / `logs_or_unavailable`, which return 503 rather
+/// than panicking.
 fn build_state(
     config: WebConfig,
     home: PathBuf,
     agent: Option<Arc<Agent>>,
     supervisor: Option<Arc<Supervisor>>,
+    logs: Option<Arc<logs::LogBuffer>>,
 ) -> Result<WebState> {
     config.validate()?;
     let credentials_path = home.join("web-auth.toml");
@@ -140,7 +143,7 @@ fn build_state(
         credentials: Arc::new(Mutex::new(credentials)),
         credentials_path,
         chat: Arc::new(chat::ChatSessionStore::new()),
-        logs: Arc::new(logs::LogBuffer::new(LOG_BUFFER_CAPACITY)),
+        logs,
         config,
         agent,
         supervisor,
@@ -151,11 +154,16 @@ fn build_state(
 ///
 /// A failure here is logged by the caller and must never take the Telegram bot
 /// down, mirroring how the A2A listener is treated.
+///
+/// `logs` is the **same** `Arc<LogBuffer>` the `LogLayer` installed in
+/// `main.rs` writes into. Handing the dashboard its own buffer would compile,
+/// run, and show an operator a permanently empty log view.
 pub async fn spawn(
     config: WebConfig,
     home: PathBuf,
     agent: Arc<Agent>,
     supervisor: Arc<Supervisor>,
+    logs: Arc<logs::LogBuffer>,
 ) -> Result<SocketAddr> {
     // The flag is authoritative here too, not only at the call site: a caller
     // that forgets to check `enabled` must not be able to open the port.
@@ -164,7 +172,7 @@ pub async fn spawn(
     }
 
     let bind = config.bind.clone();
-    let state = build_state(config, home, Some(agent), Some(supervisor))?;
+    let state = build_state(config, home, Some(agent), Some(supervisor), Some(logs))?;
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("failed to bind web dashboard to {bind}"))?;
@@ -241,6 +249,15 @@ pub async fn spawn_for_test_with(home: PathBuf, config: WebConfig) -> Result<(So
 /// route answers 503 without one, so a test that never wires an agent would
 /// prove nothing about streaming. `Supervisor` stays `None` — no chat route
 /// touches it.
+#[doc(hidden)]
+pub async fn spawn_for_test_with_agent(
+    home: PathBuf,
+    config: WebConfig,
+    agent: Option<Arc<Agent>>,
+) -> Result<(SocketAddr, ())> {
+    spawn_for_test_with_handles(home, config, agent, None, None).await
+}
+
 /// [`spawn_for_test_with_agent`] with a supervisor attached.
 ///
 /// The supervisor routes answer 503 without one, so a test that never wires a
@@ -255,27 +272,36 @@ pub async fn spawn_for_test_with_supervisor(
     config: WebConfig,
     supervisor: Option<Arc<Supervisor>>,
 ) -> Result<(SocketAddr, ())> {
-    spawn_for_test_with_handles(home, config, None, supervisor).await
+    spawn_for_test_with_handles(home, config, None, supervisor, None).await
 }
 
+/// [`spawn_for_test_with`] with a live log buffer attached.
+///
+/// The log routes answer 503 without one, and the buffer has to be the
+/// caller's: the tests push into it and then read the result back over HTTP,
+/// which is the only way to show that the routes and the buffer are the same
+/// object. The three `spawn_for_test_with_*` entry points above deliberately
+/// wire **no** buffer, so they double as the "dashboard started without logs"
+/// harness.
 #[doc(hidden)]
-pub async fn spawn_for_test_with_agent(
+pub async fn spawn_for_test_with_logs(
     home: PathBuf,
     config: WebConfig,
-    agent: Option<Arc<Agent>>,
+    logs: Arc<logs::LogBuffer>,
 ) -> Result<(SocketAddr, ())> {
-    spawn_for_test_with_handles(home, config, agent, None).await
+    spawn_for_test_with_handles(home, config, None, None, Some(logs)).await
 }
 
-/// The shared body of the three `spawn_for_test_with_*` entry points.
+/// The shared body of the `spawn_for_test_with_*` entry points.
 async fn spawn_for_test_with_handles(
     home: PathBuf,
     mut config: WebConfig,
     agent: Option<Arc<Agent>>,
     supervisor: Option<Arc<Supervisor>>,
+    logs: Option<Arc<logs::LogBuffer>>,
 ) -> Result<(SocketAddr, ())> {
     config.enabled = true;
-    let state = build_state(config, home, agent, supervisor)?;
+    let state = build_state(config, home, agent, supervisor, logs)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {

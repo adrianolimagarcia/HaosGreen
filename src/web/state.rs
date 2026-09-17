@@ -1,10 +1,12 @@
 //! Shared handles for the dashboard route modules.
 //!
 //! `WebState` is cloned into every request, so every field is an `Arc`. The
-//! `agent` and `supervisor` handles are optional on purpose: the dashboard's
-//! foundation (auth, settings, static assets) must be runnable and testable
-//! without constructing an `Agent` — its constructor takes the whole
-//! configuration surface — or a `Supervisor`, which needs a live database.
+//! `agent`, `supervisor` and `logs` handles are optional on purpose: the
+//! dashboard's foundation (auth, settings, static assets) must be runnable and
+//! testable without constructing an `Agent` — its constructor takes the whole
+//! configuration surface — or a `Supervisor`, which needs a live database, or
+//! without a `LogBuffer`, which only exists once `main.rs` has installed the
+//! tracing layer that feeds it.
 //! Routes that genuinely need them return `503 Service Unavailable` when they
 //! are absent instead of panicking, so a partially wired dashboard degrades
 //! instead of killing the process that also serves Telegram.
@@ -47,9 +49,13 @@ pub struct WebState {
     /// work on a dashboard that was started without an agent, and only the
     /// routes that actually *run* the agent return 503.
     pub chat: Arc<ChatSessionStore>,
-    /// Bounded ring buffer of recent tracing events (Phase 4 feeds it; the
-    /// handle lives here so `WebState` does not have to change again).
-    pub logs: Arc<LogBuffer>,
+    /// Bounded ring buffer of recent tracing events (Phase 4).
+    ///
+    /// `None` when the dashboard was started without one. The routes read the
+    /// **same** `Arc` the `tracing_subscriber::Layer` installed in `main.rs`
+    /// writes to: a buffer of the dashboard's own would be permanently empty,
+    /// which is exactly the kind of failure that looks like "no logs yet".
+    pub logs: Option<Arc<LogBuffer>>,
 }
 
 /// Number of tracing events retained for the dashboard log view.
@@ -80,6 +86,21 @@ impl WebState {
             "the dashboard was started without a supervisor",
         ))
     }
+
+    /// The log buffer, or a 503 body explaining why it is missing.
+    ///
+    /// Same contract as [`Self::agent_or_unavailable`] and
+    /// [`Self::supervisor_or_unavailable`]: a dashboard wired without logs
+    /// degrades to 503 rather than reporting an empty log, which would be
+    /// indistinguishable from a quiet process.
+    pub fn logs_or_unavailable(
+        &self,
+    ) -> Result<Arc<LogBuffer>, (axum::http::StatusCode, &'static str)> {
+        self.logs.clone().ok_or((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "the dashboard was started without a log buffer",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -106,7 +127,7 @@ mod tests {
             supervisor: None,
             credentials_path: PathBuf::from("/nonexistent/web-auth.toml"),
             chat: Arc::new(ChatSessionStore::new()),
-            logs: Arc::new(LogBuffer::new(16)),
+            logs: Some(Arc::new(LogBuffer::new(16))),
         }
     }
 

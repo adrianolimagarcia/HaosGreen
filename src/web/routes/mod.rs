@@ -19,6 +19,7 @@
 
 pub mod auth_routes;
 pub mod chat;
+pub mod logs;
 pub mod settings;
 pub mod supervisor;
 
@@ -35,11 +36,14 @@ use crate::web::state::WebState;
 ///
 /// The supervisor routes belong here and not on [`public_router`]: submitting a
 /// task starts work on the operator's behalf, and every lifecycle route changes
-/// persisted state.
+/// persisted state. The log routes belong here for the same reason in reverse:
+/// the log carries targets, paths and error text, and it is the surface a
+/// future change is most likely to leak through.
 pub fn router() -> Router<WebState> {
     Router::new()
         .merge(auth_routes::router())
         .merge(chat::router())
+        .merge(logs::router())
         .merge(settings::router())
         .merge(supervisor::router())
 }

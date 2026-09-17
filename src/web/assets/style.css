@@ -1179,6 +1179,288 @@ input:disabled {
   text-align: center;
 }
 
+/* ── Logs ────────────────────────────────────────────────────────────────── */
+
+/*
+ * The live log surface (design spec §5.3).
+ *
+ * Depth comes from the sunken well, exactly as in the chat transcript, and the
+ * rows inside it carry no shadow of their own: this list can hold two thousand
+ * of them, and two thousand dual shadows is a paint cost a live tail cannot
+ * justify. Separation is space plus the level chip's own inset shadow, which is
+ * the same pill language as the rest of the dashboard.
+ *
+ * The rows are monospace and dense — a log is read down a column, not as prose —
+ * while the surrounding controls keep the card and chip treatment. Every colour
+ * below is a custom property declared in `:root`, and no rule here draws a
+ * border.
+ */
+
+.log-card .card-head {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.log-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.log-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* A filter chip is a button, so it needs the resets `.chip` does not carry.
+   On is the pressed state — the chip stays sunken, like the active nav pill —
+   and off raises it back out of the surface, so the row reads as a set of
+   switches whose state is visible without a legend. */
+.log-toggle {
+  border: 0;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: var(--ease);
+}
+
+.log-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-in), var(--ring-strong);
+}
+
+.log-toggle.is-off {
+  background: var(--bg);
+  box-shadow: var(--shadow-out-sm);
+  color: var(--text-muted);
+}
+
+.log-toggle.is-off::before {
+  background: var(--text-muted);
+  opacity: 0.45;
+}
+
+.log-toggle-error::before {
+  background: var(--danger);
+}
+
+.log-toggle-error[aria-pressed="true"] {
+  background: var(--danger-tint);
+}
+
+.log-toggle-warn::before {
+  background: var(--accent);
+}
+
+.log-toggle-warn[aria-pressed="true"] {
+  background: var(--accent-tint);
+}
+
+.log-toggle-info::before {
+  background: var(--accent-bright);
+}
+
+.log-toggle-debug::before {
+  background: var(--text-muted);
+}
+
+.log-toggle-other::before {
+  background: var(--text);
+}
+
+.log-search {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.log-input {
+  width: 100%;
+  padding: 9px 14px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.92rem;
+  transition: var(--ease);
+}
+
+.log-input::placeholder {
+  color: var(--text-muted);
+}
+
+.log-input:focus {
+  outline: none;
+  box-shadow: var(--shadow-in-deep), var(--ring);
+}
+
+.log-reset {
+  margin-left: auto;
+}
+
+.log-well {
+  height: min(62vh, 640px);
+  min-height: 200px;
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in-deep);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.log-well:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-in-deep), var(--ring-strong);
+}
+
+.log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.log-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.log-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* A fixed-width chip so the time and the target start at the same x on every
+   row: a log is scanned down a column, and a ragged left edge costs more than
+   the space it saves. */
+.log-level {
+  flex: 0 0 auto;
+  justify-content: center;
+  min-width: 64px;
+  padding: 2px 10px;
+  font-size: 0.7rem;
+}
+
+.log-level-error {
+  background: var(--danger-tint);
+}
+
+.log-level-error::before {
+  background: var(--danger);
+}
+
+.log-level-warn {
+  background: var(--accent-tint);
+}
+
+.log-level-warn::before {
+  background: var(--accent);
+}
+
+.log-level-debug {
+  color: var(--text-muted);
+}
+
+.log-level-debug::before {
+  background: var(--accent-bright);
+}
+
+.log-level-other::before {
+  background: var(--text);
+}
+
+.log-time,
+.log-target,
+.log-message,
+.log-gap {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.log-time {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-target {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+/* `pre-wrap` is what keeps a multi-line message, or one carrying a `data:`
+   line, inside its own row instead of breaking the layout; `anywhere` covers
+   the single unbroken token — a URL, a base64 blob — that has no break in it. */
+.log-message {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.84rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-truncated {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Where lines were missed. Attention, not alarm: the view is working, it just
+   cannot show what the server never kept. */
+.log-row-gap {
+  background: var(--accent-tint);
+}
+
+.log-gap {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.log-empty {
+  margin: 26px 12px;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  text-align: center;
+}
+
+.log-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.log-jump {
+  margin-right: auto;
+}
+
+.log-meta {
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 
 /* ── Supervisor ──────────────────────────────────────────────────────────── */
@@ -1766,6 +2048,11 @@ input:disabled {
     padding: 14px;
   }
 
+  .log-well {
+    height: min(56vh, 520px);
+    padding: 12px;
+  }
+
   .msg {
     max-width: 92%;
   }
@@ -1838,6 +2125,39 @@ input:disabled {
 
   .chat-input-row {
     gap: 8px;
+  }
+
+  /* At 380px the level chips get a row of their own above the text filter, the
+     chip drops its fixed width (the target wraps under it anyway), and the
+     reset button stops being pushed to the far edge of a line it no longer
+     shares. */
+  .log-levels {
+    gap: 6px;
+  }
+
+  .log-toggle {
+    padding: 5px 11px;
+  }
+
+  .log-search {
+    flex: 1 1 100%;
+  }
+
+  .log-reset {
+    margin-left: 0;
+  }
+
+  .log-level {
+    min-width: 0;
+  }
+
+  .log-well {
+    height: min(52vh, 420px);
+    padding: 10px;
+  }
+
+  .log-row {
+    padding: 6px 8px;
   }
 
   /* At 380px a task's title and its state chip each get their own line, and

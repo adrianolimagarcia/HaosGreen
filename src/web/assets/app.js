@@ -17,9 +17,10 @@
  * — the request is a POST with a JSON body — so the response is read through
  * `fetch`'s `ReadableStream` and the SSE frames are reassembled by hand; see
  * the decoder below. The supervisor view lists real tasks and drives their
- * lifecycle through `/api/supervisor/*`. Logs and A2A are still deliberate
- * empty states: a stub that invented rows would be worse than an honest "not
- * yet".
+ * lifecycle through `/api/supervisor/*`. The logs view tails the dashboard's
+ * own bounded tracing buffer through the same decoder, dispatching on the
+ * `log` event name. A2A is still a deliberate empty state: a stub that invented
+ * rows would be worse than an honest "not yet".
  */
 
 (function () {
@@ -54,7 +55,8 @@
     "/logs": {
       title: "Logs",
       icon: "i-bars",
-      body: "Logs will stream the recent tracing events kept in the bounded in-memory ring buffer."
+      // Implemented: the logs view is built by `renderLogs`.
+      body: ""
     },
     "/a2a": {
       title: "A2A",
@@ -254,9 +256,12 @@
     // session store is keyed per web session, so keeping it on screen would
     // show the next operator a conversation they cannot reach. The supervisor
     // view is torn down for the same reason — its poll timer must not keep
-    // reading the task list for a signed-out browser.
+    // reading the task list for a signed-out browser — and so is the log view,
+    // whose stream would otherwise keep an abandoned tab attached to the
+    // server's log buffer.
     resetChat();
     supervisorUnmount();
+    logsUnmount();
     renderBanner();
     byId("app").hidden = true;
     byId("login-overlay").hidden = false;
@@ -392,10 +397,11 @@
     const host = byId("view");
     // Every view owns the whole panel, so the previous one is torn down first —
     // including the chat view's DOM references, which a run that outlives the
-    // view would otherwise keep writing into, and the supervisor view's poll
-    // timer, which must not survive a route change.
+    // view would otherwise keep writing into, the supervisor view's poll
+    // timer, and the log view's tail, which must not survive a route change.
     chatUnmount();
     supervisorUnmount();
+    logsUnmount();
     clear(host);
     if (route === "/settings") {
       renderSettings(host);
@@ -403,6 +409,8 @@
       renderChat(host);
     } else if (route === "/supervisor") {
       renderSupervisor(host);
+    } else if (route === "/logs") {
+      renderLogs(host);
     } else {
       renderStub(host, route);
     }
@@ -3792,6 +3800,1282 @@
     supervisor.listBusy = false;
     supervisor.listQueued = false;
     supervisor.actionBusy = false;
+  }
+
+  /* ── Logs ──────────────────────────────────────────────────────────────── */
+
+  /*
+   * The live log surface (design spec §5.3, plan Task 18).
+   *
+   * What the server actually does, and what this view therefore has to accept:
+   *
+   *  * `GET /api/logs?limit=N` answers the newest N entries, **oldest first**,
+   *    plus the ring's capacity. An absent limit means the server's own default,
+   *    `0` means none, and anything above 1000 is clamped — so the view asks for
+   *    `LOG_HISTORY_LIMIT` and never assumes it received that many.
+   *  * `GET /api/logs/stream` is a **live tail with no replay**: the tail's
+   *    cursor is read when the request arrives, so entries emitted before that
+   *    moment are never resent. The view therefore reads the history *first* and
+   *    opens the stream *second*. That order can leave a gap — lines emitted
+   *    between the two are in neither — but it cannot produce a duplicate,
+   *    because every streamed entry is at or after a cursor that was read after
+   *    the history was already in hand. The gap is stated in the view's own copy
+   *    rather than papered over, and every reattach appends an explicit marker
+   *    in the list where the missing lines would have been.
+   *  * The stream's event name is `log`. `createSseDecoder` already hands the
+   *    frame's event name to its callback, so this view dispatches on it and
+   *    ignores every other name; the decoder is shared with the chat view, not
+   *    duplicated, and the chat view's own `handleChatEvent` is untouched.
+   *  * `level` is `tracing::Level::as_str()` — upper case, and not a closed set
+   *    from the client's point of view. Anything outside ERROR/WARN/INFO/DEBUG
+   *    is rendered under an OTHER filter rather than dropped.
+   *  * Both routes answer **503** when the dashboard was started without a log
+   *    buffer. That is a startup configuration state, not a transient failure,
+   *    so the view says so once and stops; it does not retry it.
+   *
+   * `EventSource` is the natural transport for a GET SSE stream and it does send
+   * the session cookie same-origin, but it exposes no status code at all: a 503
+   * (no buffer), a 401 (session gone) and a dropped connection all arrive as the
+   * same anonymous `error`, so the 503 the operator most needs named is the one
+   * case it cannot distinguish. Its own reconnection would also have to be
+   * suppressed to bound the retry rate. The stream is therefore read through
+   * `fetch` + the shared SSE decoder — the mechanism the chat view already uses
+   * — with an `AbortController` and a generation counter for teardown.
+   *
+   * Every dynamic value goes through `textContent`. A log message is
+   * attacker-influenced: it can carry tool output, a URL, or a line of a user's
+   * own text. None of it is ever parsed as markup.
+   */
+
+  /**
+   * How many entries the view asks `GET /api/logs` for when it opens.
+   *
+   * The server's hard ceiling on one response is 1000, so this asks for exactly
+   * what it can get: a larger number would be clamped and would only suggest a
+   * history the route cannot deliver.
+   */
+  const LOG_HISTORY_LIMIT = 1000;
+
+  /**
+   * Hard cap on rendered rows, and on the entries kept in order to render them.
+   *
+   * A tab can sit on this view for days, so neither the DOM nor the model may
+   * grow with the process's output. 2000 is the ring capacity the design spec
+   * names (§5.3): it is above every history a single `GET /api/logs` can return,
+   * and small enough that re-rendering the whole list on a filter change is a
+   * sub-frame operation. The oldest entries are dropped first, which is the
+   * ring's own eviction order.
+   */
+  const LOG_ROW_CAP = 2000;
+
+  /** The longest message text rendered, in characters. The rest is summarised. */
+  const LOG_MESSAGE_MAX = 2000;
+
+  /** The most lines of one message rendered. A log line is not a file. */
+  const LOG_MESSAGE_LINES = 40;
+
+  /** How close to the bottom still counts as "following the tail", in pixels. */
+  const LOG_PIN_THRESHOLD = 48;
+
+  /**
+   * The reconnect ladder, in milliseconds. The last value repeats and is never
+   * exceeded, so a server that stays down is polled at most once every 15s.
+   */
+  const LOG_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000];
+
+  /**
+   * How long a stream must have stayed live before a drop is treated as a fresh
+   * problem rather than a continuation of the one already being backed off from.
+   *
+   * Without this the ladder would restart at its first rung every time, and a
+   * server that accepts a connection and drops it immediately would be retried
+   * once a second for as long as the tab is open — the tight loop the backoff
+   * exists to prevent. A stream that stayed up for half a minute earned a reset;
+   * one that died on arrival did not.
+   */
+  const LOG_STABLE_MS = 30000;
+
+  /** How long typing in the text filter settles before the list is rebuilt. */
+  const LOG_FILTER_DEBOUNCE_MS = 150;
+
+  /** The filter chips, in the order they are offered. OTHER is not a tracing level. */
+  const LOG_LEVELS = ["ERROR", "WARN", "INFO", "DEBUG", "OTHER"];
+
+  // #region log-core
+
+  /**
+   * The filter bucket a `level` string belongs to.
+   *
+   * `tracing::Level::as_str()` gives ERROR/WARN/INFO/DEBUG in upper case, but the
+   * set is not closed from here: `LogEntry::new` accepts any string (the
+   * backend's own tests push lower case), and a level this build has never seen
+   * must render rather than vanish. Anything unrecognised — including an empty
+   * or missing level — lands in OTHER, which is a filter the operator can turn
+   * off, not a silent drop.
+   */
+  function logLevelKey(level) {
+    const text = typeof level === "string" ? level.trim().toUpperCase() : "";
+    if (text === "ERROR" || text === "WARN" || text === "INFO" || text === "DEBUG") {
+      return text;
+    }
+    return "OTHER";
+  }
+
+  /**
+   * One entry from a `GET /api/logs` body or a `log` frame, or null.
+   *
+   * Every field is copied defensively: a missing or wrongly typed field becomes
+   * an empty string rather than `undefined` reaching `textContent`, which would
+   * print "undefined" into the operator's log.
+   */
+  function normalizeLogEntry(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return null;
+    }
+    return {
+      marker: false,
+      timestamp: typeof raw.timestamp === "string" ? raw.timestamp : "",
+      level: typeof raw.level === "string" ? raw.level : "",
+      target: typeof raw.target === "string" ? raw.target : "",
+      message: typeof raw.message === "string" ? raw.message : ""
+    };
+  }
+
+  /** The JSON payload of one `log` frame, or null when it is not an entry. */
+  function parseLogEvent(data) {
+    if (typeof data !== "string" || data === "") {
+      return null;
+    }
+    let body = null;
+    try {
+      body = JSON.parse(data);
+    } catch (ignored) {
+      return null;
+    }
+    return normalizeLogEntry(body);
+  }
+
+  /**
+   * `{ entries, capacity }` from a `GET /api/logs` body.
+   *
+   * A bare array is accepted as well as the documented envelope, so a change to
+   * the envelope cannot silently empty the view. `capacity` stays null when the
+   * server did not send a number, and the view then says nothing about it rather
+   * than inventing one.
+   */
+  function normalizeLogsBody(body) {
+    const raw = Array.isArray(body)
+      ? body
+      : body && Array.isArray(body.entries)
+        ? body.entries
+        : [];
+    const entries = [];
+    for (let i = 0; i < raw.length; i += 1) {
+      const entry = normalizeLogEntry(raw[i]);
+      if (entry) {
+        entries.push(entry);
+      }
+    }
+    const capacity =
+      body && !Array.isArray(body) && typeof body.capacity === "number" && isFinite(body.capacity)
+        ? body.capacity
+        : null;
+    return { entries: entries, capacity: capacity };
+  }
+
+  /**
+   * Whether an entry passes the filter, where `filter` is
+   * `{ levels: { ERROR: bool, ... }, text: <lower case> }`.
+   *
+   * The text filter covers target and message — the two fields an operator
+   * searches by — while the level is a separate axis with its own control. A gap
+   * marker always passes: it is not a log line, and hiding the statement that
+   * lines are missing would be the one thing this view must never do.
+   */
+  function logMatchesFilter(entry, filter) {
+    if (!entry) {
+      return false;
+    }
+    if (entry.marker === true) {
+      return true;
+    }
+    if (filter.levels[logLevelKey(entry.level)] !== true) {
+      return false;
+    }
+    if (filter.text === "") {
+      return true;
+    }
+    return (
+      entry.target.toLowerCase().indexOf(filter.text) !== -1 ||
+      entry.message.toLowerCase().indexOf(filter.text) !== -1
+    );
+  }
+
+  /**
+   * The text to render for a message, and how much of it was left out.
+   *
+   * A log message is unbounded: a tool result logged at debug level can be
+   * megabytes, and one such row would cost more to lay out than the rest of the
+   * view put together. The tail is summarised rather than silently truncated —
+   * the count of omitted characters is shown in the row, so the operator knows
+   * the line is longer than what is on screen. The line count is capped too,
+   * because a 2000-character message made of newlines is 2000 rows tall.
+   */
+  function clampLogMessage(message) {
+    const text = typeof message === "string" ? message : "";
+    let cut = text.length > LOG_MESSAGE_MAX ? LOG_MESSAGE_MAX : text.length;
+    let lines = 0;
+    for (let i = 0; i < cut; i += 1) {
+      if (text.charAt(i) === "\n") {
+        lines += 1;
+        if (lines >= LOG_MESSAGE_LINES) {
+          cut = i;
+          break;
+        }
+      }
+    }
+    if (cut >= text.length) {
+      return { text: text, omitted: 0 };
+    }
+    return { text: text.slice(0, cut), omitted: text.length - cut };
+  }
+
+  /**
+   * The stamp shown in a row's time column.
+   *
+   * The server writes RFC 3339 with nanosecond precision
+   * (`2026-09-17T10:10:33.357828816+00:00`). That is more fractional digits than
+   * `Date` is specified to parse — the format allows three — so the clock is read
+   * out of the string itself and no date is constructed: no engine's leniency is
+   * relied on, and no timezone conversion is invented. The date is kept because a
+   * tail can span midnight, and the full stamp goes in the row's tooltip. An
+   * unexpected shape is shown exactly as it arrived.
+   */
+  function logTimeText(timestamp) {
+    const text = typeof timestamp === "string" ? timestamp : "";
+    const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?/.exec(text);
+    if (!match) {
+      return text.slice(0, 32);
+    }
+    return match[2] + "-" + match[3] + " " + match[4] + (match[5] ? "." + match[5] : "");
+  }
+
+  /**
+   * Drop rows from the front of `list` until it holds at most `cap` of them.
+   *
+   * Only three DOM members are used — `childElementCount`, `firstElementChild`
+   * and `removeChild` — so the bound can be exercised against a fake list as well
+   * as in a browser. Returns how many rows it removed.
+   */
+  function trimLogRows(list, cap) {
+    let removed = 0;
+    while (list.childElementCount > cap && list.firstElementChild) {
+      list.removeChild(list.firstElementChild);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /** Whether the scroll container is close enough to the end to be following it. */
+  function logIsAtBottom(node, threshold) {
+    if (!node) {
+      return true;
+    }
+    return node.scrollHeight - node.scrollTop - node.clientHeight <= threshold;
+  }
+
+  // #endregion log-core
+
+  /**
+   * The logs view's state.
+   *
+   * The model lives here rather than in the DOM because the filters are applied
+   * to it: narrowing the filter hides rows, and widening it again brings back
+   * entries the DOM no longer holds. `dom` is null whenever the view is
+   * unmounted and every DOM write is guarded on it.
+   */
+  const logs = {
+    /** Every entry received, oldest first, capped at `LOG_ROW_CAP`. */
+    entries: [],
+    /** Entries the cap has evicted from the front, for the counter line. */
+    dropped: 0,
+    /** Entries decoded from the current chunk but not yet appended. */
+    batch: [],
+    /** `{ levels: {...}, text: <lower case> }`. */
+    filter: {
+      levels: { ERROR: true, WARN: true, INFO: true, DEBUG: true, OTHER: true },
+      text: ""
+    },
+    /** The ring's capacity as `GET /api/logs` reported it, or null. */
+    capacity: null,
+    /** True once the history read has answered, either way. */
+    historyLoaded: false,
+    /** Why the history read failed, when it did but the view carried on. */
+    historyError: "",
+    /** Whether new lines pull the view down; cleared when the operator scrolls up. */
+    follow: true,
+    /** Lines appended while the operator was scrolled away. */
+    pendingNew: 0,
+    /** idle | connecting | live | retrying | unavailable | forbidden | unsupported. */
+    state: "idle",
+    /** Failed attempts since the last *stable* stream, for the backoff ladder. */
+    attempt: 0,
+    /** When the current (or last) stream went live, for the stability test. */
+    liveAt: 0,
+    /** The delay currently being waited out, in ms. */
+    retryDelay: 0,
+    /** The server's own words for the last failure, when it gave any. */
+    lastError: "",
+    /** True once a stream has been live, so the next one marks a gap. */
+    connectedBefore: false,
+    /** The pending retry timeout and the resolver that cancels it. */
+    retryTimer: null,
+    retryResolve: null,
+    /** The pending filter debounce. */
+    filterTimer: null,
+    /** The AbortController for the in-flight stream, or null. */
+    controller: null,
+    /**
+     * Bumped by every start, retry and unmount. A read, a wait or a response
+     * whose generation is stale belongs to a stream nobody is watching, and
+     * every await in the loop is guarded on it. This is what makes teardown
+     * exact: nulling `dom` alone would not stop a loop that is suspended in a
+     * backoff wait from starting another connection.
+     */
+    generation: 0,
+    dom: null
+  };
+
+  /** Forget every entry, keeping the filters and the scroll preference. */
+  function resetLogEntries() {
+    logs.entries = [];
+    logs.dropped = 0;
+    logs.batch = [];
+    logs.pendingNew = 0;
+    logs.historyLoaded = false;
+    logs.historyError = "";
+  }
+
+  /* ── Logs: rows ────────────────────────────────────────────────────────── */
+
+  /**
+   * One row for one entry.
+   *
+   * The level chip carries the level's own text, so colour is never the only
+   * signal; the message is a `pre-wrap` block, which is what keeps a multi-line
+   * message — or one carrying a `data:` line, or a URL — inside its own row
+   * instead of breaking the layout.
+   */
+  function logRow(entry) {
+    if (entry.marker === true) {
+      const gap = make("li", "log-row log-row-gap");
+      gap.appendChild(make("p", "log-gap", entry.message));
+      return gap;
+    }
+
+    const row = make("li", "log-row");
+    const head = make("div", "log-row-head");
+
+    const key = logLevelKey(entry.level);
+    const label = entry.level === "" ? "OTHER" : entry.level.slice(0, 12);
+    head.appendChild(make("span", "chip log-level log-level-" + key.toLowerCase(), label));
+    head.appendChild(make("span", "log-time", logTimeText(entry.timestamp)));
+    head.appendChild(make("span", "log-target", entry.target));
+    row.appendChild(head);
+
+    const body = clampLogMessage(entry.message);
+    const message = make("p", "log-message", body.text === "" ? "(no message)" : body.text);
+    if (body.omitted > 0) {
+      message.appendChild(
+        make("span", "log-truncated", " … " + body.omitted + " more characters not shown")
+      );
+    }
+    row.appendChild(message);
+
+    if (entry.timestamp !== "") {
+      row.title = entry.timestamp;
+    }
+    return row;
+  }
+
+  /** How many of the retained entries the current filter lets through. */
+  function countShownLogEntries() {
+    let shown = 0;
+    for (let i = 0; i < logs.entries.length; i += 1) {
+      if (logMatchesFilter(logs.entries[i], logs.filter)) {
+        shown += 1;
+      }
+    }
+    return shown;
+  }
+
+  function paintLogEmpty(shown) {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    let text = "";
+    if (logs.state === "unavailable" || logs.state === "forbidden" || logs.state === "unsupported") {
+      // The status line above is already carrying the reason; a second, wrong
+      // explanation ("the buffer is empty") would be worse than none.
+      text = "";
+    } else if (!logs.historyLoaded) {
+      text = "Reading the recent lines…";
+    } else if (logs.entries.length === 0) {
+      text = "No lines yet. The buffer is empty; new lines appear here as the process emits them.";
+    } else if (shown === 0) {
+      text = "No lines match the current filter.";
+    }
+    dom.empty.textContent = text;
+    dom.empty.hidden = text === "";
+  }
+
+  function paintLogCounters(shown) {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    let text = logs.entries.length + (logs.entries.length === 1 ? " line" : " lines") + " retained";
+    if (logs.dropped > 0) {
+      text += " · oldest " + logs.dropped + " dropped";
+    }
+    if (shown !== logs.entries.length) {
+      text += " · " + shown + " shown by the filter";
+    }
+    if (typeof logs.capacity === "number") {
+      text += " · the server's buffer holds " + logs.capacity;
+    }
+    dom.meta.textContent = text;
+  }
+
+  /** Rebuild the whole list from the model. Used on mount and on filter change. */
+  function paintLogRows() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    clear(dom.list);
+    const fragment = document.createDocumentFragment();
+    let shown = 0;
+    for (let i = 0; i < logs.entries.length; i += 1) {
+      const entry = logs.entries[i];
+      if (logMatchesFilter(entry, logs.filter)) {
+        fragment.appendChild(logRow(entry));
+        shown += 1;
+      }
+    }
+    dom.list.appendChild(fragment);
+    trimLogRows(dom.list, LOG_ROW_CAP);
+    paintLogEmpty(shown);
+    paintLogCounters(shown);
+  }
+
+  /* ── Logs: scrolling ───────────────────────────────────────────────────── */
+
+  /** Pull the view to the newest line, and resume following. */
+  function scrollLogToEnd() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    logs.pendingNew = 0;
+    logs.follow = true;
+    dom.well.scrollTop = dom.well.scrollHeight;
+    paintLogJump();
+  }
+
+  function paintLogJump() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    dom.jump.hidden = logs.follow;
+    const text =
+      logs.pendingNew > 0 ? "Jump to latest · " + logs.pendingNew + " new" : "Jump to latest";
+    if (dom.jump.textContent !== text) {
+      dom.jump.textContent = text;
+    }
+  }
+
+  /**
+   * The operator's own scrolling is the only thing that may stop the tail.
+   *
+   * A programmatic `scrollTop` write fires this too, and that is fine: it lands
+   * at the bottom, so the state it computes is the state that was just set.
+   */
+  function onLogScroll() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    const atBottom = logIsAtBottom(dom.well, LOG_PIN_THRESHOLD);
+    logs.follow = atBottom;
+    if (atBottom) {
+      logs.pendingNew = 0;
+    }
+    paintLogJump();
+  }
+
+  /* ── Logs: appending ───────────────────────────────────────────────────── */
+
+  /**
+   * Add entries to the model and, when they pass the filter, to the list.
+   *
+   * Both bounds are enforced here. The model is capped first — nothing below may
+   * grow with the process's output — and the list is trimmed independently,
+   * because a row rendered before the filter hid its neighbours can outlive its
+   * entry in the model.
+   */
+  function appendLogEntries(entries) {
+    if (!entries || entries.length === 0) {
+      return 0;
+    }
+    const dom = logs.dom;
+    const fragment = dom ? document.createDocumentFragment() : null;
+    let added = 0;
+
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      logs.entries.push(entry);
+      if (fragment && logMatchesFilter(entry, logs.filter)) {
+        fragment.appendChild(logRow(entry));
+        added += 1;
+      }
+    }
+
+    if (logs.entries.length > LOG_ROW_CAP) {
+      const overflow = logs.entries.length - LOG_ROW_CAP;
+      logs.entries.splice(0, overflow);
+      logs.dropped += overflow;
+    }
+
+    if (!dom) {
+      return added;
+    }
+
+    if (added > 0) {
+      dom.list.appendChild(fragment);
+      trimLogRows(dom.list, LOG_ROW_CAP);
+      if (logs.follow) {
+        scrollLogToEnd();
+      } else {
+        logs.pendingNew += added;
+        paintLogJump();
+      }
+    }
+    paintLogEmpty(countShownLogEntries());
+    paintLogCounters(countShownLogEntries());
+    return added;
+  }
+
+  /**
+   * State that lines were missed, in the list where they would have been.
+   *
+   * The server keeps no replay buffer, so a gap cannot be filled — but it can be
+   * admitted, in place and in the operator's line of sight, which is the
+   * difference between a log with a hole in it and a log that lies.
+   */
+  function markLogGap(text) {
+    appendLogEntries([{ marker: true, timestamp: "", level: "", target: "", message: text }]);
+  }
+
+  /* ── Logs: filters ─────────────────────────────────────────────────────── */
+
+  function paintLogFilterControls() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    let active = logs.filter.text !== "";
+    for (let i = 0; i < LOG_LEVELS.length; i += 1) {
+      const name = LOG_LEVELS[i];
+      const on = logs.filter.levels[name] === true;
+      const toggle = dom.toggles[name];
+      if (!toggle) {
+        continue;
+      }
+      toggle.setAttribute("aria-pressed", on ? "true" : "false");
+      toggle.classList.toggle("is-off", !on);
+      if (!on) {
+        active = true;
+      }
+    }
+    dom.reset.disabled = !active;
+  }
+
+  /**
+   * Re-render the list under the current filter.
+   *
+   * Nothing is re-fetched: the route has no filter parameters, so the history is
+   * read unfiltered and the same predicate is applied to it and to every
+   * streamed entry. Re-reading the buffer here would also duplicate everything
+   * the stream has already delivered.
+   */
+  function applyLogFilter() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    const following = logs.follow;
+    paintLogFilterControls();
+    paintLogRows();
+    if (following) {
+      // The list was rebuilt, so the scroll offset it had no longer means
+      // anything. An operator who was following the tail is still following it.
+      scrollLogToEnd();
+    }
+  }
+
+  function onLogFilterInput(event) {
+    const value = event && event.target ? event.target.value : "";
+    logs.filter.text = String(value === undefined || value === null ? "" : value)
+      .trim()
+      .toLowerCase();
+    if (logs.filterTimer !== null) {
+      window.clearTimeout(logs.filterTimer);
+    }
+    logs.filterTimer = window.setTimeout(function () {
+      logs.filterTimer = null;
+      applyLogFilter();
+    }, LOG_FILTER_DEBOUNCE_MS);
+  }
+
+  function resetLogFilter() {
+    if (logs.filterTimer !== null) {
+      window.clearTimeout(logs.filterTimer);
+      logs.filterTimer = null;
+    }
+    logs.filter.text = "";
+    for (let i = 0; i < LOG_LEVELS.length; i += 1) {
+      logs.filter.levels[LOG_LEVELS[i]] = true;
+    }
+    if (logs.dom && logs.dom.input) {
+      logs.dom.input.value = "";
+    }
+    applyLogFilter();
+  }
+
+  /* ── Logs: connection state ────────────────────────────────────────────── */
+
+  function logStatusKind() {
+    if (logs.state === "live") {
+      return "ok";
+    }
+    if (logs.state === "retrying") {
+      return "warn";
+    }
+    if (logs.state === "unavailable" || logs.state === "forbidden" || logs.state === "unsupported") {
+      return "error";
+    }
+    return null;
+  }
+
+  function logStatusText() {
+    if (logs.state === "connecting") {
+      // `attempt` counts failures, so the connection being opened now is the
+      // next one: one failure behind us means this is the second try.
+      return logs.attempt > 0
+        ? "Reconnecting to the live log (attempt " + (logs.attempt + 1) + ")…"
+        : "Connecting to the live log…";
+    }
+    if (logs.state === "live") {
+      let text = "Live. New lines are appended as the process emits them.";
+      if (logs.historyError !== "") {
+        text += " The recent history could not be read: " + logs.historyError;
+      }
+      return text;
+    }
+    if (logs.state === "retrying") {
+      return (
+        "The log stream dropped" +
+        (logs.lastError !== "" ? " (" + logs.lastError + ")" : "") +
+        ". Reconnecting in " +
+        Math.round(logs.retryDelay / 1000) +
+        "s — attempt " +
+        logs.attempt +
+        "."
+      );
+    }
+    if (logs.state === "unavailable") {
+      return (
+        "The log is unavailable: " +
+        (logs.lastError !== "" ? logs.lastError : "the dashboard was started without a log buffer") +
+        ". That is decided at startup, not a transient failure, so this view has stopped retrying."
+      );
+    }
+    if (logs.state === "forbidden") {
+      return (
+        "The server refused the log stream: " +
+        (logs.lastError !== "" ? logs.lastError : "the request was refused") +
+        ". Retrying is unlikely to help."
+      );
+    }
+    if (logs.state === "unsupported") {
+      return logs.lastError !== ""
+        ? logs.lastError
+        : "This browser cannot read a streamed response, so the live log cannot be shown here.";
+    }
+    return "";
+  }
+
+  function paintLogStatus() {
+    const dom = logs.dom;
+    if (!dom) {
+      return;
+    }
+    setStatus(dom.status, logStatusKind(), logStatusText());
+    // Retrying is offered only where a retry could plausibly succeed: a 503 is a
+    // startup state and a 403 is an address that has to change, but both can be
+    // resolved by an operator who then wants to reattach without reloading.
+    dom.retry.hidden = !(
+      logs.state === "unavailable" ||
+      logs.state === "forbidden" ||
+      logs.state === "unsupported"
+    );
+  }
+
+  /** The bounded backoff delay for a given attempt number, in ms. */
+  function logRetryDelay(attempt) {
+    const index = attempt < 1 ? 0 : Math.min(attempt, LOG_BACKOFF_MS.length) - 1;
+    return LOG_BACKOFF_MS[index];
+  }
+
+  /**
+   * Wait out the backoff, or return early when the wait is cancelled.
+   *
+   * Resolves true when the loop may continue and false when its generation is
+   * stale — which is how unmount and an explicit retry both interrupt a wait
+   * without leaving a timer behind.
+   */
+  function waitForRetry(generation) {
+    logs.state = "retrying";
+    logs.retryDelay = logRetryDelay(logs.attempt);
+    paintLogStatus();
+    return new Promise(function (resolve) {
+      let settled = false;
+      const finish = function () {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        logs.retryTimer = null;
+        logs.retryResolve = null;
+        resolve(generation === logs.generation && logs.dom !== null);
+      };
+      logs.retryResolve = finish;
+      logs.retryTimer = window.setTimeout(finish, logs.retryDelay);
+    });
+  }
+
+  /** Cancel a pending backoff wait, if there is one. */
+  function cancelLogWait() {
+    if (logs.retryTimer !== null) {
+      window.clearTimeout(logs.retryTimer);
+      logs.retryTimer = null;
+    }
+    const waiter = logs.retryResolve;
+    logs.retryResolve = null;
+    if (waiter) {
+      waiter();
+    }
+  }
+
+  /* ── Logs: the stream ──────────────────────────────────────────────────── */
+
+  /** Release a response whose body is not going to be read. */
+  function discardLogResponse(response) {
+    try {
+      if (response && response.body && typeof response.body.cancel === "function") {
+        const closing = response.body.cancel();
+        if (closing && typeof closing.catch === "function") {
+          closing.catch(function () {
+            // Already closed or aborted; nothing to release.
+          });
+        }
+      }
+    } catch (ignored) {
+      // A body that is already locked or disturbed throws synchronously.
+    }
+  }
+
+  /**
+   * One `log` frame at a time, batched per decoded chunk.
+   *
+   * The decoder calls back once per frame, so appending per callback would mean
+   * one layout read per line: a 256-entry burst would measure `scrollHeight`
+   * 256 times. The batch is flushed once after each `push`, which is the
+   * smallest unit the transport actually delivers.
+   */
+  function handleLogEvent(kind, data) {
+    if (kind !== "log") {
+      // The server names every frame on this stream `log`. Anything else is
+      // ignored rather than guessed at, exactly as the chat view treats an
+      // unknown kind: the decoder is shared, the dispatch is not.
+      return;
+    }
+    const entry = parseLogEvent(data);
+    if (entry) {
+      logs.batch.push(entry);
+    }
+  }
+
+  function flushLogBatch() {
+    if (logs.batch.length === 0) {
+      return;
+    }
+    const batch = logs.batch;
+    logs.batch = [];
+    appendLogEntries(batch);
+  }
+
+  /** Read one live stream to its end, dispatching `log` frames as they arrive. */
+  async function readLogStream(response, generation) {
+    const reader = response.body.getReader();
+    const textDecoder = new TextDecoder("utf-8");
+    const decoder = createSseDecoder(handleLogEvent);
+
+    try {
+      for (;;) {
+        const step = await reader.read();
+        if (generation !== logs.generation) {
+          return;
+        }
+        if (step.done) {
+          break;
+        }
+        decoder.push(textDecoder.decode(step.value, { stream: true }));
+        flushLogBatch();
+      }
+      // Whatever is left of a multi-byte character, then a frame that never got
+      // its terminating blank line: a stream cut mid-frame would otherwise lose
+      // its last line silently.
+      decoder.push(textDecoder.decode());
+      decoder.flush();
+      flushLogBatch();
+    } catch (error) {
+      if (generation !== logs.generation || isAbort(error)) {
+        return;
+      }
+      logs.lastError = describeError(error);
+    } finally {
+      try {
+        const closing = reader.cancel();
+        if (closing && typeof closing.catch === "function") {
+          closing.catch(function () {
+            // The stream is already closed or aborted; nothing to do.
+          });
+        }
+      } catch (ignored) {
+        // Cancelling a reader that is already released throws synchronously.
+      }
+    }
+  }
+
+  /**
+   * Connect, read, and reconnect while the view is mounted.
+   *
+   * Every await is guarded on the generation, so a loop that has been superseded
+   * by an unmount or an explicit retry stops at its next step instead of
+   * starting another connection. The loop ends — rather than retrying — on the
+   * three answers that a retry cannot change: 401 (the session is gone, so the
+   * view signs out), 403 (the source address is refused) and 503 (the dashboard
+   * has no log buffer). Everything else is waited out on the backoff ladder.
+   *
+   * `logs.attempt` counts failures since the last stream that stayed up long
+   * enough to count (see `LOG_STABLE_MS`), so it is incremented on the failure
+   * paths and never at the top of the loop, where it would double-count every
+   * retry and skip the first rung of the ladder.
+   */
+  async function logStreamLoop(generation) {
+    while (generation === logs.generation && logs.dom) {
+      logs.state = "connecting";
+      paintLogStatus();
+
+      let response = null;
+      try {
+        response = await window.fetch("/api/logs/stream", {
+          method: "GET",
+          credentials: "same-origin",
+          headers: { Accept: "text/event-stream" },
+          signal: logs.controller ? logs.controller.signal : undefined
+        });
+      } catch (error) {
+        if (generation !== logs.generation || isAbort(error)) {
+          return;
+        }
+        logs.lastError = describeError(error);
+        logs.attempt += 1;
+        if (!(await waitForRetry(generation))) {
+          return;
+        }
+        continue;
+      }
+
+      if (generation !== logs.generation || !logs.dom) {
+        discardLogResponse(response);
+        return;
+      }
+
+      if (!response.ok) {
+        const status = response.status;
+        const raw = await readBodyText(response);
+        if (generation !== logs.generation || !logs.dom) {
+          return;
+        }
+        if (status === 401) {
+          showLogin("Your session expired. Sign in again.");
+          return;
+        }
+        if (status === 503 || status === 403) {
+          logs.state = status === 503 ? "unavailable" : "forbidden";
+          logs.lastError = raw;
+          paintLogStatus();
+          paintLogEmpty(0);
+          return;
+        }
+        logs.lastError = raw !== "" ? raw : "the stream answered status " + status;
+        logs.attempt += 1;
+        if (!(await waitForRetry(generation))) {
+          return;
+        }
+        continue;
+      }
+
+      if (!response.body || typeof response.body.getReader !== "function") {
+        logs.state = "unsupported";
+        logs.lastError =
+          "This browser cannot read a streamed response, so the live log cannot be shown here.";
+        paintLogStatus();
+        paintLogEmpty(0);
+        return;
+      }
+
+      // A stream that goes live after a drop, after a failed attempt, or after
+      // an explicit retry, is a point where lines were emitted that no stream
+      // delivered. Say so where they are missing.
+      if (logs.connectedBefore || logs.attempt > 0) {
+        markLogGap(
+          logs.connectedBefore
+            ? "The stream reattached. Lines emitted while it was detached are not replayed."
+            : "The stream attached after " +
+                logs.attempt +
+                " failed attempt(s). Lines emitted before it attached are not replayed."
+        );
+      }
+      logs.connectedBefore = true;
+      logs.liveAt = Date.now();
+      logs.lastError = "";
+      logs.state = "live";
+      paintLogStatus();
+
+      await readLogStream(response, generation);
+      if (generation !== logs.generation || !logs.dom) {
+        return;
+      }
+      // The server never ends this stream on its own, so reaching here means the
+      // connection was cut. A connection that lasted long enough is a fresh
+      // problem and starts the ladder again; one that died on arrival keeps
+      // climbing it.
+      if (Date.now() - logs.liveAt >= LOG_STABLE_MS) {
+        logs.attempt = 0;
+      }
+      logs.attempt += 1;
+      if (!(await waitForRetry(generation))) {
+        return;
+      }
+    }
+  }
+
+  /** Start (or supersede) the stream loop for the mounted view. */
+  function startLogStream() {
+    if (!logs.dom) {
+      return;
+    }
+    if (logs.controller) {
+      // Superseding an in-flight attempt: aborting it is what makes the old
+      // loop's pending read reject now rather than after the next tick.
+      logs.controller.abort();
+      logs.controller = null;
+    }
+    logs.controller = new AbortController();
+    logs.generation += 1;
+    const generation = logs.generation;
+    // A loop parked in a backoff wait belongs to the generation that just ended.
+    cancelLogWait();
+    logs.attempt = 0;
+
+    logStreamLoop(generation)
+      .catch(function (error) {
+        if (generation !== logs.generation || !logs.dom) {
+          return;
+        }
+        logs.state = "unsupported";
+        logs.lastError = "The log stream could not be read: " + describeError(error);
+        paintLogStatus();
+      })
+      .then(function () {
+        if (generation === logs.generation && logs.controller) {
+          logs.controller = null;
+        }
+      });
+  }
+
+  /** Re-read the buffer and reattach, after a state a retry could resolve. */
+  function retryLogView() {
+    if (!logs.dom) {
+      return;
+    }
+    logs.generation += 1;
+    cancelLogWait();
+    if (logs.controller) {
+      logs.controller.abort();
+      logs.controller = null;
+    }
+    logs.attempt = 0;
+    logs.lastError = "";
+    logs.state = "connecting";
+    paintLogStatus();
+    loadLogHistory();
+  }
+
+  /* ── Logs: history ─────────────────────────────────────────────────────── */
+
+  /**
+   * Read the buffer, then attach the tail.
+   *
+   * That order is the whole of the view's honesty about completeness: the
+   * history read is a snapshot, the stream starts after it, and the lines in
+   * between are in neither. The reverse order would deliver duplicates instead,
+   * which is harder for an operator to notice and impossible to repair.
+   */
+  async function loadLogHistory() {
+    const generation = logs.generation;
+    logs.historyLoaded = false;
+    logs.historyError = "";
+    paintLogRows();
+    paintLogStatus();
+
+    let body = null;
+    try {
+      body = await api("/api/logs?limit=" + LOG_HISTORY_LIMIT);
+    } catch (error) {
+      if (generation !== logs.generation || !logs.dom) {
+        return;
+      }
+      logs.historyLoaded = true;
+      if (error && error.status === 401) {
+        showLogin("Your session expired. Sign in again.");
+        return;
+      }
+      if (error && error.status === 503) {
+        logs.state = "unavailable";
+        logs.lastError = (error.message || "").trim();
+        paintLogStatus();
+        paintLogRows();
+        return;
+      }
+      if (error && error.status === 403) {
+        logs.state = "forbidden";
+        logs.lastError = (error.message || "").trim();
+        paintLogStatus();
+        paintLogRows();
+        return;
+      }
+      // A history read that failed for any other reason is reported but does not
+      // stop the view: the tail may still attach, and a live log with no history
+      // is more useful to an operator than an empty panel.
+      logs.historyError = describeError(error);
+      paintLogRows();
+      paintLogStatus();
+      startLogStream();
+      return;
+    }
+
+    if (generation !== logs.generation || !logs.dom) {
+      return;
+    }
+
+    const normalized = normalizeLogsBody(body);
+    resetLogEntries();
+    logs.capacity = normalized.capacity;
+    logs.historyLoaded = true;
+    paintLogRows();
+    appendLogEntries(normalized.entries);
+    startLogStream();
+  }
+
+  /* ── Logs: view ────────────────────────────────────────────────────────── */
+
+  function logFilterBar() {
+    const bar = make("div", "log-filters");
+
+    const levels = make("div", "log-levels");
+    levels.setAttribute("role", "group");
+    levels.setAttribute("aria-label", "Filter by level");
+    const toggles = {};
+    for (let i = 0; i < LOG_LEVELS.length; i += 1) {
+      const name = LOG_LEVELS[i];
+      const toggle = button(name, "chip log-toggle log-toggle-" + name.toLowerCase());
+      toggle.setAttribute("aria-pressed", "true");
+      toggle.addEventListener(
+        "click",
+        (function (level) {
+          return function () {
+            logs.filter.levels[level] = logs.filter.levels[level] !== true;
+            applyLogFilter();
+          };
+        })(name)
+      );
+      toggles[name] = toggle;
+      levels.appendChild(toggle);
+    }
+    bar.appendChild(levels);
+
+    const search = make("div", "log-search");
+    const label = make("label", "sr-only", "Filter lines by text in the target or the message");
+    label.setAttribute("for", "log-filter-text");
+    const input = document.createElement("input");
+    input.id = "log-filter-text";
+    input.className = "log-input";
+    input.type = "search";
+    input.placeholder = "Filter target or message…";
+    input.setAttribute("autocomplete", "off");
+    input.spellcheck = false;
+    input.addEventListener("input", onLogFilterInput);
+    search.appendChild(label);
+    search.appendChild(input);
+    bar.appendChild(search);
+
+    const reset = button("Reset filters", "btn btn-ghost log-reset");
+    reset.addEventListener("click", resetLogFilter);
+    bar.appendChild(reset);
+
+    return { bar: bar, toggles: toggles, input: input, reset: reset };
+  }
+
+  function renderLogs(host) {
+    const card = make("section", "card log-card");
+    card.appendChild(cardHead("i-bars", "Live log"));
+
+    const status = make("p", "status");
+    status.hidden = true;
+    card.appendChild(status);
+
+    const controls = logFilterBar();
+    card.appendChild(controls.bar);
+
+    // The well scrolls; the list inside it holds only rows, so the row cap can
+    // be enforced by counting children without the empty state getting in the way.
+    const well = make("div", "log-well");
+    well.tabIndex = 0;
+    well.setAttribute("aria-label", "Live log lines");
+    well.addEventListener("scroll", onLogScroll);
+
+    const list = make("ol", "log-list");
+    list.setAttribute("role", "log");
+    well.appendChild(list);
+
+    const empty = make("p", "log-empty");
+    empty.hidden = true;
+    well.appendChild(empty);
+    card.appendChild(well);
+
+    const actions = make("div", "log-actions");
+    const jump = button("Jump to latest", "btn btn-ghost log-jump");
+    jump.hidden = true;
+    jump.addEventListener("click", function () {
+      scrollLogToEnd();
+    });
+    const retry = button("Retry now", "btn btn-ghost log-retry");
+    retry.hidden = true;
+    retry.addEventListener("click", function () {
+      retryLogView();
+    });
+    actions.appendChild(jump);
+    actions.appendChild(retry);
+    card.appendChild(actions);
+
+    const meta = make("p", "log-meta");
+    card.appendChild(meta);
+
+    card.appendChild(
+      make(
+        "p",
+        "card-note",
+        "This is a live tail, not a replay. The recent lines are read once when the view opens and new lines are appended as the process emits them; the server keeps no replay buffer, so lines emitted in the moment between those two steps are not shown here. Leaving this view closes the stream. Times are printed exactly as the process wrote them (RFC 3339, UTC); hover a row for the full stamp."
+      )
+    );
+    card.appendChild(
+      make(
+        "p",
+        "card-note",
+        "The list keeps the newest 2000 lines and drops the oldest, so a tab left open for days cannot grow without limit. A message longer than 2000 characters, or longer than 40 lines, is summarised with the number of characters left out."
+      )
+    );
+
+    host.appendChild(card);
+
+    logs.dom = {
+      well: well,
+      list: list,
+      empty: empty,
+      status: status,
+      jump: jump,
+      retry: retry,
+      meta: meta,
+      input: controls.input,
+      reset: controls.reset,
+      toggles: controls.toggles
+    };
+
+    resetLogEntries();
+    logs.follow = true;
+    logs.state = "connecting";
+    logs.attempt = 0;
+    logs.liveAt = 0;
+    logs.retryDelay = 0;
+    logs.lastError = "";
+    logs.capacity = null;
+    logs.connectedBefore = false;
+    logs.generation += 1;
+
+    paintLogFilterControls();
+    paintLogRows();
+    paintLogStatus();
+    paintLogJump();
+
+    loadLogHistory();
+  }
+
+  /**
+   * Stop the tail and drop every reference to the logs view's DOM.
+   *
+   * `navigate()` calls this before rendering the next route and `showLogin`
+   * calls it when the session ends. The server's tail task ends when its
+   * response body is dropped, so aborting the fetch is what releases it — a
+   * stream left running here would be the client-side twin of the leaked task
+   * the backend was hardened against. The generation bump is what stops a loop
+   * that is suspended in a backoff wait from opening another connection, and the
+   * timers are cleared here rather than left to fire into a view that is gone.
+   */
+  function logsUnmount() {
+    logs.generation += 1;
+    cancelLogWait();
+    if (logs.filterTimer !== null) {
+      window.clearTimeout(logs.filterTimer);
+      logs.filterTimer = null;
+    }
+    if (logs.controller) {
+      logs.controller.abort();
+      logs.controller = null;
+    }
+    logs.batch = [];
+    logs.state = "idle";
+    logs.attempt = 0;
+    logs.liveAt = 0;
+    logs.retryDelay = 0;
+    logs.connectedBefore = false;
+    logs.dom = null;
   }
 
   /* ── Boot ──────────────────────────────────────────────────────────────── */
