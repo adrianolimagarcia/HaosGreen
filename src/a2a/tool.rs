@@ -337,6 +337,7 @@ mod tests {
                 timeout_secs: 10,
                 poll_interval_ms: 100,
                 poll_timeout_secs: 10,
+                send_timeout_secs: None,
             },
         );
         let tool = CallA2aAgent::new(shared(outbound));
@@ -364,6 +365,7 @@ mod tests {
                 timeout_secs: 10,
                 poll_interval_ms: 100,
                 poll_timeout_secs: 10,
+                send_timeout_secs: None,
             },
         );
         let tool = CallA2aAgent::new(shared(outbound));
@@ -476,6 +478,7 @@ mod tests {
                 timeout_secs: 5,
                 poll_interval_ms: 50,
                 poll_timeout_secs: 5,
+                send_timeout_secs: None,
             },
         );
 
@@ -519,6 +522,7 @@ mod tests {
                 timeout_secs: 2,
                 poll_interval_ms: 50,
                 poll_timeout_secs: 2,
+                send_timeout_secs: None,
             },
         );
 
@@ -564,6 +568,7 @@ mod tests {
                 timeout_secs: 1, // 1 second timeout
                 poll_interval_ms: 10,
                 poll_timeout_secs: 1,
+                send_timeout_secs: None,
             },
         );
 
@@ -593,6 +598,7 @@ mod tests {
                 timeout_secs: 5,
                 poll_interval_ms: 50,
                 poll_timeout_secs: 5,
+                send_timeout_secs: None,
             },
         );
         let text_with_secret =
@@ -612,6 +618,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 20,
             poll_timeout_secs: 5,
+            send_timeout_secs: None,
         }
     }
 

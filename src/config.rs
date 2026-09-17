@@ -416,12 +416,18 @@ pub struct A2aOutboundConfig {
     pub peers: HashMap<String, A2aOutboundPeerConfig>,
 }
 
+pub const MAX_A2A_SEND_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct A2aOutboundPeerConfig {
     pub url: String,
     pub token: String,
     pub timeout_secs: u64,
+    /// Optional deadline for the complete synchronous SendMessage request.
+    /// `None` preserves `timeout_secs`; values must be 1..=MAX_A2A_SEND_TIMEOUT_SECS.
+    #[serde(default)]
+    pub send_timeout_secs: Option<u64>,
     pub poll_interval_ms: u64,
     pub poll_timeout_secs: u64,
 }
@@ -432,6 +438,7 @@ impl fmt::Debug for A2aOutboundPeerConfig {
             .field("url", &self.url)
             .field("token", &"[REDACTED]")
             .field("timeout_secs", &self.timeout_secs)
+            .field("send_timeout_secs", &self.send_timeout_secs)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("poll_timeout_secs", &self.poll_timeout_secs)
             .finish()
@@ -443,6 +450,7 @@ impl Default for A2aOutboundPeerConfig {
             url: String::new(),
             token: String::new(),
             timeout_secs: 30,
+            send_timeout_secs: None,
             poll_interval_ms: 250,
             poll_timeout_secs: 60,
         }
@@ -464,6 +472,11 @@ impl A2aOutboundPeerConfig {
         }
         if self.timeout_secs < 1 {
             bail!("A2A outbound peer '{name}' timeout_secs must be at least 1");
+        }
+        if let Some(send_timeout_secs) = self.send_timeout_secs {
+            if send_timeout_secs == 0 || send_timeout_secs > MAX_A2A_SEND_TIMEOUT_SECS {
+                bail!("A2A outbound peer '{name}' send_timeout_secs must be between 1 and {MAX_A2A_SEND_TIMEOUT_SECS}");
+            }
         }
         if self.poll_interval_ms < 1 {
             bail!("A2A outbound peer '{name}' poll_interval_ms must be at least 1");
@@ -1681,6 +1694,29 @@ mod tests {
             Some("new-key"),
             "explicit [[provider]] should win"
         );
+    }
+
+    #[test]
+    fn send_timeout_none_falls_back_to_timeout() {
+        let cfg = A2aOutboundPeerConfig {
+            timeout_secs: 7,
+            send_timeout_secs: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.send_timeout_secs.unwrap_or(cfg.timeout_secs), 7);
+    }
+
+    #[test]
+    fn send_timeout_rejects_zero_and_over_cap() {
+        let mut cfg = A2aOutboundPeerConfig {
+            url: "https://example.test".into(),
+            token: "x".into(),
+            ..Default::default()
+        };
+        cfg.send_timeout_secs = Some(0);
+        assert!(cfg.validate("peer").is_err());
+        cfg.send_timeout_secs = Some(MAX_A2A_SEND_TIMEOUT_SECS + 1);
+        assert!(cfg.validate("peer").is_err());
     }
 
     #[test]

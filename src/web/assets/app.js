@@ -5401,6 +5401,7 @@
       url: a2aText(peer.url, ""),
       fingerprint: a2aText(peer.token_fingerprint, ""),
       timeoutSecs: a2aCount(peer.timeout_secs),
+      sendTimeoutSecs: peer.send_timeout_secs == null ? null : a2aCount(peer.send_timeout_secs),
       pollIntervalMs: a2aCount(peer.poll_interval_ms),
       pollTimeoutSecs: a2aCount(peer.poll_timeout_secs)
     };
@@ -5488,12 +5489,18 @@
    * one — so the omission is the only correct value here.
    */
   function a2aPeerPayload(peer) {
-    return {
+    const payload = {
       url: peer.url,
       timeout_secs: peer.timeoutSecs,
       poll_interval_ms: peer.pollIntervalMs,
       poll_timeout_secs: peer.pollTimeoutSecs
     };
+    if (peer.sendTimeoutSecs !== null) {
+      payload.send_timeout_secs = peer.sendTimeoutSecs;
+    } else {
+      payload.clear_send_timeout_secs = true;
+    }
+    return payload;
   }
 
   /**
@@ -5509,6 +5516,11 @@
     const payload = { url: values.url };
     if (values.token !== "") {
       payload.token = values.token;
+    }
+    if (values.sendTimeoutSecs !== null) {
+      payload.send_timeout_secs = values.sendTimeoutSecs;
+    } else {
+      payload.clear_send_timeout_secs = true;
     }
     if (values.timeoutSecs !== null) {
       payload.timeout_secs = values.timeoutSecs;
@@ -6336,6 +6348,11 @@
     addFact(facts, "Timeout", peer.timeoutSecs === null ? "not reported" : peer.timeoutSecs + "s");
     addFact(
       facts,
+      "Send timeout",
+      peer.sendTimeoutSecs === null ? "uses request timeout" : peer.sendTimeoutSecs + "s"
+    );
+    addFact(
+      facts,
       "Poll interval",
       peer.pollIntervalMs === null ? "not reported" : peer.pollIntervalMs + "ms"
     );
@@ -6451,6 +6468,7 @@
         isNew: true,
         url: "",
         timeoutSecs: "",
+        sendTimeoutSecs: "",
         pollIntervalMs: "",
         pollTimeoutSecs: ""
       };
@@ -6464,6 +6482,7 @@
         isNew: false,
         url: peer.url,
         timeoutSecs: peer.timeoutSecs === null ? "" : String(peer.timeoutSecs),
+        sendTimeoutSecs: peer.sendTimeoutSecs === null ? "" : String(peer.sendTimeoutSecs),
         pollIntervalMs: peer.pollIntervalMs === null ? "" : String(peer.pollIntervalMs),
         pollTimeoutSecs: peer.pollTimeoutSecs === null ? "" : String(peer.pollTimeoutSecs)
       };
@@ -6551,6 +6570,16 @@
     timeoutField.input.value = draft.timeoutSecs;
     form.appendChild(timeoutField.wrap);
 
+    const sendTimeoutField = a2aInput(
+      "a2a-peer-send-timeout",
+      "Send timeout (seconds)",
+      "number",
+      "Deadline for the complete SendMessage request. Empty uses Timeout (seconds). Must be 1–300."
+    );
+    sendTimeoutField.input.max = "300";
+    sendTimeoutField.input.value = draft.sendTimeoutSecs;
+    form.appendChild(sendTimeoutField.wrap);
+
     const pollField = a2aInput(
       "a2a-peer-poll",
       "Poll interval (milliseconds)",
@@ -6595,6 +6624,7 @@
       url: urlField.input,
       token: tokenField.input,
       timeout: timeoutField.input,
+      sendTimeout: sendTimeoutField.input,
       poll: pollField.input,
       pollTimeout: pollTimeoutField.input,
       save: save,
@@ -6663,6 +6693,15 @@
       setStatus(ed.status, "error", timeout.message);
       return;
     }
+    const sendTimeout = a2aNumberField(ed.sendTimeout.value, "send_timeout_secs");
+    if (!sendTimeout.ok) {
+      setStatus(ed.status, "error", sendTimeout.message);
+      return;
+    }
+    if (sendTimeout.value !== null && (sendTimeout.value < 1 || sendTimeout.value > 300)) {
+      setStatus(ed.status, "error", "send_timeout_secs must be between 1 and 300, or empty to use timeout_secs.");
+      return;
+    }
     const poll = a2aNumberField(ed.poll.value, "poll_interval_ms");
     if (!poll.ok) {
       setStatus(ed.status, "error", poll.message);
@@ -6681,6 +6720,7 @@
         url: url,
         token: ed.token.value,
         timeoutSecs: timeout.value,
+        sendTimeoutSecs: sendTimeout.value,
         pollIntervalMs: poll.value,
         pollTimeoutSecs: pollTimeout.value
       })

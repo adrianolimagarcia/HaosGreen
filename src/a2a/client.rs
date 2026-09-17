@@ -14,10 +14,28 @@ use reqwest_client::Client as ReqwestClient;
 
 use crate::config::A2aOutboundPeerConfig;
 
+#[derive(Debug)]
+pub enum A2aTimeoutError {
+    SendMessage { seconds: u64 },
+}
+
+impl std::fmt::Display for A2aTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SendMessage { seconds } => {
+                write!(f, "A2A SendMessage timed out after {seconds} seconds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for A2aTimeoutError {}
+
 pub struct A2aClient {
     pub card: AgentCard,
     pub sdk: A2AClient<Box<dyn Transport>>,
     pub timeout_secs: u64,
+    pub send_timeout_secs: Option<u64>,
 }
 
 fn join_card_url(base_url: &str) -> Result<reqwest_client::Url> {
@@ -65,8 +83,12 @@ impl A2aClient {
 
     pub async fn from_card(card: AgentCard, config: &A2aOutboundPeerConfig) -> Result<Self> {
         config.validate("peer")?;
+        let effective_send_timeout_secs = config.send_timeout_secs.unwrap_or(config.timeout_secs);
+        let transport_timeout_secs = effective_send_timeout_secs
+            .max(config.timeout_secs)
+            .saturating_add(1);
         let http = ReqwestClient::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .timeout(Duration::from_secs(transport_timeout_secs))
             .build()
             .context("failed to construct reqwest client")?;
         let transport_factory = Arc::new(JsonRpcTransportFactory::new(Some(http)));
@@ -82,6 +104,7 @@ impl A2aClient {
             card,
             sdk,
             timeout_secs: config.timeout_secs,
+            send_timeout_secs: config.send_timeout_secs,
         })
     }
 
@@ -106,10 +129,15 @@ impl A2aClient {
 
     pub async fn send_message(&self, req: &SendMessageRequest) -> Result<SendMessageResponse> {
         let fut = self.sdk.send_message(req);
-        let resp = if self.timeout_secs > 0 {
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs), fut)
+        let send_timeout_secs = self.send_timeout_secs.unwrap_or(self.timeout_secs);
+        let resp = if send_timeout_secs > 0 {
+            tokio::time::timeout(Duration::from_secs(send_timeout_secs), fut)
                 .await
-                .context("send_message timed out")?
+                .map_err(|_| {
+                    anyhow::anyhow!(A2aTimeoutError::SendMessage {
+                        seconds: send_timeout_secs
+                    })
+                })?
         } else {
             fut.await
         }
@@ -282,6 +310,7 @@ mod tests {
     use axum::routing::post;
     use axum::{extract::State, http::HeaderMap, routing::get, Json, Router};
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -550,6 +579,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_timeout_respects_send_deadline_without_retries() {
+        let post_count = Arc::new(AtomicUsize::new(0));
+        let count = post_count.clone();
+        let app = Router::new().route(
+            "/jsonrpc",
+            post(move |Json(req): Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert_eq!(req.get("method").and_then(Value::as_str), Some("SendMessage"));
+                    let post_number = count.fetch_add(1, Ordering::SeqCst);
+                    let delay = if post_number == 0 { 2 } else { 8 };
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    Json(json!({"jsonrpc":"2.0","id":req.get("id"),"result":{"message":{"messageId":"late","role":"ROLE_AGENT","parts":[{"text":"late"}]}}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let cfg = A2aOutboundPeerConfig {
+            url: format!("http://{addr}"),
+            token: "secret".into(),
+            timeout_secs: 1,
+            send_timeout_secs: Some(5),
+            poll_interval_ms: 10,
+            poll_timeout_secs: 5,
+        };
+        let card = test_agent_card(&format!("http://{addr}/jsonrpc"));
+        let client = A2aClient::from_card(card, &cfg).await.unwrap();
+
+        client
+            .send_text("slow but within send deadline")
+            .await
+            .unwrap();
+        let err = client.send_text("beyond send deadline").await.unwrap_err();
+        assert!(err.downcast_ref::<A2aTimeoutError>().is_some());
+        assert!(err
+            .to_string()
+            .contains("A2A SendMessage timed out after 5 seconds"));
+        assert_eq!(post_count.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
     async fn direct_send_message_completed_message() {
         let app = Router::new().route(
             "/jsonrpc",
@@ -585,6 +658,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 50,
             poll_timeout_secs: 5,
+            send_timeout_secs: None,
         };
 
         let client = A2aClient::from_card(card, &cfg).await.unwrap();
@@ -644,6 +718,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 50,
             poll_timeout_secs: 5,
+            send_timeout_secs: None,
         };
 
         let client = A2aClient::from_card(card, &cfg).await.unwrap();
@@ -735,6 +810,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 10,
             poll_timeout_secs: 5,
+            send_timeout_secs: None,
         };
 
         let client = A2aClient::from_card(card, &cfg).await.unwrap();
@@ -789,6 +865,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 10,
             poll_timeout_secs: 1,
+            send_timeout_secs: None,
         };
 
         let client = A2aClient::from_card(card, &cfg).await.unwrap();
@@ -857,6 +934,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 10,
             poll_timeout_secs: 5,
+            send_timeout_secs: None,
         };
 
         let client = A2aClient::from_card(card, &cfg).await.unwrap();
@@ -905,6 +983,7 @@ mod tests {
             timeout_secs: 5,
             poll_interval_ms: 10,
             poll_timeout_secs: 5,
+            send_timeout_secs: None,
         };
 
         let client = A2aClient::from_card(card, &cfg).await.unwrap();

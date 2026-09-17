@@ -588,6 +588,7 @@ struct OutboundPeerView {
     url: String,
     token_fingerprint: Option<String>,
     timeout_secs: u64,
+    send_timeout_secs: Option<u64>,
     poll_interval_ms: u64,
     poll_timeout_secs: u64,
 }
@@ -652,6 +653,7 @@ fn outbound_view(outbound: &A2aOutboundConfig) -> OutboundResponse {
                 url: peer.url.clone(),
                 token_fingerprint: fingerprint(&peer.token),
                 timeout_secs: peer.timeout_secs,
+                send_timeout_secs: peer.send_timeout_secs,
                 poll_interval_ms: peer.poll_interval_ms,
                 poll_timeout_secs: peer.poll_timeout_secs,
             }
@@ -710,12 +712,32 @@ struct OutboundPeerInput {
     #[serde(default)]
     timeout_secs: Option<u64>,
     #[serde(default)]
+    send_timeout_secs: Option<u64>,
+    /// Explicitly clears a previously configured send timeout. Older clients
+    /// omit this flag and retain the existing override when the value is absent.
+    #[serde(default)]
+    clear_send_timeout_secs: bool,
+    #[serde(default)]
     poll_interval_ms: Option<u64>,
     #[serde(default)]
     poll_timeout_secs: Option<u64>,
 }
 
-/// The body of `PUT /api/a2a/outbound`: the complete replacement peer set.
+fn merge_send_timeout(
+    input: &OutboundPeerInput,
+    existing: Option<&A2aOutboundPeerConfig>,
+    defaults: Option<u64>,
+) -> Option<u64> {
+    if input.clear_send_timeout_secs {
+        None
+    } else {
+        input
+            .send_timeout_secs
+            .or_else(|| existing.and_then(|peer| peer.send_timeout_secs))
+            .or(defaults)
+    }
+}
+
 ///
 /// `deny_unknown_fields` is deliberate. An unrecognised key is a client bug,
 /// and silently ignoring it would let a UI that misspelled `peers` wipe the
@@ -800,6 +822,7 @@ async fn replace_outbound(
                 .timeout_secs
                 .or_else(|| existing.map(|peer| peer.timeout_secs))
                 .unwrap_or(defaults.timeout_secs),
+            send_timeout_secs: merge_send_timeout(input, existing, defaults.send_timeout_secs),
             poll_interval_ms: input
                 .poll_interval_ms
                 .or_else(|| existing.map(|peer| peer.poll_interval_ms))
@@ -822,11 +845,15 @@ async fn replace_outbound(
         // above `i64::MAX` would be written as a negative number, and the
         // operator's next start would fail to parse the file this route wrote.
         // Refused here rather than truncated.
-        for (field, value) in [
+        let mut values = vec![
             ("timeout_secs", peer.timeout_secs),
             ("poll_interval_ms", peer.poll_interval_ms),
             ("poll_timeout_secs", peer.poll_timeout_secs),
-        ] {
+        ];
+        if let Some(value) = peer.send_timeout_secs {
+            values.push(("send_timeout_secs", value));
+        }
+        for (field, value) in values {
             if value > MAX_TOML_INTEGER {
                 tracing::warn!(peer = %name, field, "web: rejected an out-of-range A2A outbound value");
                 return (
@@ -1235,6 +1262,7 @@ impl ConfigFile {
                         .unwrap_or(defaults.poll_interval_ms),
                     poll_timeout_secs: integer("poll_timeout_secs")
                         .unwrap_or(defaults.poll_timeout_secs),
+                    send_timeout_secs: integer("send_timeout_secs"),
                 },
             );
         }
@@ -1354,6 +1382,12 @@ fn set_outbound_peers(
             "timeout_secs",
             toml_edit::value(toml_integer(peer.timeout_secs, "timeout_secs", name)?),
         );
+        if let Some(send_timeout_secs) = peer.send_timeout_secs {
+            entry.insert(
+                "send_timeout_secs",
+                toml_edit::value(toml_integer(send_timeout_secs, "send_timeout_secs", name)?),
+            );
+        }
         entry.insert(
             "poll_interval_ms",
             toml_edit::value(toml_integer(
@@ -1894,6 +1928,25 @@ mod tests {
     }
 
     #[test]
+    fn clear_send_timeout_overrides_legacy_omission_merge() {
+        let existing = A2aOutboundPeerConfig {
+            send_timeout_secs: Some(42),
+            ..Default::default()
+        };
+        let input: OutboundPeerInput = serde_json::from_value(serde_json::json!({
+            "url": "https://example.test",
+            "clear_send_timeout_secs": true
+        }))
+        .unwrap();
+        assert_eq!(merge_send_timeout(&input, Some(&existing), None), None);
+
+        let legacy: OutboundPeerInput = serde_json::from_value(serde_json::json!({
+            "url": "https://example.test"
+        }))
+        .unwrap();
+        assert_eq!(merge_send_timeout(&legacy, Some(&existing), None), Some(42));
+    }
+    #[test]
     fn peer_names_that_could_carry_a_newline_are_refused() {
         assert!(valid_peer_name("laptop"));
         assert!(valid_peer_name("lab-2.eu_1"));
@@ -2000,6 +2053,7 @@ bind = "127.0.0.1:8787"
                     timeout_secs: 5,
                     poll_interval_ms: 25,
                     poll_timeout_secs: 5,
+                    send_timeout_secs: None,
                 },
             );
         }

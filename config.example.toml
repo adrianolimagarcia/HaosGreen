@@ -321,7 +321,8 @@ Be concise and helpful."""
 # [a2a.outbound.peers.researcher]
 # url = "http://192.168.1.51:8443"            # Remote agent base URL (http:// or https://)
 # token = "remote-peer-bearer-token"          # Bearer token for remote authentication
-# timeout_secs = 30                           # HTTP request timeout in seconds (default: 30)
+# timeout_secs = 30                           # HTTP transport timeout in seconds (default: 30)
+# send_timeout_secs = 15                      # Optional complete synchronous SendMessage deadline; 1..=300, omitted uses timeout_secs
 # poll_interval_ms = 250                      # Polling interval in ms when awaiting async tasks (default: 250)
 # poll_timeout_secs = 60                      # Maximum duration to wait for task completion (default: 60)
 
