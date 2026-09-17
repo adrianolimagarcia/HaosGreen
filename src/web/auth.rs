@@ -166,6 +166,20 @@ impl Credentials {
         let actual = hash_bearer(presented);
         expected.ct_eq(actual.as_bytes()).into()
     }
+
+    /// A short, non-reversible label for the active bearer token, or `None`
+    /// when bearer is off or unset.
+    ///
+    /// The stored value is already a SHA-256 digest of a 256-bit random token,
+    /// so exposing six of its hex characters identifies a token the operator
+    /// already holds without narrowing an attacker's search space in any
+    /// useful way. The full digest is never exposed.
+    pub fn bearer_fingerprint(&self) -> Option<String> {
+        if !self.bearer_enabled || self.bearer_token_hash.is_empty() {
+            return None;
+        }
+        Some(self.bearer_token_hash.chars().take(6).collect())
+    }
 }
 
 /// Write a file that only its owner can read, creating it with that mode
@@ -254,6 +268,11 @@ impl SessionStore {
 /// thinking an empty list is a restriction.
 pub struct IpGate {
     nets: Vec<IpNet>,
+    /// The trimmed entries exactly as they were configured. Kept so the
+    /// dashboard can show the operator the **live** allowlist after
+    /// `PUT /api/settings/allow-ips` replaces it — reporting the startup value
+    /// from `WebConfig` would show a list the gate is no longer enforcing.
+    entries: Vec<String>,
 }
 
 impl IpGate {
@@ -263,6 +282,7 @@ impl IpGate {
     /// the operator wrote).
     pub fn new(entries: &[String]) -> Result<Self> {
         let mut nets = Vec::with_capacity(entries.len());
+        let mut trimmed_entries = Vec::with_capacity(entries.len());
         for entry in entries {
             let trimmed = entry.trim();
             if trimmed.is_empty() {
@@ -275,8 +295,17 @@ impl IpGate {
                     anyhow::anyhow!("web.allow_ips entry '{trimmed}' is not an IP or CIDR range")
                 })?;
             nets.push(net);
+            trimmed_entries.push(trimmed.to_string());
         }
-        Ok(Self { nets })
+        Ok(Self {
+            nets,
+            entries: trimmed_entries,
+        })
+    }
+
+    /// The configured entries, trimmed.
+    pub fn entries(&self) -> &[String] {
+        &self.entries
     }
 
     /// True when the list is empty, i.e. the gate restricts nothing.
@@ -590,6 +619,19 @@ mod tests {
     #[test]
     fn a_malformed_entry_is_rejected_at_construction() {
         assert!(IpGate::new(&["999.1.1.1".to_string()]).is_err());
+    }
+
+    #[test]
+    fn the_gate_reports_the_entries_it_was_built_with() {
+        let gate = IpGate::new(&[" 10.0.0.0/8 ".to_string(), "192.168.1.5".to_string()]).unwrap();
+        assert_eq!(
+            gate.entries().to_vec(),
+            vec!["10.0.0.0/8", "192.168.1.5"],
+            "entries must be trimmed and preserved in order"
+        );
+        assert!(!gate.is_empty());
+        assert!(IpGate::new(&[]).unwrap().entries().is_empty());
+        assert!(IpGate::new(&[]).unwrap().is_empty());
     }
 
     #[test]

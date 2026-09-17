@@ -500,6 +500,33 @@ async fn main() -> Result<()> {
         tracing::debug!("A2A disabled");
     }
 
+    // Web dashboard listener. Like the A2A listener, a failure here is logged
+    // and the Telegram bot keeps running: a dashboard misconfiguration must not
+    // take the bot down.
+    if config.web.enabled {
+        if let Err(e) = config.web.validate() {
+            tracing::error!(error = %e, "web configuration is invalid; the dashboard was NOT started");
+        } else {
+            let home = config
+                .resolved_home
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            match haos_green::web::spawn(
+                config.web.clone(),
+                home,
+                Arc::clone(&agent),
+                Arc::clone(&_supervisor),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "web dashboard failed to start"),
+            }
+        }
+    } else {
+        tracing::debug!("web dashboard disabled");
+    }
+
     // Run the Telegram platform with signal-driven graceful shutdown
     info!("Bot is starting...");
 
