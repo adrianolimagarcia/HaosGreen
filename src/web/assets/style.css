@@ -795,6 +795,342 @@ input:disabled {
   font-size: 0.88rem;
 }
 
+/* ── Chat ────────────────────────────────────────────────────────────────── */
+
+/*
+ * The conversation surface. Depth, not lines: the log is a sunken well, the
+ * bubbles are raised out of it, and the operator's own turns take the accent
+ * fill the active nav pill uses. Nothing here introduces a colour — every
+ * value is a token declared in `:root`.
+ *
+ * Two contrast rules are load-bearing and are why `--text-muted` never appears
+ * on an accent fill: it measures 2.7:1 there. The active session row and the
+ * user bubble therefore use `--text` (6.6:1) throughout.
+ */
+
+.sidebar-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 6px;
+}
+
+.sidebar-head .btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.sidebar-title {
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.session-item {
+  display: flex;
+}
+
+.session-select {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: var(--ease);
+}
+
+.session-select:hover:not(:disabled) {
+  background: var(--surface);
+  box-shadow: var(--shadow-out-sm);
+  color: var(--text);
+}
+
+.session-select:active:not(:disabled) {
+  box-shadow: var(--shadow-in);
+}
+
+.session-select:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-strong);
+}
+
+.session-select:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.session-select.is-active {
+  background-image: linear-gradient(145deg, var(--accent-bright), var(--accent));
+  box-shadow: var(--shadow-out-sm);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.session-select.is-active .session-meta {
+  color: var(--text);
+}
+
+.session-label {
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.session-meta {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 400;
+}
+
+.session-empty {
+  padding: 10px 14px;
+  color: var(--text-muted);
+  font-size: 0.86rem;
+}
+
+.chat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.chat-card .card-head {
+  flex-wrap: wrap;
+  margin-bottom: 0;
+}
+
+.chat-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.chat-state {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+}
+
+.btn-stop:not(:disabled) {
+  background: var(--danger-tint);
+}
+
+.chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  height: min(56vh, 520px);
+  min-height: 180px;
+  padding: 18px;
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in-deep);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.chat-log:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-in-deep), var(--ring-strong);
+}
+
+.chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin: auto;
+  padding: 24px 12px;
+  text-align: center;
+}
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-width: 86%;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-out-sm);
+}
+
+.msg-user {
+  align-self: flex-end;
+  background-image: linear-gradient(145deg, var(--accent-bright), var(--accent));
+}
+
+.msg-assistant {
+  align-self: flex-start;
+}
+
+.msg-error {
+  align-self: flex-start;
+  background: var(--danger-tint);
+}
+
+.msg-note {
+  align-self: center;
+  max-width: 100%;
+  padding: 4px 10px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 0.86rem;
+  text-align: center;
+}
+
+.msg-role {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.msg-user .msg-role {
+  color: var(--text);
+}
+
+.msg-error .msg-role {
+  color: var(--danger);
+}
+
+/* `pre-wrap` because an agent answer is written in paragraphs, and the model's
+   newlines are part of it. */
+.msg-body {
+  font-size: 0.97rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-jump {
+  align-self: center;
+}
+
+/* The pause before the first token. A run that uses a tool is silent until its
+   final answer is chunked, so without this the view looks frozen. The label
+   carries the meaning; the dots are decoration, and `prefers-reduced-motion`
+   stops them (see the end of this file) without hiding the label. */
+.chat-working {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.chat-dots {
+  display: inline-flex;
+  gap: 5px;
+}
+
+.chat-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: chat-pulse 1.3s ease-in-out infinite;
+}
+
+.chat-dot:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.chat-dot:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@keyframes chat-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+.chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-composer .status {
+  margin-top: 0;
+}
+
+.chat-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 46px;
+  max-height: 160px;
+  padding: 12px 15px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  box-shadow: var(--shadow-in);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.45;
+  resize: none;
+  overflow-y: auto;
+  transition: var(--ease);
+}
+
+.chat-input::placeholder {
+  color: var(--text-muted);
+}
+
+.chat-input:focus {
+  outline: none;
+  box-shadow: var(--shadow-in-deep), var(--ring);
+}
+
+.chat-input:disabled {
+  opacity: 0.6;
+}
+
 /* ── Login overlay ───────────────────────────────────────────────────────── */
 
 .overlay {
@@ -904,6 +1240,38 @@ input:disabled {
   .empty-state {
     padding: 36px 20px;
   }
+
+  /* The session list becomes a sideways chip row, matching the nav above it. */
+  .sidebar-chat {
+    gap: 10px;
+  }
+
+  .session-list {
+    flex-direction: row;
+    gap: 10px;
+    padding-bottom: 4px;
+    overflow-x: auto;
+    overflow-y: visible;
+    overscroll-behavior-x: contain;
+  }
+
+  .session-item {
+    flex: 0 0 auto;
+  }
+
+  .session-select {
+    width: auto;
+    max-width: 220px;
+  }
+
+  .chat-log {
+    height: min(50vh, 420px);
+    padding: 14px;
+  }
+
+  .msg {
+    max-width: 92%;
+  }
 }
 
 @media (max-width: 420px) {
@@ -940,6 +1308,30 @@ input:disabled {
 
   .login-card {
     padding: 26px 20px;
+  }
+
+  .chat-head-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .chat-state {
+    font-size: 0.78rem;
+  }
+
+  .msg {
+    max-width: 100%;
+    padding: 11px 13px;
+  }
+
+  .chat-log {
+    height: min(48vh, 380px);
+    padding: 12px;
+  }
+
+  .chat-input-row {
+    gap: 8px;
   }
 }
 

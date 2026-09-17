@@ -208,6 +208,20 @@
           </a>
         </nav>
 
+        <!--
+          Chat session list. `app.js` fills it in only while the chat view is
+          active, so the sidebar never carries a stale conversation list into
+          the other surfaces. It is empty — and hidden — until then.
+        -->
+        <section id="sidebar-chat" class="sidebar-chat" hidden>
+          <div class="sidebar-head">
+            <h2 class="sidebar-title">Conversations</h2>
+            <button id="chat-new" class="btn btn-ghost" type="button">New chat</button>
+          </div>
+          <ul id="session-list" class="session-list"></ul>
+          <p id="session-error" class="status" role="status" hidden></p>
+        </section>
+
         <div class="sidebar-foot">
           <p id="whoami" class="whoami"></p>
           <button id="logout" class="btn btn-ghost" type="button">Sign out</button>
