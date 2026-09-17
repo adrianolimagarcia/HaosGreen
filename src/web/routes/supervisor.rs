@@ -49,11 +49,11 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::supervisor::artifact::ArtifactRow;
-use crate::supervisor::job::Job;
+use crate::supervisor::job::{Job, JobStatus, JobType};
 use crate::supervisor::state::transition_allowed;
 use crate::supervisor::store::{TransitionRow, MAX_RECENT_TASKS};
 use crate::supervisor::task::{ExecutionMode, RiskLevel, Task, TaskStatus, TaskType};
-use crate::supervisor::{SubmitOutcome, Supervisor};
+use crate::supervisor::{SubmitOutcome, Supervisor, SupervisorError};
 use crate::web::state::WebState;
 
 pub fn router() -> Router<WebState> {
@@ -84,8 +84,21 @@ fn conflict(message: &str) -> Response {
     (StatusCode::CONFLICT, message.to_string()).into_response()
 }
 
+/// Log a 500 and answer with the fixed sentence.
+///
+/// The log carries the **whole** `anyhow` chain (`{error:#}`), not
+/// `error = %error`. `Display` on an `anyhow::Error` prints only the outermost
+/// context, so a failure whose real cause is `no such table: sup_transitions`
+/// used to be logged as nothing but `insert sup_tasks` — every 500 in this
+/// module was undiagnosable, and Phase 4's log view renders exactly this line.
+/// The body stays the fixed sentence: a `rusqlite` error carries the failing
+/// statement and an artifact error carries an absolute path.
 fn internal_error(what: &str, error: &anyhow::Error) -> Response {
-    tracing::error!(error = %error, what = %what, "web: supervisor request failed");
+    tracing::error!(
+        error = %format!("{error:#}"),
+        what = %what,
+        "web: supervisor request failed"
+    );
     (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR).into_response()
 }
 
@@ -195,10 +208,68 @@ impl ArtifactView {
     }
 }
 
+/// The per-job projection the detail view renders.
+///
+/// `Job` is a store row, exactly like `Task`, `TransitionRow` and
+/// `ArtifactRow`, so it is projected rather than serialized as-is. What is
+/// **not** here, and why — deliberately, rather than by omission:
+///
+/// * `workspace` — never assigned anywhere in the supervisor; every job the
+///   pipeline creates leaves it `None`, so it would be a permanent `null`.
+/// * `input_context` — written only by the MCP backend
+///   (`supervisor/backend/mcp.rs`), which `main.rs` does not register. It is
+///   `null` for every job this dashboard can produce. `Task::inputs` and
+///   `constraints` are left out of `TaskSummary` for the same reason.
+/// * `prompt` — duplicates `goal` for the jobs the planner emits (it is the
+///   task's `user_request` verbatim) and is the largest free-text field on the
+///   row; the artifact and report surfaces are where full text belongs.
+/// * `timeout_secs`, `retry_max`, `retry_count`, `allow_tools` — scheduling
+///   internals of the orchestrator, not something the operator acts on.
+///
+/// `error` **is** included, and the trade is stated rather than hidden: it is
+/// the one field that explains a failed job, and a failed job with no reason is
+/// a worse dashboard than one that names a path. It can carry an absolute path
+/// today, because a backend failure is persisted as its `anyhow` chain. The
+/// text is already scrubbed of secrets at the persistence boundary
+/// (`TaskStore::update_job_status` runs `redact::redact`); the path is not, and
+/// is the same class of value the 500 body withholds.
+#[derive(Serialize)]
+struct JobView {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_job_id: Option<String>,
+    job_type: JobType,
+    backend: String,
+    goal: String,
+    status: JobStatus,
+    /// The stored summary, present once the job has finished. The store
+    /// reconstructs `Job::result` from `result_summary` (`store::jobs_for_task`),
+    /// so the summary is read back from there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl JobView {
+    fn of(job: Job) -> Self {
+        Self {
+            id: job.id,
+            parent_job_id: job.parent_job_id,
+            job_type: job.job_type,
+            backend: job.backend,
+            goal: job.goal,
+            status: job.status,
+            summary: job.result.map(|r| r.summary),
+            error: job.error,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct TaskDetailResponse {
     task: TaskDetail,
-    jobs: Vec<Job>,
+    jobs: Vec<JobView>,
     transitions: Vec<TransitionView>,
     artifacts: Vec<ArtifactView>,
 }
@@ -299,7 +370,7 @@ async fn read_task(State(state): State<WebState>, Path(id): Path<String>) -> Res
 
     Json(TaskDetailResponse {
         task: TaskDetail::of(&task),
-        jobs,
+        jobs: jobs.into_iter().map(JobView::of).collect(),
         transitions,
         artifacts,
     })
@@ -311,7 +382,13 @@ async fn submit_task(State(state): State<WebState>, Json(body): Json<SubmitReque
     // dashboard with a supervisor too, and 400 is the answer that says so.
     // The six routes with no body check the wiring first, so that
     // `supervisor: None` is uniformly a 503 — see the module documentation.
-    if body.text.trim().is_empty() {
+    //
+    // The trimmed text is what is passed on, so the value that was validated is
+    // the value that is classified and stored. (`IntakeRouter::normalize` also
+    // trims, so the persisted `user_request` was already trimmed; the route
+    // should not depend on a callee to repair its own input.)
+    let text = body.text.trim();
+    if text.is_empty() {
         return (StatusCode::BAD_REQUEST, "the task text must not be empty").into_response();
     }
 
@@ -324,10 +401,7 @@ async fn submit_task(State(state): State<WebState>, Json(body): Json<SubmitReque
     // a single operator account, so there is no per-user identity to record;
     // the platform string keeps dashboard tasks distinguishable from Telegram
     // ones in `sup_tasks`.
-    let outcome = match supervisor
-        .submit("web", "dashboard", None, &body.text)
-        .await
-    {
+    let outcome = match supervisor.submit("web", "dashboard", None, text).await {
         Ok(outcome) => outcome,
         Err(e) => return internal_error("submit a supervisor task", &e),
     };
@@ -442,25 +516,6 @@ impl Action {
     }
 }
 
-/// Whether an error from a lifecycle method is a refusal by the state machine
-/// rather than a fault.
-///
-/// The pre-check in [`lifecycle`] answers 409 in every ordinary case, so this
-/// is only a fallback for the window between that check and the call, where a
-/// concurrent request can move the task. It is a fallback rather than the
-/// primary mechanism on purpose: matching error text is brittle, and the route
-/// should not have to depend on it where it does not have to.
-///
-/// The strings are the ones `Supervisor::{pause,resume,cancel,approve}` produce.
-/// `the_refusal_signatures_match_the_supervisor_messages` pins them, so a
-/// reworded `bail!` in `supervisor/mod.rs` fails that test instead of silently
-/// turning every refusal into a 500.
-fn is_state_refusal(message: &str) -> bool {
-    message.contains("cannot pause a task in state")
-        || message.contains("cannot resume a task in state")
-        || message.contains("illegal state transition")
-}
-
 /// The shared body of the four lifecycle routes.
 ///
 /// # 409 is decided before the supervisor is called
@@ -473,12 +528,17 @@ fn is_state_refusal(message: &str) -> bool {
 /// those answer **500**.
 ///
 /// The pre-check cannot cover a task that moves between it and the call — two
-/// operators, two browsers. There the error text is the only signal left, and
-/// [`is_state_refusal`] reads it; a re-read then supplies the current state for
-/// the message. The classification is deliberately *not* "the state no longer
-/// permits the action": `resume` and `approve` also fail **after** a legal
-/// transition, because they run the plan, and a failure there is an internal
-/// fault rather than a conflict.
+/// operators, two browsers. There the error **type** is the signal left, and it
+/// is read with `anyhow::Error::downcast_ref` on [`SupervisorError`] rather
+/// than by matching error text; a re-read then supplies the current state for
+/// the message. Matching text is the trap this replaced: rewording a `bail!`
+/// anywhere in `supervisor/mod.rs` silently turned every raced refusal into a
+/// 500, with nothing but a string-matching test to notice.
+///
+/// The classification is deliberately *not* "the state no longer permits the
+/// action": `resume` and `approve` also fail **after** a legal transition,
+/// because they run the plan, and a failure there is an internal fault rather
+/// than a conflict.
 async fn lifecycle(state: WebState, id: String, action: Action) -> Response {
     let supervisor = match state.supervisor_or_unavailable() {
         Ok(supervisor) => supervisor,
@@ -496,14 +556,28 @@ async fn lifecycle(state: WebState, id: String, action: Action) -> Response {
     }
 
     if let Err(e) = action.apply(&supervisor, &id).await {
-        if is_state_refusal(&e.to_string()) {
-            // Lost a race with another request. The state is re-read rather
-            // than echoed from the error, so the message carries this task's
-            // current state and nothing from the error chain.
-            return match supervisor.store().get(&id).await {
-                Ok(Some(task)) => conflict(&action.refusal(&task.status)),
-                _ => conflict("the task is no longer in a state that allows that action"),
-            };
+        match e.downcast_ref::<SupervisorError>() {
+            // The task was deleted between the read above and the call. A
+            // vanished task is not a server fault, so it is the same 404 the
+            // pre-check gives.
+            Some(SupervisorError::NotFound { .. }) => return unknown_task(),
+            // A second `execute_now` for a task that is already running. The
+            // plan it would start is a duplicate of one in flight, so this is a
+            // conflict rather than a fault.
+            Some(SupervisorError::AlreadyRunning { .. }) => {
+                return conflict("that task is already running")
+            }
+            Some(SupervisorError::StateRefusal { .. }) => {
+                // Lost a race with another request. The state is re-read rather
+                // than echoed from the error, so the message carries this task's
+                // current state and nothing from the error chain.
+                return match supervisor.store().get(&id).await {
+                    Ok(Some(task)) => conflict(&action.refusal(&task.status)),
+                    Ok(None) => unknown_task(),
+                    Err(_) => conflict("the task is no longer in a state that allows that action"),
+                };
+            }
+            None => {}
         }
         return internal_error("apply a supervisor lifecycle action", &e);
     }
@@ -643,10 +717,12 @@ mod tests {
         }
     }
 
-    /// The fallback classifier is only useful if it matches the messages the
-    /// supervisor really produces.
+    /// The classifier in [`lifecycle`] is only useful if the supervisor really
+    /// raises the typed refusal it looks for. This is the test that would catch
+    /// a lifecycle method reverting to a bare `anyhow::bail!`: the error would
+    /// stop being a `StateRefusal` and every raced refusal would answer 500.
     #[tokio::test]
-    async fn the_refusal_signatures_match_the_supervisor_messages() {
+    async fn the_supervisor_refusals_are_typed_state_refusals() {
         let dir = tempfile::tempdir().unwrap();
         let supervisor = test_supervisor(dir.path());
 
@@ -666,20 +742,157 @@ mod tests {
         ] {
             let error = action.apply(&supervisor, &task.id).await.unwrap_err();
             assert!(
-                is_state_refusal(&error.to_string()),
-                "{action:?} must be recognised as a refusal, got {error}"
+                matches!(
+                    error.downcast_ref::<SupervisorError>(),
+                    Some(SupervisorError::StateRefusal { .. })
+                ),
+                "{action:?} must raise SupervisorError::StateRefusal, got {error:?}"
             );
         }
     }
 
     /// The other half of the distinction: a real fault must not be read as a
-    /// refusal, or every database error would become a 409.
+    /// refusal, or every database error would become a 409. A plain `anyhow`
+    /// error carries no `SupervisorError` in its chain, and the two other typed
+    /// variants are answered differently — a vanished task is a 404 and an
+    /// already-running task is a conflict of its own.
     #[test]
     fn a_genuine_fault_is_not_mistaken_for_a_refusal() {
-        assert!(!is_state_refusal("no such table: sup_tasks"));
-        assert!(!is_state_refusal(
+        fn is_state_refusal(error: &anyhow::Error) -> bool {
+            matches!(
+                error.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::StateRefusal { .. })
+            )
+        }
+
+        assert!(!is_state_refusal(&anyhow::anyhow!(
+            "no such table: sup_tasks"
+        )));
+        assert!(!is_state_refusal(&anyhow::anyhow!(
             "write artifact /home/op/.haos-green/supervisor/x/plan.json: Permission denied"
+        )));
+        assert!(!is_state_refusal(&SupervisorError::not_found("6f1c")));
+        assert!(!is_state_refusal(&SupervisorError::already_running("6f1c")));
+        // A refusal wrapped in context is still a refusal: the type is searched
+        // for down the whole chain, not only at the top.
+        assert!(is_state_refusal(
+            &SupervisorError::state_refusal(TaskStatus::Done, TaskStatus::Plan)
+                .context("resume a finished task")
         ));
-        assert!(!is_state_refusal("task not found: 6f1c"));
+    }
+
+    /// `Job` is a store row; the detail view gets a projection. `workspace` and
+    /// `input_context` are dropped because nothing in the registered pipeline
+    /// ever sets them, and the raw row must not reach the wire.
+    #[test]
+    fn the_job_view_carries_exactly_the_agreed_fields() {
+        let mut job = Job::new("task-1", JobType::ExecutorJob, "shell", "echo hello");
+        job.workspace = Some("/home/op/.haos-green/supervisor/ws".into());
+        job.input_context = serde_json::json!({"api_key": "leak"});
+        job.status = JobStatus::Succeeded;
+        job.result = Some(crate::supervisor::job::JobOutput {
+            status: JobStatus::Succeeded,
+            summary: "ran".into(),
+            evidence: vec![],
+            errors: vec![],
+            changed_files: vec!["/home/op/secret.txt".into()],
+            next_step: None,
+        });
+        job.error = Some("boom".into());
+
+        let value = serde_json::to_value(JobView::of(job)).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            ["backend", "error", "goal", "id", "job_type", "status", "summary"]
+        );
+        assert_eq!(value["summary"], serde_json::json!("ran"));
+        assert!(
+            !value.to_string().contains("input_context")
+                && !value.to_string().contains("workspace")
+                && !value.to_string().contains("secret.txt"),
+            "the raw store row must not reach the wire: {value}"
+        );
+    }
+
+    /// `parent_job_id` is present only for a spawned subjob, and the summary
+    /// only once the job has finished — the two `skip_serializing_if` fields
+    /// must actually be skipped rather than serialized as `null`.
+    #[test]
+    fn the_job_view_omits_the_optional_fields_when_they_are_absent() {
+        let job = Job::new("task-1", JobType::ExecutorJob, "reasoning", "do it");
+        let value = serde_json::to_value(JobView::of(job)).unwrap();
+        assert!(value.get("parent_job_id").is_none(), "got {value}");
+        assert!(value.get("summary").is_none(), "got {value}");
+        assert!(value.get("error").is_none(), "got {value}");
+    }
+
+    /// Collects what a `tracing` subscriber formats, so a test can read the log
+    /// line a handler emitted.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The 500 log must carry the **root cause**, not only the outermost
+    /// context.
+    ///
+    /// `anyhow`'s `Display` prints the outer layer alone, so a failure whose
+    /// real cause is `no such table: sup_transitions` was logged as nothing but
+    /// `insert sup_tasks` — every 500 in this module undiagnosable, and Phase
+    /// 4's log view renders exactly this line. `error = %error` fails this test;
+    /// `error = %format!("{error:#}")` passes it.
+    ///
+    /// The subscriber is installed with `with_default`, which is scoped to this
+    /// thread, so the test neither installs nor depends on a global subscriber.
+    #[test]
+    fn the_internal_error_log_carries_the_whole_error_chain() {
+        let error = anyhow::anyhow!("no such table: sup_transitions").context("insert sup_tasks");
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let response = tracing::subscriber::with_default(subscriber, || {
+            internal_error("submit a supervisor task", &error)
+        });
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("insert sup_tasks"),
+            "the log must keep the outer context: {logged:?}"
+        );
+        assert!(
+            logged.contains("no such table: sup_transitions"),
+            "the log must carry the root cause, not just the outermost context: {logged:?}"
+        );
+        // The body stays the fixed sentence — the chain is logged, never
+        // returned.
+        assert!(
+            !INTERNAL_ERROR.contains("sup_transitions"),
+            "the response body must not carry the chain"
+        );
     }
 }

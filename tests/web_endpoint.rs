@@ -1827,8 +1827,20 @@ async fn a_refused_supervisor_lifecycle_action_is_409_not_500() {
     );
 }
 
+/// The listing ignores any client-supplied limit.
+///
+/// **This test cannot prove the clamp**, and the earlier version of it implied
+/// that it could: the route passes the constant `MAX_RECENT_TASKS`, so deleting
+/// `.clamp()` from `TaskStore::list_recent` leaves an assertion of "25 tasks in
+/// the store, 20 rows on the wire" green. The proof of the clamp is the store
+/// unit test `the_clamp_is_the_only_thing_that_bounds_a_caller_supplied_limit`,
+/// which calls the store with a limit it is not supposed to honour.
+///
+/// What *this* test can prove is the property the HTTP surface owns: there is no
+/// way to ask the route for more than the bound, whatever a caller puts in the
+/// query string.
 #[tokio::test]
-async fn the_supervisor_listing_is_capped_at_twenty() {
+async fn the_supervisor_listing_ignores_a_client_supplied_limit() {
     let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
 
     for i in 0..25 {
@@ -1841,19 +1853,322 @@ async fn the_supervisor_listing_is_capped_at_twenty() {
     }
 
     let cookie = login_and_get_cookie(&base, "admin").await;
-    let listed = reqwest::Client::new()
-        .get(format!("{base}/api/supervisor/tasks"))
+    for query in ["", "?limit=1000", "?limit=100&limit=500", "?limit=-1"] {
+        let listed = reqwest::Client::new()
+            .get(format!("{base}/api/supervisor/tasks{query}"))
+            .header(reqwest::header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), 200, "GET /api/supervisor/tasks{query}");
+        let listed: serde_json::Value = listed.json().await.unwrap();
+        assert_eq!(
+            listed["tasks"].as_array().unwrap().len(),
+            20,
+            "GET /api/supervisor/tasks{query} must stay bounded at 20: {listed}"
+        );
+    }
+}
+
+/// Two concurrent `resume`s of the same task must start the plan **once**.
+///
+/// This is the bug both reviewers found, at the boundary where it was observed:
+/// the four lifecycle routes are read-check-write across separate lock
+/// acquisitions, so two requests could both pass the check and both run the
+/// plan — two `Paused -> Execute` audit edges, two sets of job rows, two
+/// artifact rows for the same paths.
+///
+/// # What this test proves, and what it does not
+///
+/// It proves the **composed contract** at the HTTP boundary: whatever the
+/// interleaving, exactly one `resume` is accepted, every other answer is a
+/// conflict rather than a fault, and the task is left with one audit edge and
+/// one set of jobs. That assertion is deterministic *after* the fix, because
+/// only one request can win the compare-and-swap.
+///
+/// It is **not** the proof of the compare-and-swap, and must not be read as one.
+/// The window that made the bug possible is between the route's pre-check and
+/// the supervisor call, and the server — not the test — decides whether two
+/// requests land in it. Measured: with the compare-and-swap reverted to the
+/// unconditional `UPDATE`, this test still passed, because the in-flight guard
+/// covered the duplicate run. The deterministic proofs are the multi-threaded
+/// unit tests
+/// `supervisor::store::tests::concurrent_duplicate_transitions_let_exactly_one_win`
+/// and `supervisor::tests::concurrent_resumes_start_the_plan_exactly_once`,
+/// which fail reliably under that same mutation.
+///
+/// The runtime flavour matters. Every other supervisor test in this file is on
+/// the default current-thread runtime, where the requests only interleave at
+/// `await` points and the registered backend never yields — which is why the
+/// old suite could not see this at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_resumes_of_a_supervisor_task_start_it_once() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+    let paused = supervisor_action(&base, &cookie, &id, "pause").await;
+    assert_eq!(
+        paused.status(),
+        200,
+        "the task must be paused to be resumable"
+    );
+
+    let mut requests = Vec::new();
+    for _ in 0..8 {
+        let base = base.clone();
+        let cookie = cookie.clone();
+        let id = id.clone();
+        requests.push(tokio::spawn(async move {
+            supervisor_action(&base, &cookie, &id, "resume")
+                .await
+                .status()
+                .as_u16()
+        }));
+    }
+    let mut statuses = Vec::new();
+    for request in requests {
+        statuses.push(request.await.expect("a client task must not panic"));
+    }
+
+    let accepted = statuses.iter().filter(|status| **status == 200).count();
+    assert_eq!(
+        accepted, 1,
+        "exactly one resume may be accepted, got {statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|status| *status == 200 || *status == 409),
+        "every other resume must be a conflict, not a fault: {statuses:?}"
+    );
+
+    let trail = supervisor.store().transitions(&id).await.unwrap();
+    let resumed = trail
+        .iter()
+        .filter(|r| {
+            r.from == haos_green::supervisor::task::TaskStatus::Paused
+                && r.to == haos_green::supervisor::task::TaskStatus::Execute
+        })
+        .count();
+    assert_eq!(
+        resumed, 1,
+        "the audit trail must not carry duplicate edges: {trail:?}"
+    );
+
+    let task = supervisor.store().get(&id).await.unwrap().unwrap();
+    let planned = haos_green::supervisor::planner::Planner::new()
+        .plan(&task)
+        .jobs
+        .len();
+    assert_eq!(
+        supervisor.store().jobs_for_task(&id).await.unwrap().len(),
+        planned,
+        "the task must have exactly one set of jobs"
+    );
+}
+
+/// A row that exists but cannot be mapped is a **fault**, not a missing task.
+///
+/// `TaskStore::get` used to fold a row-mapping failure into `Ok(None)`, so a
+/// corrupt `state` was answered as 404 "unknown supervisor task" for a task
+/// sitting in the database — while `list_recent` propagated the identical error
+/// as a 500. A 404 sends the operator looking for a task that is right there.
+#[tokio::test]
+async fn a_corrupt_supervisor_task_row_is_a_server_fault_not_a_missing_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().expect("open a memory store");
+    let supervisor = test_supervisor(&dir.path().join("artifacts"), &memory);
+    let (addr, _handle) = haos_green::web::spawn_for_test_with_supervisor(
+        dir.path().to_path_buf(),
+        haos_green::config::WebConfig::default(),
+        Some(supervisor.clone()),
+    )
+    .await
+    .expect("the dashboard should start with a supervisor");
+    let base = format!("http://{addr}");
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+
+    // The row reads fine to begin with, so the assertion below is about the
+    // corruption and not about a task that never existed.
+    let healthy = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks/{id}"))
         .header(reqwest::header::COOKIE, &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(listed.status(), 200);
-    let listed: serde_json::Value = listed.json().await.unwrap();
+    assert_eq!(healthy.status(), 200);
+
+    // The row stays: only its `state` stops mapping.
+    memory
+        .connection()
+        .lock()
+        .await
+        .execute(
+            "UPDATE sup_tasks SET state='\"NOT_A_STATE\"' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+
+    let broken = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks/{id}"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
-        listed["tasks"].as_array().unwrap().len(),
-        20,
-        "the dashboard must never be handed more than 20 tasks: {listed}"
+        broken.status(),
+        500,
+        "a task whose row does not map is a server fault, not a 404"
     );
+    let body = broken.text().await.unwrap();
+    assert!(
+        !body.contains("unknown supervisor task"),
+        "the task is not unknown: {body:?}"
+    );
+    assert!(
+        !body.contains("sup_tasks") && !body.contains("NOT_A_STATE"),
+        "the response must not carry the SQL error chain: {body:?}"
+    );
+
+    // The lifecycle routes read the same row in their pre-check, so they must
+    // answer 500 too — not 404, and not a 409 blaming the task's state.
+    for action in ["pause", "cancel", "approve"] {
+        let response = supervisor_action(&base, &cookie, &id, action).await;
+        assert_eq!(
+            response.status(),
+            500,
+            "{action} on an unreadable row must be a fault, got {}",
+            response.status()
+        );
+    }
+}
+
+/// Job text is scrubbed **before it is stored**, so it comes back scrubbed.
+///
+/// The reviewers demonstrated the gap end to end: `ArtifactManager::write_text`
+/// runs the summary through `redact::redact`, `TaskStore::update_job_status` did
+/// not, so the same text was `api_key=***` on disk and the raw value in
+/// `sup_jobs` — which this route served. Reachability is concrete:
+/// `ShellBackend`'s summary is the command's stdout.
+#[tokio::test]
+async fn a_job_summary_and_error_are_redacted_in_the_task_detail() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+
+    let job = haos_green::supervisor::job::Job::new(
+        &id,
+        haos_green::supervisor::job::JobType::ShellJob,
+        "shell",
+        "echo hello",
+    );
+    supervisor.store().create_job(&job).await.unwrap();
+    supervisor
+        .store()
+        .update_job_status(
+            &job.id,
+            haos_green::supervisor::job::JobStatus::Succeeded,
+            Some("stdout: api_key=<CAMPO_API_KEY_4d1f8ab3_8>"),
+            Some("failed with Bearer ZZBEARERTOKEN"),
+        )
+        .await
+        .unwrap();
+
+    let detail = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks/{id}"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), 200);
+    let body = detail.text().await.unwrap();
+    assert!(
+        !body.contains("CAMPO_API_KEY") && !body.contains("ZZBEARERTOKEN"),
+        "a secret reached the API: {body}"
+    );
+    assert!(
+        body.contains("api_key=***") && body.contains("Bearer ***"),
+        "the text must still be readable, with the values scrubbed: {body}"
+    );
+}
+
+/// The detail route ships a job **projection**, not the store row.
+///
+/// `Job::workspace` is never assigned anywhere in the supervisor and
+/// `Job::input_context` is written only by the MCP backend, which `main.rs`
+/// does not register — so both are dropped rather than shipped as permanent
+/// `null`s. `timeout_secs` / `retry_max` / `retry_count` / `allow_tools` are
+/// orchestrator internals, and `prompt` duplicates `goal`.
+#[tokio::test]
+async fn the_task_detail_projects_its_jobs_instead_of_shipping_the_store_row() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let id = submit_supervisor_task(&base, &cookie, "summarize the readme").await;
+
+    let mut job = haos_green::supervisor::job::Job::new(
+        &id,
+        haos_green::supervisor::job::JobType::ShellJob,
+        "shell",
+        "echo hello",
+    );
+    job.prompt = Some("echo hello".into());
+    job.workspace = Some("/home/op/.haos-green/supervisor/workspaces/x".into());
+    job.input_context = serde_json::json!({"api_key": "ZZINPUTCONTEXTLEAK"});
+    job.allow_tools = vec!["shell".into()];
+    job.timeout_secs = 900;
+    job.retry_max = 3;
+    supervisor.store().create_job(&job).await.unwrap();
+
+    let detail = reqwest::Client::new()
+        .get(format!("{base}/api/supervisor/tasks/{id}"))
+        .header(reqwest::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    let jobs = detail["jobs"].as_array().expect("a jobs array");
+    assert_eq!(jobs.len(), 1, "got {detail}");
+    let mut keys: Vec<&str> = jobs[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["backend", "goal", "id", "job_type", "status"],
+        "the job projection must be exactly this: {detail}"
+    );
+    let rendered = detail.to_string();
+    assert!(
+        !rendered.contains("ZZINPUTCONTEXTLEAK")
+            && !rendered.contains("input_context")
+            && !rendered.contains("workspace")
+            && !rendered.contains("retry_max"),
+        "the raw store row must not reach the wire: {rendered}"
+    );
+}
+
+/// The route validates the trimmed text and stores the trimmed text.
+///
+/// `IntakeRouter::normalize` also trims, so the persisted `user_request` was
+/// already trimmed before this test existed — it is a regression guard on the
+/// value the API round-trips, not evidence that the route was the only thing
+/// standing between the caller and an untrimmed row.
+#[tokio::test]
+async fn a_supervisor_task_stores_the_trimmed_request() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+
+    let id = submit_supervisor_task(&base, &cookie, "   summarize the readme   ").await;
+    let task = supervisor.store().get(&id).await.unwrap().unwrap();
+    assert_eq!(task.user_request, "summarize the readme");
+    assert_eq!(task.title, "summarize the readme");
 }
 
 /// The other half of the 409/500 distinction: a genuine internal failure must

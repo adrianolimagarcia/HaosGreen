@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::supervisor::job::{Job, JobStatus, JobType};
 use crate::supervisor::task::{ExecutionMode, RiskLevel, Task, TaskStatus, TaskType};
+use crate::supervisor::SupervisorError;
 
 /// Hard upper bound on how many tasks [`TaskStore::list_recent`] will ever
 /// return, whatever the caller asks for.
@@ -116,15 +117,27 @@ impl TaskStore {
         Ok(())
     }
 
+    /// One task by id, or `None` when no such row exists.
+    ///
+    /// The three outcomes are kept apart on purpose. An earlier version wrote
+    /// `match rows.next() { Some(Ok(t)) => Some(t), _ => None }`, which folded a
+    /// row-mapping failure into "no such task": a task that exists but whose
+    /// stored `state` (or `task_type`, `risk_level`, …) cannot be parsed was
+    /// reported to the dashboard as an unknown id — a 404 — while
+    /// [`TaskStore::list_recent`] propagated the identical error as a 500. A
+    /// corrupt row is a fault, not a missing task, and saying "unknown task"
+    /// about a row that is sitting right there sends the operator looking for
+    /// the wrong thing.
     pub async fn get(&self, id: &str) -> Result<Option<Task>> {
         let conn = self.conn.lock().await;
         let mut stmt =
             conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM sup_tasks WHERE id=?1"))?;
         let mut rows = stmt.query_map([id], row_to_task)?;
-        Ok(match rows.next() {
-            Some(Ok(t)) => Some(t),
-            _ => None,
-        })
+        match rows.next() {
+            None => Ok(None),
+            Some(Ok(task)) => Ok(Some(task)),
+            Some(Err(e)) => Err(anyhow::Error::new(e).context("read sup_tasks row")),
+        }
     }
 
     /// Newest-first task listing for the dashboard.
@@ -168,6 +181,40 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Append an audit row and move the task to `to`, **only if the task is
+    /// still in `from`**.
+    ///
+    /// # Why this is a compare-and-swap
+    ///
+    /// The lifecycle methods (`Supervisor::{pause,resume,cancel,approve}`) are
+    /// read-check-write across separate lock acquisitions: they read the task,
+    /// decide the transition is legal, and then call this. Two concurrent
+    /// requests therefore both pass the check, and an unconditional
+    /// `UPDATE sup_tasks SET state=?1 WHERE id=?2` let both of them through —
+    /// two `Paused -> Execute` audit edges, two plans, two sets of jobs, two
+    /// `sup_artifacts` rows for the same path with different `sha256`, and (in
+    /// debug builds) a `Plan -> Plan` panic out of the `debug_assert!` below.
+    /// Every one of those is a duplicate side effect performed on the
+    /// operator's behalf: the registered backends are a full agent run and
+    /// `sh -c`.
+    ///
+    /// The conditional `UPDATE … WHERE id=?2 AND state=?3` is what makes the
+    /// read-check-write atomic: whichever request arrives second finds the row
+    /// no longer in `from` and is refused. The refusal is
+    /// [`SupervisorError::StateRefusal`], which the routes classify by type
+    /// (never by matching text) into a 409.
+    ///
+    /// The insert and the update share one transaction, so a refused
+    /// transition rolls the audit row back with it: the trail records what
+    /// happened, not what was attempted.
+    ///
+    /// The `debug_assert!` stays. It answers a different question — whether the
+    /// caller passed a pair the state machine has an edge for at all — which
+    /// the compare-and-swap cannot see: a caller that asks for `Done -> Done`
+    /// on a task that really is `Done` matches the `WHERE` clause. That is a
+    /// programmer error, not a race, and the race that used to surface here is
+    /// now closed by the compare-and-swap and by `Supervisor`'s per-task
+    /// in-flight guard.
     pub async fn record_transition(
         &self,
         task_id: &str,
@@ -182,22 +229,49 @@ impl TaskStore {
             from,
             to
         );
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let from_json = serde_json::to_string(&from)?;
+        let to_json = serde_json::to_string(&to)?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO sup_transitions (task_id, from_state, to_state, reason, actor)
              VALUES (?1,?2,?3,?4,?5)",
-            rusqlite::params![
-                task_id,
-                serde_json::to_string(&from)?,
-                serde_json::to_string(&to)?,
-                reason,
-                actor
-            ],
-        )?;
-        conn.execute(
-            "UPDATE sup_tasks SET state=?1, updated_at=datetime('now') WHERE id=?2",
-            rusqlite::params![serde_json::to_string(&to)?, task_id],
-        )?;
+            rusqlite::params![task_id, from_json, to_json, reason, actor],
+        )
+        .context("insert sup_transitions")?;
+        let updated = tx
+            .execute(
+                "UPDATE sup_tasks SET state=?1, updated_at=datetime('now')
+                 WHERE id=?2 AND state=?3",
+                rusqlite::params![to_json, task_id, from_json],
+            )
+            .context("update sup_tasks state")?;
+        if updated != 1 {
+            // Distinguish "the task moved on" from "the task is gone" so the
+            // caller can answer 409 and 404 respectively.
+            let persisted: Option<String> = tx
+                .query_row("SELECT state FROM sup_tasks WHERE id=?1", [task_id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .context("read the persisted state of a sup_tasks row")?;
+            // Dropping the transaction rolls the audit row back with it.
+            drop(tx);
+            return match persisted {
+                // Defensive: `sup_transitions.task_id` has a foreign key to
+                // `sup_tasks`, so a transition for a task that never existed is
+                // refused by the insert above. This is the answer for a row
+                // that is gone all the same, and the two must not be confused
+                // with "the task moved on".
+                None => Err(SupervisorError::not_found(task_id)),
+                Some(state) => match serde_json::from_str::<TaskStatus>(&state) {
+                    Ok(actual) => Err(SupervisorError::state_refusal(actual, to)),
+                    Err(e) => Err(anyhow::Error::new(e)
+                        .context(format!("sup_tasks {task_id} holds an unreadable state"))),
+                },
+            };
+        }
+        tx.commit().context("commit sup_tasks state change")?;
         Ok(())
     }
 
@@ -306,6 +380,24 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// Record a job's terminal state, summary and error.
+    ///
+    /// # Redaction happens here, not at the route
+    ///
+    /// `summary` is whatever the backend produced — for `ShellBackend` that is
+    /// the command's stdout — and `error` is a backend's `anyhow` chain. Both
+    /// used to be stored verbatim, so the same text was scrubbed on its way to
+    /// the on-disk artifact (`ArtifactManager::write_text` runs
+    /// [`crate::supervisor::redact::redact`]) and stored raw in `sup_jobs`,
+    /// which then served it back through `GET /api/supervisor/tasks/{id}`. A
+    /// job whose output contained `api_key=…` was therefore redacted in the
+    /// file and readable in the JSON.
+    ///
+    /// Scrubbing at the persistence boundary rather than in the projection is
+    /// deliberate: the database is what every future read path, log view and
+    /// export reads, so the secret must not be written at all. A route-level
+    /// filter would leave the plaintext in `sup_jobs` and depend on every
+    /// current and future reader remembering to filter it.
     pub async fn update_job_status(
         &self,
         id: &str,
@@ -313,6 +405,8 @@ impl TaskStore {
         summary: Option<&str>,
         error: Option<&str>,
     ) -> Result<()> {
+        let summary = summary.map(crate::supervisor::redact::redact);
+        let error = error.map(crate::supervisor::redact::redact);
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE sup_jobs SET status=?1, result_summary=?2, error=?3,
@@ -482,6 +576,23 @@ mod tests {
         );
     }
 
+    /// **This is the proof of the clamp.** The route passes the constant
+    /// `MAX_RECENT_TASKS` (`web/routes/supervisor.rs`), so no HTTP test can
+    /// observe the `.clamp()` itself — deleting it leaves an end-to-end
+    /// assertion on "at most 20" green. Only calling the store with a limit it
+    /// is not supposed to honour can fail when the clamp goes away.
+    #[tokio::test]
+    async fn the_clamp_is_the_only_thing_that_bounds_a_caller_supplied_limit() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        for i in 0..25 {
+            let t = Task::new(&format!("t{i}"), "req");
+            store.create(&t, "telegram", "u1", None).await.unwrap();
+        }
+        assert_eq!(store.list_recent(usize::MAX).await.unwrap().len(), 20);
+        assert_eq!(store.list_recent(21).await.unwrap().len(), 20);
+    }
+
     #[tokio::test]
     async fn list_recent_clamps_a_zero_limit_to_one() {
         let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
@@ -523,5 +634,208 @@ mod tests {
         let history = store.transitions(&t.id).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].to, TaskStatus::Classify);
+    }
+
+    /// A row that exists but cannot be mapped is a fault, not a missing task.
+    ///
+    /// `get` used to fold `Some(Err(_))` into `Ok(None)`, so a corrupt `state`
+    /// was reported to the dashboard as an unknown id (404) while
+    /// `list_recent` propagated the identical error as a 500. This test pins
+    /// all three outcomes apart.
+    #[tokio::test]
+    async fn get_keeps_a_missing_row_and_an_unmappable_row_apart() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let t = Task::new("T", "u");
+        store.create(&t, "telegram", "u1", None).await.unwrap();
+
+        // Case 1: no such row.
+        assert!(store.get("no-such-task").await.unwrap().is_none());
+
+        // Case 2: the row is there and maps cleanly.
+        assert_eq!(store.get(&t.id).await.unwrap().unwrap().title, "T");
+
+        // Case 3: the row is there and does not map. Written as raw SQL
+        // because nothing in the store can produce it — which is exactly why
+        // the difference has to be pinned by a test.
+        {
+            let conn = memory.connection();
+            let conn = conn.lock().await;
+            conn.execute(
+                "UPDATE sup_tasks SET state='\"NOT_A_STATE\"' WHERE id=?1",
+                [&t.id],
+            )
+            .unwrap();
+        }
+        let error = store
+            .get(&t.id)
+            .await
+            .expect_err("an unmappable row must be an error, never `Ok(None)`");
+        assert!(
+            format!("{error:#}").contains("read sup_tasks row"),
+            "the error must name the read that failed: {error:#}"
+        );
+        // The listing propagates the same class of failure, so the two read
+        // paths agree about what a corrupt row is.
+        assert!(store.list_recent(20).await.is_err());
+    }
+
+    /// The compare-and-swap, at the store: eight concurrent duplicate
+    /// transitions of the same task, only one of which may land.
+    ///
+    /// Before the fix the `UPDATE` carried no condition, so **every** one of
+    /// them succeeded — there was nothing to fail — leaving eight audit rows
+    /// and, one level up, eight plans. This is the same hazard the supervisor's
+    /// read-check-write lifecycle has, isolated to the write that has to be
+    /// atomic for it to be safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_transitions_let_exactly_one_win() {
+        use crate::supervisor::task::TaskStatus;
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let t = Task::new("T", "u");
+        store.create(&t, "telegram", "u1", None).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let id = t.id.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .record_transition(&id, TaskStatus::Intake, TaskStatus::Classify, "test", None)
+                    .await
+            }));
+        }
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        for handle in handles {
+            match handle.await.expect("no transition may panic") {
+                Ok(()) => accepted += 1,
+                Err(e) => {
+                    assert!(
+                        matches!(
+                            e.downcast_ref::<crate::supervisor::SupervisorError>(),
+                            Some(crate::supervisor::SupervisorError::StateRefusal { .. })
+                        ),
+                        "a refused duplicate must be a typed refusal, got {e:?}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(accepted, 1, "exactly one duplicate transition may land");
+        assert_eq!(refused, 7);
+        assert_eq!(
+            store.transitions(&t.id).await.unwrap().len(),
+            1,
+            "a refused transition must roll its audit row back"
+        );
+        assert_eq!(
+            store.get(&t.id).await.unwrap().unwrap().status,
+            TaskStatus::Classify
+        );
+    }
+
+    /// The refusal has to be usable by the caller: a task that has moved on
+    /// reports the state it is *actually* in, and a task that is gone reports
+    /// `NotFound` rather than an unreadable state.
+    #[tokio::test]
+    async fn a_refused_transition_names_the_state_the_task_is_really_in() {
+        use crate::supervisor::task::TaskStatus;
+        use crate::supervisor::SupervisorError;
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let t = Task::new("T", "u");
+        store.create(&t, "telegram", "u1", None).await.unwrap();
+        store
+            .record_transition(
+                &t.id,
+                TaskStatus::Intake,
+                TaskStatus::Classify,
+                "test",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The task is in `Classify`, not `Route`: the stale `from` is refused
+        // and the error names the state the store really holds. `Route -> Plan`
+        // is itself a legal edge, so this refusal can only come from the
+        // compare-and-swap — which is the point.
+        let error = store
+            .record_transition(&t.id, TaskStatus::Route, TaskStatus::Plan, "test", None)
+            .await
+            .expect_err("a stale `from` must be refused");
+        match error.downcast_ref::<SupervisorError>() {
+            Some(SupervisorError::StateRefusal { from, to }) => {
+                assert_eq!(from, &TaskStatus::Classify);
+                assert_eq!(to, &TaskStatus::Plan);
+            }
+            other => panic!("expected a typed state refusal, got {other:?}"),
+        }
+        assert_eq!(store.transitions(&t.id).await.unwrap().len(), 1);
+
+        // A transition for a task that does not exist at all never reaches the
+        // compare-and-swap: `sup_transitions.task_id` carries a foreign key to
+        // `sup_tasks`, so the insert is refused first. Pinned because the
+        // `NotFound` arm below is the answer for the case the constraint cannot
+        // see (a row that is gone but whose insert somehow landed), and a test
+        // that claimed to exercise it through this path would be lying.
+        let missing = store
+            .record_transition(
+                "gone",
+                TaskStatus::Intake,
+                TaskStatus::Classify,
+                "test",
+                None,
+            )
+            .await
+            .expect_err("a transition for a missing task must be refused");
+        assert!(
+            format!("{missing:#}").contains("FOREIGN KEY"),
+            "expected the foreign key to refuse the insert, got {missing:#}"
+        );
+    }
+
+    /// Job text is scrubbed at the **persistence boundary**, so the secret is
+    /// never written — not merely hidden by one read path.
+    ///
+    /// `ArtifactManager::write_text` already redacts; `update_job_status` did
+    /// not, so the same text was `api_key=***` on disk and the raw value in
+    /// `sup_jobs`, which `GET /api/supervisor/tasks/{id}` served back.
+    #[tokio::test]
+    async fn update_job_status_redacts_secrets_before_persisting() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let task = Task::new("T", "u");
+        store.create(&task, "telegram", "u", None).await.unwrap();
+        let job = Job::new(&task.id, JobType::ExecutorJob, "shell", "echo");
+        store.create_job(&job).await.unwrap();
+
+        store
+            .update_job_status(
+                &job.id,
+                JobStatus::Succeeded,
+                Some("stdout: api_key=ZZTOPSECRETKEY done"),
+                Some("failed with Bearer ZZBEARERTOKEN"),
+            )
+            .await
+            .unwrap();
+
+        let stored = store.jobs_for_task(&task.id).await.unwrap();
+        let summary = &stored[0].result.as_ref().expect("a stored summary").summary;
+        let error = stored[0].error.as_deref().expect("a stored error");
+        assert!(
+            !summary.contains("CAMPO_API_KEY"),
+            "the secret must not be written at all: {summary}"
+        );
+        assert!(summary.contains("api_key=***"), "got {summary}");
+        assert!(
+            !error.contains("ZZBEARERTOKEN"),
+            "the secret must not be written at all: {error}"
+        );
+        assert!(error.contains("Bearer ***"), "got {error}");
+        // Redaction is not a blunt truncation: the rest of the text survives.
+        assert!(summary.contains("stdout:"), "got {summary}");
     }
 }

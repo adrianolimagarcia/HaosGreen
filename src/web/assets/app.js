@@ -2412,14 +2412,22 @@
   /**
    * The lifecycle actions, in the order they are offered.
    *
-   * `from` is copied from `Action::permitted_from` in
-   * `src/web/routes/supervisor.rs`, which is `transition_allowed` from
-   * `src/supervisor/state.rs` — plus a stricter `resume`, which the supervisor
-   * itself limits to a `PAUSED` task. Two consequences are deliberate rather
-   * than oversights: `approve` is offered on a `PAUSED` task (`Paused ->
-   * Execute` is a legal edge and the server accepts it), and `cancel` is
-   * refused from `VERIFY`, `REPORT`, `ARCHIVE`, `DONE`, `FAILED` and
-   * `CLASSIFY`, none of which has an edge to `CANCELLED`.
+   * Each `from` is the set of states in which the server accepts that action,
+   * transcribed by hand from `Action::permitted_from` in
+   * `src/web/routes/supervisor.rs`: the `transition_allowed` edge into
+   * `Paused`, `Cancelled` or `Execute` in `src/supervisor/state.rs`, except for
+   * `resume`, which that route narrows to an exact `PAUSED`. This is a
+   * transcription and not a derivation — the server stays the authority, so a
+   * list that drifts disables a button the server would have accepted rather
+   * than offering one it would refuse, and a refusal is still handled: the
+   * server's own 409 sentence is shown inline, never via `alert()`.
+   *
+   * Consequences that are deliberate rather than oversights: `approve` is
+   * offered on a `PAUSED` task (`Paused -> Execute` is a legal edge and the
+   * server accepts it); `pause` is *not* offered on a `PAUSED` task, because
+   * the table has no `Paused -> Paused` edge and the route answers 409 for it;
+   * and `cancel` is refused from `VERIFY`, `REPORT`, `ARCHIVE`, `DONE`,
+   * `FAILED` and `CLASSIFY`, none of which has an edge to `CANCELLED`.
    */
   const LIFECYCLE_ACTIONS = [
     {
@@ -2428,7 +2436,7 @@
       past: "approved",
       icon: "i-check",
       className: "btn btn-accent",
-      from: ["ROUTE", "CLARIFY", "PAUSED"]
+      from: ["ROUTE", "CLARIFY", "PLAN", "PREPAREWORKSPACE", "PAUSED", "REVIEW", "VERIFY"]
     },
     {
       key: "resume",
@@ -2513,6 +2521,10 @@
     /** The poll interval handle, or null when polling is stopped. */
     timer: null,
     listBusy: false,
+    /** Bumped per list read, and on unmount, so a slow response cannot overwrite a newer one. */
+    listToken: 0,
+    /** A read was asked for while one was in flight: re-run once it settles. */
+    listQueued: false,
     /** What the list currently renders, so an unchanged poll does not rebuild it. */
     listSignature: null,
     /** Bumped per detail read so a slow response cannot overwrite a newer one. */
@@ -2804,8 +2816,9 @@
       return (
         "The task is not queued and is not running. It is held in state " +
         stateText(result.state) +
-        " waiting for an answer. This dashboard has no way to answer a " +
-        "clarification, so the task stays here until it is cancelled."
+        " waiting for an answer. This dashboard cannot answer a clarification " +
+        "for you, but the task is not stuck: it can still be approved — which " +
+        "runs it as it stands — or cancelled from its detail panel."
       );
     }
     if (result.outcome === "auto_execute_planned") {
@@ -3059,15 +3072,39 @@
     supervisorStartPolling();
   }
 
+  /**
+   * Re-read the listing.
+   *
+   * Two races are handled here, and both use the shape the detail panel already
+   * uses for the same problem:
+   *
+   *  * A response is applied only while it still owns `listToken`. That guard
+   *    cannot be `dom !== null` on its own: `supervisorUnmount` nulls `dom` and
+   *    a fast remount restores it before a slow response lands, so a listing
+   *    read before the operator navigated away would overwrite the newer
+   *    snapshot the remount asked for. `supervisorUnmount` bumps the token, so
+   *    every request issued before it is dropped on arrival.
+   *  * A request that arrives while one is in flight is remembered in
+   *    `listQueued` and re-issued once that one settles, instead of being
+   *    dropped. `runSupervisorAction` awaits a refresh because the list is
+   *    stale the moment an action returns; returning early there would leave
+   *    the row's chip on the pre-action state until the next poll, five
+   *    seconds later, while the detail panel beside it was already fresh.
+   */
   async function refreshTasks() {
-    const dom = supervisor.dom;
-    if (!dom || supervisor.listBusy) {
+    if (!supervisor.dom) {
+      return;
+    }
+    if (supervisor.listBusy) {
+      supervisor.listQueued = true;
       return;
     }
     supervisor.listBusy = true;
+    supervisor.listToken += 1;
+    const token = supervisor.listToken;
     try {
       const body = await api("/api/supervisor/tasks");
-      if (!supervisor.dom) {
+      if (token !== supervisor.listToken || !supervisor.dom) {
         return;
       }
       supervisor.unavailable = false;
@@ -3079,7 +3116,7 @@
         refreshDetail(supervisor.selectedId);
       }
     } catch (error) {
-      if (!supervisor.dom) {
+      if (token !== supervisor.listToken || !supervisor.dom) {
         return;
       }
       if (error && error.status === 401) {
@@ -3105,7 +3142,16 @@
           " The dashboard will try again in five seconds."
       );
     } finally {
-      supervisor.listBusy = false;
+      // Only the request that still owns the token may release the flag. A
+      // stale response settling after a remount must not clear the newer
+      // request's hold on it, or a third fetch would run beside it.
+      if (token === supervisor.listToken) {
+        supervisor.listBusy = false;
+        if (supervisor.listQueued) {
+          supervisor.listQueued = false;
+          refreshTasks();
+        }
+      }
     }
   }
 
@@ -3707,7 +3753,13 @@
     paintOutcome();
     paintTaskList();
     refreshTasks();
-    supervisorStartPolling();
+    // `visibilitychange` never fires for the state a document is loaded in, so
+    // a dashboard opened directly at `#/supervisor` in a background tab would
+    // otherwise poll every five seconds until it was first shown. A hidden tab
+    // starts polling from its first visibility event instead.
+    if (!document.hidden) {
+      supervisorStartPolling();
+    }
 
     if (supervisor.selectedId !== null) {
       // Coming back to the view reopens the task the operator was reading.
@@ -3723,6 +3775,11 @@
    * calls it when the session ends: a listing that arrives after the operator
    * left must not write into a panel that is gone, and the poll must not
    * outlive the view.
+   *
+   * Both read tokens are bumped here. Nulling `dom` alone is not enough for the
+   * listing: a remount restores `dom` before a slow response lands, so the
+   * response would pass a `dom !== null` guard and paint a snapshot read before
+   * the navigation. The bumped token is what makes it stale.
    */
   function supervisorUnmount() {
     supervisorStopPolling();
@@ -3730,8 +3787,10 @@
     supervisor.dom = null;
     supervisor.detail = null;
     supervisor.detailToken += 1;
+    supervisor.listToken += 1;
     supervisor.listSignature = null;
     supervisor.listBusy = false;
+    supervisor.listQueued = false;
     supervisor.actionBusy = false;
   }
 
