@@ -4,7 +4,7 @@
 //! > reaches state `completed`.
 //!
 //! Nothing on the agent path is stubbed. This test builds a real
-//! [`rustfox::agent::Agent`] (17 constructor arguments, including the
+//! [`haos_green::agent::Agent`] (17 constructor arguments, including the
 //! self-referential `Weak<Agent>` that `run_with_policy` needs), wraps it in
 //! the real [`A2aExecutor`], persists through the real [`SqliteTaskStore`],
 //! serves the real axum router on an ephemeral loopback port, and drives it
@@ -53,22 +53,22 @@ use a2a::types::{Task, TaskState, TaskStatus};
 use a2a_server::{AgentExecutor, ExecutorContext};
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use rustfox::a2a::server::{build_state, router};
-use rustfox::a2a::{A2aExecutor, SqliteTaskStore};
-use rustfox::agent::Agent;
-use rustfox::builtin_tools::BuiltinTools;
-use rustfox::cancel_registry::CancelRegistry;
-use rustfox::config::{A2aConfig, A2aPeerConfig, Config};
-use rustfox::langsmith::LangSmithClient;
-use rustfox::mcp::McpManager;
-use rustfox::memory::MemoryStore;
-use rustfox::memory_tools::MemoryTools;
-use rustfox::platform::sender::{MessageFormat, PlatformMessageId, PlatformSender};
-use rustfox::provider;
-use rustfox::scheduler::reminders::ScheduledTaskStore;
-use rustfox::scheduler::Scheduler;
-use rustfox::skills::SkillRegistry;
-use rustfox::tool_registry::ToolRegistry;
+use haos_green::a2a::server::{build_state, router};
+use haos_green::a2a::{A2aExecutor, SqliteTaskStore};
+use haos_green::agent::Agent;
+use haos_green::builtin_tools::BuiltinTools;
+use haos_green::cancel_registry::CancelRegistry;
+use haos_green::config::{A2aConfig, A2aPeerConfig, Config};
+use haos_green::langsmith::LangSmithClient;
+use haos_green::mcp::McpManager;
+use haos_green::memory::MemoryStore;
+use haos_green::memory_tools::MemoryTools;
+use haos_green::platform::sender::{MessageFormat, PlatformMessageId, PlatformSender};
+use haos_green::provider;
+use haos_green::scheduler::reminders::ScheduledTaskStore;
+use haos_green::scheduler::Scheduler;
+use haos_green::skills::SkillRegistry;
+use haos_green::tool_registry::ToolRegistry;
 
 /// Name of the peer as it appears in `[a2a.peers.<name>]`.
 const PEER_NAME: &str = "laptop";
@@ -298,7 +298,7 @@ async fn build_agent(config_path: &Path, memory: &MemoryStore, a2a: A2aConfig) -
         soul_updated.clone(),
     )));
     tool_registry.register(Box::new(MemoryTools::new(memory.clone())));
-    tool_registry.register(Box::new(rustfox::skill_tools::SkillTools::new(
+    tool_registry.register(Box::new(haos_green::skill_tools::SkillTools::new(
         config.skills.directory.clone(),
         config.agents.directory.clone(),
         skills_rw.clone(),
@@ -308,7 +308,7 @@ async fn build_agent(config_path: &Path, memory: &MemoryStore, a2a: A2aConfig) -
     let task_store = ScheduledTaskStore::new(memory.connection());
     let scheduler = Arc::new(Scheduler::new().await.expect("create the scheduler"));
     let (job_tx, _job_rx) =
-        tokio::sync::mpsc::unbounded_channel::<rustfox::agent::ScheduledJobRequest>();
+        tokio::sync::mpsc::unbounded_channel::<haos_green::agent::ScheduledJobRequest>();
     let langsmith = Arc::new(LangSmithClient::new(None));
     let cancel_registry = Arc::new(CancelRegistry::new());
     let sender: Arc<dyn PlatformSender> = Arc::new(NoopSender);
@@ -383,7 +383,7 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
         .peers
         .get(PEER_NAME)
         .unwrap_or_else(|| panic!("the agent's config must carry peer '{PEER_NAME}'"));
-    let resolved = rustfox::a2a::resolve_allowed_tools(PEER_NAME, peer, &registered);
+    let resolved = haos_green::a2a::resolve_allowed_tools(PEER_NAME, peer, &registered);
     assert!(
         !resolved.is_empty(),
         "peer '{PEER_NAME}' must resolve to a non-empty tool policy"

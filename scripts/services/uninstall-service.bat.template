@@ -1,3 +1,5 @@
 @echo off
-sc stop RustFox
-sc delete RustFox
+sc stop HaosGreen
+sc delete HaosGreen
+sc stop RustFox >nul 2>&1
+sc delete RustFox >nul 2>&1

@@ -455,9 +455,9 @@ mod tests {
 
     #[test]
     fn test_link_passes_through() {
-        let out = markdown_to_telegram_v2("[RustFox](https://github.com)");
+        let out = markdown_to_telegram_v2("[HaosGreen](https://github.com)");
         assert!(
-            out.starts_with("[RustFox]"),
+            out.starts_with("[HaosGreen]"),
             "display text must be kept: {}",
             out
         );

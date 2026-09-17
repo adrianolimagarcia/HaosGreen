@@ -1,9 +1,9 @@
-use rustfox::supervisor::{SubmitOutcome, Supervisor};
+use haos_green::supervisor::{SubmitOutcome, Supervisor};
 
 #[tokio::test]
 async fn fast_mode_runs_to_completion_and_reports() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("done:{p}")) });
 
@@ -17,5 +17,5 @@ async fn fast_mode_runs_to_completion_and_reports() {
     let report = sup.execute_now(&task_id).await.unwrap();
     assert!(report.contains("done:"));
     let final_state = sup.state(&task_id).await.unwrap();
-    assert_eq!(final_state, rustfox::supervisor::task::TaskStatus::Done);
+    assert_eq!(final_state, haos_green::supervisor::task::TaskStatus::Done);
 }

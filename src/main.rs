@@ -6,17 +6,17 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use rustfox::agent::Agent;
-use rustfox::config::Config;
-use rustfox::mcp::McpManager;
-use rustfox::memory::MemoryStore;
-use rustfox::platform;
-use rustfox::provider;
-use rustfox::scheduler::tasks::register_builtin_tasks;
-use rustfox::scheduler::Scheduler;
-use rustfox::setup;
-use rustfox::skills::loader::load_skills_from_dir;
-use rustfox::tool_registry::ToolUiMode;
+use haos_green::agent::Agent;
+use haos_green::config::Config;
+use haos_green::mcp::McpManager;
+use haos_green::memory::MemoryStore;
+use haos_green::platform;
+use haos_green::provider;
+use haos_green::scheduler::tasks::register_builtin_tasks;
+use haos_green::scheduler::Scheduler;
+use haos_green::setup;
+use haos_green::skills::loader::load_skills_from_dir;
+use haos_green::tool_registry::ToolUiMode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,rustfox=debug".into()),
+                .unwrap_or_else(|_| "info,haos_green=debug,rustfox=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -33,8 +33,11 @@ async fn main() -> Result<()> {
     if let Some(cmd) = setup::parse_args() {
         match cmd {
             setup::Command::Setup { cli } => {
-                let cfg_path = rustfox::home::resolve_config_path(
-                    std::env::var("RUSTFOX_CONFIG_PATH").ok().as_deref(),
+                let cfg_path = haos_green::home::resolve_config_path(
+                    std::env::var("HAOS_GREEN_CONFIG_PATH")
+                        .or_else(|_| std::env::var("RUSTFOX_CONFIG_PATH"))
+                        .ok()
+                        .as_deref(),
                     &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                     dirs::home_dir().as_deref(),
                 );
@@ -54,8 +57,11 @@ async fn main() -> Result<()> {
     }
 
     // If we reach here, it's a normal bot start — resolve config path
-    let config_path = rustfox::home::resolve_config_path(
-        std::env::var("RUSTFOX_CONFIG_PATH").ok().as_deref(),
+    let config_path = haos_green::home::resolve_config_path(
+        std::env::var("HAOS_GREEN_CONFIG_PATH")
+            .or_else(|_| std::env::var("RUSTFOX_CONFIG_PATH"))
+            .ok()
+            .as_deref(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         dirs::home_dir().as_deref(),
     );
@@ -119,7 +125,7 @@ async fn main() -> Result<()> {
     }
     info!("  Allowed users: {:?}", config.telegram.allowed_user_ids);
     info!("  MCP servers: {}", config.mcp_servers.len());
-    let langsmith = std::sync::Arc::new(rustfox::langsmith::LangSmithClient::new(
+    let langsmith = std::sync::Arc::new(haos_green::langsmith::LangSmithClient::new(
         config.langsmith.as_ref(),
     ));
     if langsmith.is_enabled() {
@@ -136,7 +142,7 @@ async fn main() -> Result<()> {
         config
             .embedding
             .as_ref()
-            .map(|cfg| rustfox::memory::embeddings::EmbeddingConfig {
+            .map(|cfg| haos_green::memory::embeddings::EmbeddingConfig {
                 api_key: cfg.api_key.clone(),
                 base_url: cfg.base_url.clone(),
                 model: cfg.model.clone(),
@@ -155,9 +161,12 @@ async fn main() -> Result<()> {
     // Refresh any expiring OAuth tokens before connecting to MCP servers
     let http_client = reqwest::Client::new();
     let mut mcp_server_configs = config.mcp_servers.clone();
-    let refreshed =
-        rustfox::mcp::refresh_expiring_tokens(&mut mcp_server_configs, &config_path, &http_client)
-            .await;
+    let refreshed = haos_green::mcp::refresh_expiring_tokens(
+        &mut mcp_server_configs,
+        &config_path,
+        &http_client,
+    )
+    .await;
     if refreshed > 0 {
         info!("  Refreshed {refreshed} expiring MCP OAuth token(s) at startup");
     }
@@ -167,18 +176,24 @@ async fn main() -> Result<()> {
     mcp_manager.connect_all(&mcp_server_configs).await;
 
     // Seed bundled skills/agents from embedded data into the home directory.
-    if let Err(e) = rustfox::skills::embed::seed_skills(&config.skills.directory).await {
+    if let Err(e) = haos_green::skills::embed::seed_skills(&config.skills.directory).await {
         warn!("Skill seeding failed: {e}");
     }
-    if let Err(e) = rustfox::skills::embed::seed_agents(&config.agents.directory).await {
+    if let Err(e) = haos_green::skills::embed::seed_agents(&config.agents.directory).await {
         warn!("Agent seeding failed: {e}");
     }
     // Write a home-side lock recording content hashes for future diff/audit.
     if let Some(home) = &config.resolved_home {
-        let _ =
-            rustfox::skills::seed::write_lock("skills-lock.json", &config.skills.directory, home);
-        let _ =
-            rustfox::skills::seed::write_lock("agents-lock.json", &config.agents.directory, home);
+        let _ = haos_green::skills::seed::write_lock(
+            "skills-lock.json",
+            &config.skills.directory,
+            home,
+        );
+        let _ = haos_green::skills::seed::write_lock(
+            "agents-lock.json",
+            &config.agents.directory,
+            home,
+        );
     }
 
     // Load skills from the instance directory.
@@ -192,7 +207,7 @@ async fn main() -> Result<()> {
     info!("  Agents: {}", agents.len());
 
     // Create ScheduledTaskStore sharing the existing SQLite connection
-    let task_store = rustfox::scheduler::reminders::ScheduledTaskStore::new(memory.connection());
+    let task_store = haos_green::scheduler::reminders::ScheduledTaskStore::new(memory.connection());
 
     // Create scheduler as Arc so Agent can hold it and closures can reference it
     let scheduler = Arc::new(Scheduler::new().await?);
@@ -200,15 +215,15 @@ async fn main() -> Result<()> {
     // Create Bot early so it can be passed to Agent
     let bot = Arc::new(teloxide::Bot::new(&config.telegram.bot_token));
 
-    rustfox::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
+    haos_green::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
 
     // Channel for dispatching scheduled job work from fire closures to background runner
     let (job_tx, mut job_rx) =
-        tokio::sync::mpsc::unbounded_channel::<rustfox::agent::ScheduledJobRequest>();
+        tokio::sync::mpsc::unbounded_channel::<haos_green::agent::ScheduledJobRequest>();
 
-    let cancel_registry = std::sync::Arc::new(rustfox::cancel_registry::CancelRegistry::new());
-    let sender: Arc<dyn rustfox::platform::sender::PlatformSender> = Arc::new(
-        rustfox::platform::telegram::TelegramAdapter::new((*bot).clone()),
+    let cancel_registry = std::sync::Arc::new(haos_green::cancel_registry::CancelRegistry::new());
+    let sender: Arc<dyn haos_green::platform::sender::PlatformSender> = Arc::new(
+        haos_green::platform::telegram::TelegramAdapter::new((*bot).clone()),
     );
     let a2a_skills = skills.clone();
     let skills_rw = Arc::new(tokio::sync::RwLock::new(skills.clone()));
@@ -216,35 +231,37 @@ async fn main() -> Result<()> {
     let restart_pending = Arc::new(AtomicBool::new(false));
     let soul_updated = Arc::new(AtomicBool::new(false));
 
-    let mut tool_registry = rustfox::tool_registry::ToolRegistry::new();
-    tool_registry.register(Box::new(rustfox::builtin_tools::BuiltinTools::new(
+    let mut tool_registry = haos_green::tool_registry::ToolRegistry::new();
+    tool_registry.register(Box::new(haos_green::builtin_tools::BuiltinTools::new(
         config.skills.directory.clone(),
         skills_rw.clone(),
         restart_pending.clone(),
         soul_updated.clone(),
     )));
-    tool_registry.register(Box::new(rustfox::memory_tools::MemoryTools::new(
+    tool_registry.register(Box::new(haos_green::memory_tools::MemoryTools::new(
         memory.clone(),
     )));
-    tool_registry.register(Box::new(rustfox::scheduling_tools::SchedulingTools::new(
-        task_store.clone(),
-        Arc::clone(&scheduler),
-        job_tx.clone(),
-        Arc::clone(&bot),
-    )));
-    tool_registry.register(Box::new(rustfox::skill_tools::SkillTools::new(
+    tool_registry.register(Box::new(
+        haos_green::scheduling_tools::SchedulingTools::new(
+            task_store.clone(),
+            Arc::clone(&scheduler),
+            job_tx.clone(),
+            Arc::clone(&bot),
+        ),
+    ));
+    tool_registry.register(Box::new(haos_green::skill_tools::SkillTools::new(
         config.skills.directory.clone(),
         config.agents.directory.clone(),
         skills_rw.clone(),
         agents_rw.clone(),
     )));
-    tool_registry.register(Box::new(rustfox::command_tool::CommandTool::new(
+    tool_registry.register(Box::new(haos_green::command_tool::CommandTool::new(
         config.sandbox.allowed_directory.clone(),
         cancel_registry.clone(),
         sender.clone(),
     )));
     if !config.a2a.outbound.peers.is_empty() {
-        tool_registry.register(Box::new(rustfox::a2a::tool::CallA2aAgent::new(
+        tool_registry.register(Box::new(haos_green::a2a::tool::CallA2aAgent::new(
             config.a2a.outbound.clone(),
         )));
     }
@@ -330,11 +347,11 @@ async fn main() -> Result<()> {
                     };
                     let chat = teloxide::types::ChatId(chat_id_val);
                     let error_msg = format!("**Scheduled task failed:** {}", e);
-                    let _ = rustfox::platform::telegram::send_markdown_message(
+                    let _ = haos_green::platform::telegram::send_markdown_message(
                         &req.bot,
                         chat,
                         &error_msg,
-                        rustfox::platform::telegram::MessageFormat::Auto,
+                        haos_green::platform::telegram::MessageFormat::Auto,
                     )
                     .await;
                     continue;
@@ -353,11 +370,11 @@ async fn main() -> Result<()> {
                 }
             };
             let chat = teloxide::types::ChatId(chat_id_val);
-            if let Err(e) = rustfox::platform::telegram::send_markdown_message(
+            if let Err(e) = haos_green::platform::telegram::send_markdown_message(
                 &req.bot,
                 chat,
                 &response,
-                rustfox::platform::telegram::MessageFormat::Auto,
+                haos_green::platform::telegram::MessageFormat::Auto,
             )
             .await
             {
@@ -379,7 +396,7 @@ async fn main() -> Result<()> {
             interval.tick().await; // skip first immediate tick
             loop {
                 interval.tick().await;
-                let refreshed = rustfox::mcp::refresh_expiring_tokens(
+                let refreshed = haos_green::mcp::refresh_expiring_tokens(
                     &mut cfgs,
                     &refresh_config_path,
                     &refresh_http_client,
@@ -402,7 +419,7 @@ async fn main() -> Result<()> {
     register_builtin_tasks(
         &scheduler,
         memory.clone(),
-        rustfox::llm::LlmClient::new(registry.clone()),
+        haos_green::llm::LlmClient::new(registry.clone()),
         config.memory.summarize_cron.clone(),
         config.memory.summarize_threshold,
         config.learning.user_model_cron.clone(),
@@ -418,21 +435,21 @@ async fn main() -> Result<()> {
     // future routing paths can resolve backends rather than failing with
     // "backend not found". Held alive in main's scope so the binding isn't
     // dead-code-eliminated.
-    let mut sup_registry = rustfox::supervisor::backend::Registry::new();
+    let mut sup_registry = haos_green::supervisor::backend::Registry::new();
     sup_registry.register(std::sync::Arc::new(
-        rustfox::supervisor::backend::reasoning::ReasoningBackend::from_agent(
+        haos_green::supervisor::backend::reasoning::ReasoningBackend::from_agent(
             Arc::clone(&agent),
             "supervisor".to_string(),
             "supervisor".to_string(),
         ),
     ));
     sup_registry.register(std::sync::Arc::new(
-        rustfox::supervisor::backend::shell::ShellBackend::new(
+        haos_green::supervisor::backend::shell::ShellBackend::new(
             config.sandbox.allowed_directory.clone(),
         ),
     ));
 
-    let _supervisor = Arc::new(rustfox::supervisor::Supervisor::new(
+    let _supervisor = Arc::new(haos_green::supervisor::Supervisor::new(
         config.supervisor.artifacts_dir.clone(),
         memory.connection(),
         sup_registry,
@@ -459,9 +476,9 @@ async fn main() -> Result<()> {
                 // `spawn` binds, then derives the advertised URL from the
                 // address it actually bound, so the Agent Card never
                 // advertises port 0 for an ephemeral bind.
-                let a2a_executor = rustfox::a2a::A2aExecutor::new(agent.clone());
-                let a2a_store = rustfox::a2a::SqliteTaskStore::new(agent.memory.connection());
-                if let Err(e) = rustfox::a2a::server::spawn(
+                let a2a_executor = haos_green::a2a::A2aExecutor::new(agent.clone());
+                let a2a_store = haos_green::a2a::SqliteTaskStore::new(agent.memory.connection());
+                if let Err(e) = haos_green::a2a::server::spawn(
                     config.a2a.clone(),
                     a2a_skills,
                     a2a_executor,

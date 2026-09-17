@@ -110,7 +110,7 @@ mod tests {
 
     fn cfg() -> A2aCardConfig {
         A2aCardConfig {
-            name: "RustFox".to_string(),
+            name: "HaosGreen".to_string(),
             description: "Self-hosted assistant".to_string(),
             version: "1.0.2".to_string(),
         }
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn card_carries_configured_identity() {
         let card = build_agent_card(&cfg(), &registry(vec![]), "http://localhost:8443");
-        assert_eq!(card.name, "RustFox");
+        assert_eq!(card.name, "HaosGreen");
         assert_eq!(card.description, "Self-hosted assistant");
         assert_eq!(card.version, "1.0.2");
     }

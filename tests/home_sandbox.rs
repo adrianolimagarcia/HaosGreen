@@ -1,9 +1,9 @@
-use rustfox::config::Config;
+use haos_green::config::Config;
 
 #[test]
 fn sandbox_defaults_to_home_workspace_and_excludes_secrets() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join(".rustfox");
+    let home = tmp.path().join(".haos-green");
     let cfg_path = tmp.path().join("config.toml");
     let toml = format!(
         r#"
@@ -23,7 +23,7 @@ fn sandbox_defaults_to_home_workspace_and_excludes_secrets() {
     // Sandbox is the workspace subdir of home.
     assert_eq!(cfg.sandbox.allowed_directory, home.join("workspace"));
     // DB lives ABOVE the sandbox → structurally unreachable by file tools.
-    assert_eq!(cfg.memory.database_path, home.join("rustfox.db"));
+    assert_eq!(cfg.memory.database_path, home.join("haos-green.db"));
     assert!(!cfg
         .memory
         .database_path

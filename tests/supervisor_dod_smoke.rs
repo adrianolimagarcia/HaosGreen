@@ -4,13 +4,13 @@
 //! plan → execute → verify → report → archive → done) for a different
 //! workflow class so a regression in any stage trips at least one test.
 
-use rustfox::supervisor::task::TaskStatus;
-use rustfox::supervisor::{SubmitOutcome, Supervisor};
+use haos_green::supervisor::task::TaskStatus;
+use haos_green::supervisor::{SubmitOutcome, Supervisor};
 
 #[tokio::test]
 async fn dod_general_assistant_fast_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("answered:{p}")) });
 
@@ -44,7 +44,7 @@ async fn dod_general_assistant_fast_mode() {
 #[tokio::test]
 async fn dod_research_workflow_artifacts_present() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("research:{p}")) });
     let id = sup
@@ -73,7 +73,7 @@ async fn dod_research_workflow_artifacts_present() {
 #[tokio::test]
 async fn dod_writing_workflow_completes() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("draft:{p}")) });
     let id = sup
@@ -91,12 +91,12 @@ async fn dod_high_risk_task_requires_approval() {
     // exercise the equivalent gate: a Medium-risk request under strict
     // thresholds must surface as `NeedsApproval`.
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let strict = Supervisor::new(
         dir.path().into(),
         memory.connection(),
-        rustfox::supervisor::backend::Registry::new(),
-        rustfox::config::RiskThresholdsConfig {
+        haos_green::supervisor::backend::Registry::new(),
+        haos_green::config::RiskThresholdsConfig {
             require_approval_for_medium: true,
             ..Default::default()
         },
@@ -110,15 +110,15 @@ async fn dod_high_risk_task_requires_approval() {
 
 #[tokio::test]
 async fn dod_rigorous_mode_visits_review_state() {
-    use rustfox::supervisor::task::TaskStatus;
+    use haos_green::supervisor::task::TaskStatus;
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
 
     // Use repo-aware constructor so workspace stage works for code task
     let repo = tempfile::tempdir().unwrap();
     init_git_repo(repo.path()).await;
 
-    let mut sup = rustfox::supervisor::Supervisor::new_for_test_with_repo(
+    let mut sup = haos_green::supervisor::Supervisor::new_for_test_with_repo(
         dir.path().into(),
         repo.path().into(),
         memory.connection(),
@@ -168,7 +168,7 @@ async fn init_git_repo(p: &std::path::Path) {
 #[tokio::test]
 async fn dod_resumes_from_paused_state() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("done:{p}")) });
     let id = sup

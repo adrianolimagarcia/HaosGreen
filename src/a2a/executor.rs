@@ -1,4 +1,4 @@
-//! Bridges an A2A task to a RustFox agent turn, under the peer's tool policy.
+//! Bridges an A2A task to a HaosGreen agent turn, under the peer's tool policy.
 //!
 //! This is the security-critical module of Phase 2. Two things must hold:
 //!
@@ -48,7 +48,7 @@ impl Drop for AgentTaskCleanup {
 /// `service_params` (`middleware.rs:17-28`), and that is the **only** identity
 /// channel available: the SDK sets `ctx.user` to `None` unconditionally
 /// (`handler.rs:558`, `handler.rs:668`).
-pub const PEER_HEADER: &str = "x-rustfox-a2a-peer";
+pub const PEER_HEADER: &str = "x-haos-green-a2a-peer";
 
 /// Cancel-registry key for an A2A task.
 ///
@@ -139,7 +139,7 @@ impl TaskGate {
     }
 }
 
-/// Drives an A2A task through the RustFox agent loop.
+/// Drives an A2A task through the HaosGreen agent loop.
 pub struct A2aExecutor {
     agent: Arc<crate::agent::Agent>,
     gate: TaskGate,

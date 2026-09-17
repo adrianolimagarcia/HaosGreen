@@ -1,8 +1,8 @@
-# CLAUDE.md - RustFox Development Guide
+# CLAUDE.md - HaosGreen Development Guide
 
 ## Project Overview
 
-RustFox is a Telegram AI assistant written in Rust. It connects to Telegram as a
+HaosGreen is a Telegram AI assistant written in Rust. It connects to Telegram as a
 bot, uses OpenRouter for inference (default model `moonshotai/kimi-k2.6`, see
 `default_model()` in `src/config.rs`), provides built-in sandboxed tools plus
 MCP (Model Context Protocol) servers for extensible tool integration, and runs
@@ -36,12 +36,12 @@ Copy `config.example.toml` to `config.toml` and fill in credentials.
 
 ### Home directory
 
-RustFox stores all state under a single home directory (default `~/.rustfox`),
-resolved as: `RUSTFOX_HOME` env (absolute) → `[general].home` config → `~/.rustfox`.
-Layout: `config.toml`, `rustfox.db`, `skills/`, `agents/`, `workspace/` (the
+HaosGreen stores all state under a single home directory (default `~/.haos-green`),
+resolved as: `HAOS_GREEN_HOME` env (or `RUSTFOX_HOME`, absolute) → `[general].home` config → `~/.haos-green` (with fallback to `~/.rustfox`).
+Layout: `config.toml`, `haos-green.db`, `skills/`, `agents/`, `workspace/` (the
 sandbox), `artifacts/`, `user_model.md`. Each path can be pinned to an absolute
 location in `config.toml`; unset paths fall back to the home default. Run
-isolated instances with `RUSTFOX_HOME=...`. See
+isolated instances with `HAOS_GREEN_HOME=...`. See
 `docs/persistent-home-directory.md`. Path resolution lives in `src/home.rs`
 (`Config::resolve` writes the resolved absolute paths back into the config).
 Bundled skills/agents are seed-copied on first run; `/update-skills` re-syncs
@@ -136,7 +136,7 @@ src/
 - **Async runtime**: Tokio (`full` features)
 - **Error handling**: `anyhow::Result` throughout, with `.context()` /
   `.with_context()` for error messages
-- **Logging**: `tracing` (`RUST_LOG`, default `info,rustfox=debug`)
+- **Logging**: `tracing` (`RUST_LOG`, default `info,haos_green=debug`)
 - **Serialization**: `serde` derive with
   `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields
 - **Shared state**: `Arc<Agent>` and friends, passed via teloxide's `dptree`
@@ -173,7 +173,7 @@ src/
 
 > **Do not treat "read-only" as "safe".** Two of the worst bugs found in this
 > codebase were read-only tools that reached outside their sandbox:
-> `read_soul_file` could return `~/.rustfox/config.toml` (API key + every peer
+> `read_soul_file` could return `~/.haos-green/config.toml` (API key + every peer
 > token) because its JSON-schema `enum` was only an LLM hint, never enforced at
 > runtime. Validate at runtime, on the **resolved path**, and fail closed —
 > never `unwrap_or_else` a validation error into a default path.
@@ -301,7 +301,7 @@ dispatch through a `special_tool_handler` closure instead.
 
 Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs` starts an axum listener alongside the Telegram bot. The server provides:
 - Server phases 1–4: Agent Card (`/.well-known/agent-card.json`), Bearer + IP authentication, per-peer tool policy, real `AgentExecutor`/task store, JSON-RPC operations (`SendMessage`, `GetTask`, `CancelTask`), concurrency control via `TaskGate`, and SSE streaming (`SendStreamingMessage` emitting lifecycle transitions).
-- Client & tool (Phase 5): Outbound A2A client (`src/a2a/client.rs`) and `call_a2a_agent` tool (`src/a2a/tool.rs`) allowing RustFox to delegate tasks to remote A2A peers.
+- Client & tool (Phase 5): Outbound A2A client (`src/a2a/client.rs`) and `call_a2a_agent` tool (`src/a2a/tool.rs`) allowing HaosGreen to delegate tasks to remote A2A peers.
 
 ### Endpoints
 - `GET /.well-known/agent-card.json` — **public**, no auth. Lists skills by
@@ -324,10 +324,10 @@ Implementation plans: `docs/superpowers/plans/2026-09-16-a2a-phase1-card-auth-po
 
 > **Security invariants — do not weaken without a written reason:**
 > - `DEFAULT_PEER_TOOLS` (`src/a2a/policy.rs`) is an **allowlist**. A tool added
->   to RustFox is *not* granted to peers until it is named there.
-> - **Anti-recursion invariant**: `call_a2a_agent` is **NEVER** in `DEFAULT_PEER_TOOLS`. An inbound peer cannot call outbound A2A peers through RustFox unless explicitly granted by operator policy, preventing unbounded peer-to-peer amplification loops.
+>   to HaosGreen is *not* granted to peers until it is named there.
+> - **Anti-recursion invariant**: `call_a2a_agent` is **NEVER** in `DEFAULT_PEER_TOOLS`. An inbound peer cannot call outbound A2A peers through HaosGreen unless explicitly granted by operator policy, preventing unbounded peer-to-peer amplification loops.
 > - `read_soul_file` and `plan_view` are deliberately excluded: `read_soul_file`
->   can reach `~/.rustfox/config.toml`, which holds the API key and every peer
+>   can reach `~/.haos-green/config.toml`, which holds the API key and every peer
 >   token. Do not add them back.
 > - `["*"]` expands to the **registry's** tool set, never a hand-written list.
 > - An empty configured token never authenticates, and duplicate tokens are
@@ -412,16 +412,16 @@ into the `Registry` at startup.
 ```rust
 struct EchoBackend;
 #[async_trait::async_trait]
-impl rustfox::supervisor::backend::Backend for EchoBackend {
+impl haos_green::supervisor::backend::Backend for EchoBackend {
     fn name(&self) -> &str { "echo" }
-    fn capabilities(&self) -> rustfox::supervisor::backend::BackendCapabilities {
-        rustfox::supervisor::backend::BackendCapabilities { reasoning: true, ..Default::default() }
+    fn capabilities(&self) -> haos_green::supervisor::backend::BackendCapabilities {
+        haos_green::supervisor::backend::BackendCapabilities { reasoning: true, ..Default::default() }
     }
-    fn can_handle(&self, _: &rustfox::supervisor::job::JobType) -> bool { true }
-    async fn run(&self, job: &mut rustfox::supervisor::job::Job, _: &rustfox::supervisor::backend::RunContext)
-        -> anyhow::Result<rustfox::supervisor::job::JobOutput> { /* ... */ todo!() }
+    fn can_handle(&self, _: &haos_green::supervisor::job::JobType) -> bool { true }
+    async fn run(&self, job: &mut haos_green::supervisor::job::Job, _: &haos_green::supervisor::backend::RunContext)
+        -> anyhow::Result<haos_green::supervisor::job::JobOutput> { /* ... */ todo!() }
 }
-let mut reg = rustfox::supervisor::backend::Registry::new();
+let mut reg = haos_green::supervisor::backend::Registry::new();
 reg.register(std::sync::Arc::new(EchoBackend));
 ```
 

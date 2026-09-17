@@ -1,7 +1,7 @@
 //! Setup wizard — web (Axum server + browser) and CLI modes.
 //!
 //! Extracted from `src/bin/setup.rs` so the main binary can reuse it
-//! via `rustfox --setup`.
+//! via `haos-green --setup`.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -334,7 +334,7 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to bind to {addr}"))?;
 
     println!("\n============================================");
-    println!("  RustFox Setup Wizard");
+    println!("  HaosGreen Setup Wizard");
     println!("  http://localhost:{SETUP_PORT}");
     println!("============================================");
     println!("Press Ctrl-C to exit without saving.\n");
@@ -451,7 +451,7 @@ async fn oauth_start(
 
     let redir = redirect_uri();
     let reg_body = ClientRegistrationRequest {
-        client_name: "RustFox Setup".into(),
+        client_name: "HaosGreen Setup".into(),
         redirect_uris: vec![redir.clone()],
         grant_types: vec!["authorization_code".into()],
         response_types: vec!["code".into()],
@@ -654,7 +654,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     use std::io::{self, Write};
 
     println!("============================================");
-    println!("  RustFox CLI Setup");
+    println!("  HaosGreen CLI Setup");
     println!("============================================");
     println!("Press Enter to accept [defaults].\n");
 
@@ -681,7 +681,10 @@ fn run_cli(config_dir: &Path) -> Result<()> {
         read_line("Model [moonshotai/kimi-k2.6]: ")?,
         "moonshotai/kimi-k2.6",
     );
-    let db_path = or_default(read_line("Memory DB path [rustfox.db]: ")?, "rustfox.db");
+    let db_path = or_default(
+        read_line("Memory DB path [haos-green.db]: ")?,
+        "haos-green.db",
+    );
     let location = read_line("Your location (optional, e.g. Tokyo, Japan): ")?;
 
     let config = format_config(&ConfigParams {
@@ -708,7 +711,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     if buf.trim().is_empty() || buf.trim().eq_ignore_ascii_case("y") {
         if let Err(e) = crate::setup::service::handle(crate::setup::service::Action::Install) {
             eprintln!("Warning: Service installation failed: {e}");
-            eprintln!("You can retry later with: rustfox --service install");
+            eprintln!("You can retry later with: haos-green --service install");
         }
     }
 

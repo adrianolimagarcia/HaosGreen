@@ -1,5 +1,5 @@
 [package]
-name = "rustfox"
+name = "haos-green"
 version = "1.0.2"
 edition = "2021"
 
@@ -111,11 +111,11 @@ subtle = "2"
 tower-http = { version = "0.6", features = ["trace"] }
 
 [lib]
-name = "rustfox"
+name = "haos_green"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rustfox"
+name = "haos-green"
 path = "src/main.rs"
 
 [dev-dependencies]

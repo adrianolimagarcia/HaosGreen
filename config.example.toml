@@ -1,4 +1,4 @@
-# RustFox Configuration
+# HaosGreen Configuration
 
 [telegram]
 # Get your bot token from @BotFather on Telegram
@@ -47,7 +47,7 @@ Be concise and helpful."""
 # model = "qwen2.5-7b-instruct"
 
 # ── Fallback Chain (optional) ──────────────────────────────────────────
-# When the primary model fails, RustFox tries each fallback in order.
+# When the primary model fails, HaosGreen tries each fallback in order.
 # Each entry is a full provider-prefixed model string.
 # [fallback]
 # chain = [
@@ -57,12 +57,12 @@ Be concise and helpful."""
 # ]
 
 # ── Home directory & paths ──────────────────────────────────────────────
-# By default RustFox stores everything under ~/.rustfox:
-#   ~/.rustfox/config.toml, rustfox.db, skills/, agents/, workspace/, artifacts/
-# Override the home root with the RUSTFOX_HOME env var (absolute path) or
+# By default HaosGreen stores everything under ~/.haos-green:
+#   ~/.haos-green/config.toml, haos-green.db, skills/, agents/, workspace/, artifacts/
+# Override the home root with the HAOS_GREEN_HOME env var (absolute path; RUSTFOX_HOME also checked for compatibility) or
 # [general].home (see the [general] section below). Run a second isolated
 # instance with:
-#   RUSTFOX_HOME="$HOME/.rustfox-work" cargo run
+#   HAOS_GREEN_HOME="$HOME/.haos-green-work" cargo run
 
 [sandbox]
 # The LLM's persistent workspace (file/command tools are confined here).
@@ -72,8 +72,8 @@ Be concise and helpful."""
 [memory]
 # Path to the SQLite database file for persistent memory
 # Stores conversations, knowledge base, and vector embeddings
-# Leave unset to use <home>/rustfox.db. Set an absolute path to override.
-# database_path = "/absolute/path/to/rustfox.db"
+# Leave unset to use <home>/haos-green.db. Set an absolute path to override.
+# database_path = "/absolute/path/to/haos-green.db"
 
 # Query rewriting for memory search (optional; default: false)
 # When enabled, ambiguous follow-up questions are rewritten into self-contained
@@ -89,8 +89,8 @@ Be concise and helpful."""
 # directory = "/absolute/path/to/skills"
 
 [general]
-# Home directory root for all RustFox state (optional; overrides ~/.rustfox).
-# Must be an absolute path. The RUSTFOX_HOME env var takes precedence over this.
+# Home directory root for all HaosGreen state (optional; overrides ~/.haos-green).
+# Must be an absolute path. The HAOS_GREEN_HOME env var takes precedence over this.
 # home = "/absolute/path/to/home"
 
 # Your location, injected into the system prompt so the AI knows your timezone/region
@@ -113,7 +113,7 @@ Be concise and helpful."""
 # Get your API key at https://smith.langchain.com → Settings → API Keys
 # [langsmith]
 # api_key = "ls__..."
-# project = "rustfox"   # LangSmith project name (default: "default")
+# project = "haos-green"   # LangSmith project name (default: "default")
 
 # Embedding API for vector search (optional)
 # When configured, enables hybrid vector + FTS5 search for memory.
@@ -139,7 +139,7 @@ Be concise and helpful."""
 # [[mcp_servers]]
 # name = "filesystem"
 # command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/rustfox-sandbox"]
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/haos-green-sandbox"]
 
 # Example: Google Workspace MCP server (Gmail, Calendar, Drive, Docs, Sheets, Slides)
 # Note: use --from because the package name differs from the executable name
@@ -277,7 +277,7 @@ Be concise and helpful."""
 # # fetch it before they authenticate. Skill names/descriptions are listed;
 # # skill instruction bodies are never included.
 # [a2a.card]
-# name = "RustFox"
+# name = "HaosGreen"
 # description = "Self-hosted Telegram AI assistant"
 # version = "1.0.2"
 #
@@ -291,7 +291,7 @@ Be concise and helpful."""
 # # That default deliberately EXCLUDES execute_command, write_file, send_file,
 # # self_upgrade, schedule_task, update_soul_file, read_soul_file, plan_view and
 # # everything else. read_soul_file is excluded because it can read
-# # ~/.rustfox/config.toml, which holds your API key and every peer token.
+# # ~/.haos-green/config.toml, which holds your API key and every peer token.
 # #
 # # tools = ["read_file", "search_memory"]    # Explicit list, used verbatim.
 # # tools = []                                # Grant nothing.
@@ -314,7 +314,7 @@ Be concise and helpful."""
 #
 # ── Outbound A2A Client Peers (optional) ────────────────────────────────────
 #
-# Allows RustFox to call remote A2A agents via the `call_a2a_agent` tool.
+# Allows HaosGreen to call remote A2A agents via the `call_a2a_agent` tool.
 # If no outbound peers are configured, the tool remains unregistered in the
 # agent tool registry.
 #

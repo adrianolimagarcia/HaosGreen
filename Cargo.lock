@@ -1324,6 +1324,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "haos-green"
+version = "1.0.2"
+dependencies = [
+ "a2a-client-lf",
+ "a2a-lf",
+ "a2a-server-lf",
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dirs",
+ "docx-rs",
+ "futures",
+ "futures-util",
+ "include_dir",
+ "infer",
+ "ipnet",
+ "libc",
+ "nix",
+ "pdf-extract",
+ "pulldown-cmark 0.12.2",
+ "rand 0.8.7",
+ "regex",
+ "reqwest 0.12.28",
+ "reqwest 0.13.4",
+ "rmcp",
+ "rusqlite",
+ "rustc-hash",
+ "self_update",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlite-vec",
+ "subtle",
+ "teloxide",
+ "tempfile",
+ "tokio",
+ "tokio-cron-scheduler",
+ "tokio-util",
+ "toml",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3099,55 +3148,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
-]
-
-[[package]]
-name = "rustfox"
-version = "1.0.2"
-dependencies = [
- "a2a-client-lf",
- "a2a-lf",
- "a2a-server-lf",
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "dirs",
- "docx-rs",
- "futures",
- "futures-util",
- "include_dir",
- "infer",
- "ipnet",
- "libc",
- "nix",
- "pdf-extract",
- "pulldown-cmark 0.12.2",
- "rand 0.8.7",
- "regex",
- "reqwest 0.12.28",
- "reqwest 0.13.4",
- "rmcp",
- "rusqlite",
- "rustc-hash",
- "self_update",
- "serde",
- "serde_json",
- "sha2",
- "sqlite-vec",
- "subtle",
- "teloxide",
- "tempfile",
- "tokio",
- "tokio-cron-scheduler",
- "tokio-util",
- "toml",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

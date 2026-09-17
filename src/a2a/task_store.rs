@@ -1,4 +1,4 @@
-//! SQLite-backed [`TaskStore`] over the existing RustFox database.
+//! SQLite-backed [`TaskStore`] over the existing HaosGreen database.
 //!
 //! Mirrors `src/supervisor/store.rs`: a cloneable handle over the shared
 //! connection, with `async fn` methods that lock it.

@@ -88,7 +88,9 @@ pub struct A2aConfig {
     /// a deliberate act.
     pub bind: String,
     /// Externally reachable base URL that peers should use to reach this
-    /// agent, e.g. `https://rustfox.example.com:8443`. It is what the Agent
+    /// Default: `<home>/haos-green.example.com` or similar.
+    /// URL that remote agents will use to contact this agent.
+    /// agent, e.g. `https://haos-green.example.com:8443`. It is what the Agent
     /// Card advertises verbatim in `supportedInterfaces[].url`.
     ///
     /// Required whenever `bind` names an unspecified address (`0.0.0.0`,
@@ -169,7 +171,7 @@ impl A2aConfig {
     }
 
     /// `public_url` is advertised verbatim in the Agent Card, so a value with no
-    /// scheme (e.g. `rustfox.example.com:8443`) would be served as-is and no
+    /// scheme (e.g. `haos-green.example.com:8443`) would be served as-is and no
     /// peer could ever reach it — the same silent-discovery breakage I1 fixes
     /// for the derived URL. Reject it up front rather than ship a dead card.
     fn validate_public_url(&self) -> Result<()> {
@@ -306,7 +308,7 @@ pub struct A2aCardConfig {
 impl Default for A2aCardConfig {
     fn default() -> Self {
         Self {
-            name: "RustFox".to_string(),
+            name: "HaosGreen".to_string(),
             description: "Self-hosted Telegram AI assistant".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -641,7 +643,7 @@ pub struct GeneralConfig {
     /// Optional location string injected into the system prompt (e.g. "Tokyo, Japan")
     #[serde(default)]
     pub location: Option<String>,
-    /// Optional absolute path overriding the default `~/.rustfox` home root.
+    /// Optional absolute path overriding the default `~/.haos-green` home root.
     #[serde(default)]
     pub home: Option<PathBuf>,
 }
@@ -737,10 +739,10 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_system_prompt() -> String {
-    "You are RustFox — an AI assistant with tools, memory, and skills.\n\
+    "You are HaosGreen — an AI assistant with tools, memory, and skills.\n\
      \n\
      ## Identity\n\
-     Your name is RustFox, but your soul (if loaded) overrides any default identity.\n\
+     Your name is HaosGreen, but your soul (if loaded) overrides any default identity.\n\
      Soul takes precedence over everything.\n\
      \n\
      ## Priority Chain\n\
@@ -892,7 +894,7 @@ impl Config {
     /// Resolved home directory (set by `resolve()`). Returns `None` before
     /// `resolve()` has been called or if the home directory could not be
     /// resolved. Used by soul file handlers to scope file access to the
-    /// RustFox home (NOT the sandbox — soul files live in the home parent).
+    /// HaosGreen home (NOT the sandbox — soul files live in the home parent).
     pub fn resolved_home(&self) -> Option<&PathBuf> {
         self.resolved_home.as_ref()
     }
@@ -930,7 +932,9 @@ impl Config {
             ensure_dirs, resolve_data_path, resolve_home, PathOrigin, ResolvedPaths,
         };
 
-        let env_home = std::env::var("RUSTFOX_HOME").ok();
+        let env_home = std::env::var("HAOS_GREEN_HOME")
+            .or_else(|_| std::env::var("RUSTFOX_HOME"))
+            .ok();
         let config_home = self.general.as_ref().and_then(|g| g.home.as_deref());
         let os_home = dirs::home_dir();
         let home = resolve_home(env_home.as_deref(), config_home, os_home.as_deref())?;
@@ -956,7 +960,7 @@ impl Config {
         let database = resolve_one(
             "memory.database_path",
             &self.memory.database_path,
-            "rustfox.db",
+            "haos-green.db",
         );
         let skills = resolve_one("skills.directory", &self.skills.directory, "skills");
         let agents = resolve_one("agents.directory", &self.agents.directory, "agents");
@@ -1083,7 +1087,7 @@ mod tests {
     #[test]
     fn resolved_home_returns_some_after_resolve() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -1099,7 +1103,7 @@ mod tests {
     #[test]
     fn resolve_fills_unset_paths_under_home() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -1108,7 +1112,7 @@ mod tests {
         let warnings = cfg.resolve().unwrap();
         assert_eq!(cfg.resolved_home.as_ref().unwrap(), &home);
         assert_eq!(cfg.sandbox.allowed_directory, home.join("workspace"));
-        assert_eq!(cfg.memory.database_path, home.join("rustfox.db"));
+        assert_eq!(cfg.memory.database_path, home.join("haos-green.db"));
         assert_eq!(cfg.skills.directory, home.join("skills"));
         assert_eq!(cfg.agents.directory, home.join("agents"));
         assert_eq!(cfg.supervisor.artifacts_dir, home.join("artifacts"));
@@ -1118,7 +1122,7 @@ mod tests {
     #[test]
     fn resolve_keeps_absolute_overrides() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -1137,7 +1141,7 @@ mod tests {
     #[test]
     fn resolve_warns_on_relative_override() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -1152,7 +1156,7 @@ mod tests {
     #[test]
     fn load_resolves_paths_to_absolute() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let cfg_path = tmp.path().join("config.toml");
         let toml = format!(
             r#"
@@ -1996,18 +2000,18 @@ api_key = "x"
 
 [a2a]
 enabled = true
-public_url = "https://rustfox.example.com"
+public_url = "https://haos-green.example.com"
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(
             cfg.a2a.public_url.as_deref(),
-            Some("https://rustfox.example.com")
+            Some("https://haos-green.example.com")
         );
     }
 
     #[test]
     fn a2a_validate_accepts_http_and_https_public_urls() {
-        for url in ["http://192.168.1.50:8443", "https://rustfox.example.com"] {
+        for url in ["http://192.168.1.50:8443", "https://haos-green.example.com"] {
             let mut cfg = a2a_cfg();
             cfg.public_url = Some(url.to_string());
             cfg.validate()
@@ -2021,13 +2025,13 @@ public_url = "https://rustfox.example.com"
         // served as-is, so no peer could ever reach this agent -- the same
         // silent-discovery breakage as advertising `0.0.0.0`.
         let mut cfg = a2a_cfg();
-        cfg.public_url = Some("rustfox.example.com:8443".to_string());
+        cfg.public_url = Some("haos-green.example.com:8443".to_string());
         let err = cfg
             .validate()
             .expect_err("a schemeless public_url must be refused")
             .to_string();
         assert!(
-            err.contains("public_url") && err.contains("rustfox.example.com:8443"),
+            err.contains("public_url") && err.contains("haos-green.example.com:8443"),
             "the error must name the key and quote the value: {err}"
         );
     }
@@ -2048,7 +2052,7 @@ public_url = "https://rustfox.example.com"
     fn a2a_validate_trims_a_public_url_before_checking_it() {
         // Surrounding whitespace must not turn a valid URL into a rejection.
         let mut cfg = a2a_cfg();
-        cfg.public_url = Some("  https://rustfox.example.com  ".to_string());
+        cfg.public_url = Some("  https://haos-green.example.com  ".to_string());
         cfg.validate()
             .expect("a padded but valid URL must be accepted");
     }

@@ -1,10 +1,10 @@
-use rustfox::config::RiskThresholdsConfig;
-use rustfox::supervisor::{SubmitOutcome, Supervisor};
+use haos_green::config::RiskThresholdsConfig;
+use haos_green::supervisor::{SubmitOutcome, Supervisor};
 
 #[tokio::test]
 async fn production_supervisor_applies_risk_thresholds_from_config() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let strict_thresholds = RiskThresholdsConfig {
         require_approval_for_medium: true,
         ..Default::default()
@@ -12,7 +12,7 @@ async fn production_supervisor_applies_risk_thresholds_from_config() {
     let sup = Supervisor::new(
         dir.path().into(),
         memory.connection(),
-        rustfox::supervisor::backend::Registry::new(),
+        haos_green::supervisor::backend::Registry::new(),
         strict_thresholds,
     );
 
@@ -30,11 +30,11 @@ async fn production_supervisor_applies_risk_thresholds_from_config() {
 #[tokio::test]
 async fn production_supervisor_default_thresholds_auto_execute_medium() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let sup = Supervisor::new(
         dir.path().into(),
         memory.connection(),
-        rustfox::supervisor::backend::Registry::new(),
+        haos_green::supervisor::backend::Registry::new(),
         RiskThresholdsConfig::default(),
     );
     let outcome = sup

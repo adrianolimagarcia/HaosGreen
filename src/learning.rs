@@ -40,7 +40,7 @@ fn detect_deployment_mode() -> UpgradeMode {
     UpgradeMode::Release
 }
 
-/// Detect if RustFox is running as a systemd/launchd service.
+/// Detect if HaosGreen is running as a systemd/launchd service.
 pub fn is_service_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -48,9 +48,20 @@ pub fn is_service_installed() -> bool {
             h.join(".config")
                 .join("systemd")
                 .join("user")
-                .join("rustfox.service")
+                .join("haos-green.service")
         });
         if let Some(p) = service_path {
+            if p.exists() {
+                return true;
+            }
+        }
+        let legacy_path = dirs::home_dir().map(|h| {
+            h.join(".config")
+                .join("systemd")
+                .join("user")
+                .join("rustfox.service")
+        });
+        if let Some(p) = legacy_path {
             if p.exists() {
                 return true;
             }
@@ -61,9 +72,19 @@ pub fn is_service_installed() -> bool {
         let plist_path = dirs::home_dir().map(|h| {
             h.join("Library")
                 .join("LaunchAgents")
-                .join("com.rustfox.bot.plist")
+                .join("com.haos-green.bot.plist")
         });
         if let Some(p) = plist_path {
+            if p.exists() {
+                return true;
+            }
+        }
+        let legacy_path = dirs::home_dir().map(|h| {
+            h.join("Library")
+                .join("LaunchAgents")
+                .join("com.rustfox.bot.plist")
+        });
+        if let Some(p) = legacy_path {
             if p.exists() {
                 return true;
             }
@@ -72,6 +93,12 @@ pub fn is_service_installed() -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
+        if let Ok(output) = Command::new("sc").args(["query", "HaosGreen"]).output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("STATE") {
+                return true;
+            }
+        }
         if let Ok(output) = Command::new("sc").args(["query", "RustFox"]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.contains("STATE") {
@@ -88,8 +115,16 @@ pub fn restart_bot() -> anyhow::Result<()> {
     if is_service_installed() {
         #[cfg(target_os = "linux")]
         {
+            let svc_name = if dirs::home_dir()
+                .map(|h| h.join(".config/systemd/user/haos-green.service").exists())
+                .unwrap_or(false)
+            {
+                "haos-green.service"
+            } else {
+                "rustfox.service"
+            };
             let status = std::process::Command::new("systemctl")
-                .args(["--user", "restart", "rustfox.service"])
+                .args(["--user", "restart", svc_name])
                 .status()
                 .context("Failed to run systemctl restart")?;
             if !status.success() {
@@ -98,8 +133,19 @@ pub fn restart_bot() -> anyhow::Result<()> {
         }
         #[cfg(target_os = "macos")]
         {
+            let label = if dirs::home_dir()
+                .map(|h| {
+                    h.join("Library/LaunchAgents/com.haos-green.bot.plist")
+                        .exists()
+                })
+                .unwrap_or(false)
+            {
+                "com.haos-green.bot"
+            } else {
+                "com.rustfox.bot"
+            };
             let status = std::process::Command::new("launchctl")
-                .args(["stop", "com.rustfox.bot"])
+                .args(["stop", label])
                 .status()
                 .context("Failed to run launchctl stop")?;
             if !status.success() {
@@ -108,15 +154,25 @@ pub fn restart_bot() -> anyhow::Result<()> {
         }
         #[cfg(target_os = "windows")]
         {
+            let svc = if Command::new("sc")
+                .args(["query", "HaosGreen"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                "HaosGreen"
+            } else {
+                "RustFox"
+            };
             let status = std::process::Command::new("sc")
-                .args(["stop", "RustFox"])
+                .args(["stop", svc])
                 .status()
                 .context("Failed to run sc stop")?;
             if !status.success() {
                 tracing::warn!("sc stop failed with exit: {:?}", status.code());
             }
             let status = std::process::Command::new("sc")
-                .args(["start", "RustFox"])
+                .args(["start", svc])
                 .status()
                 .context("Failed to run sc start")?;
             if !status.success() {
@@ -192,7 +248,7 @@ async fn extract_skill_from_conversation(
     };
 
     let analysis_prompt = format!(
-        "You are a skill-extraction engine for an AI assistant called RustFox.\n\
+        "You are a skill-extraction engine for an AI assistant called HaosGreen.\n\
          \n\
          Analyze the following conversation transcript and decide if it contains a \
          **reusable, multi-step workflow** that should be saved as a new skill.\n\
@@ -432,7 +488,7 @@ tags: [user, preferences, context]
 
 # User Model
 
-<!-- Auto-maintained by RustFox. Updated periodically from conversation history. -->
+<!-- Auto-maintained by HaosGreen. Updated periodically from conversation history. -->
 
 user_name: ~
 language: [en]
@@ -669,7 +725,7 @@ pub async fn self_upgrade(
             if !status_output.trim().is_empty() {
                 let stash_result = run_git_command(
                     &project_root,
-                    &["stash", "push", "-m", "rustfox-auto-stash-before-update"],
+                    &["stash", "push", "-m", "haos-green-auto-stash-before-update"],
                 )
                 .await?;
                 log.push_str(&format!("  ⚠ Stashed: {}\n", stash_result.trim()));
@@ -728,8 +784,8 @@ pub async fn self_upgrade(
             let update_result = tokio::task::spawn_blocking(|| {
                 self_update::backends::github::Update::configure()
                     .repo_owner("chinkan")
-                    .repo_name("RustFox")
-                    .bin_name("rustfox")
+                    .repo_name("haos-green")
+                    .bin_name("haos-green")
                     .show_download_progress(false)
                     .current_version(self_update::cargo_crate_version!())
                     .build()
@@ -765,7 +821,7 @@ pub async fn self_upgrade(
             .args(["--service", "install"])
             .output()
             .await
-            .context("Failed to run rustfox --service install")?;
+            .context("Failed to run haos-green --service install")?;
         if !service_output.status.success() {
             let combined = format!(
                 "{}{}",
@@ -773,7 +829,7 @@ pub async fn self_upgrade(
                 String::from_utf8_lossy(&service_output.stderr)
             );
             anyhow::bail!(
-                "rustfox --service install failed (exit {:?}): {}",
+                "haos-green --service install failed (exit {:?}): {}",
                 service_output.status.code(),
                 combined.trim()
             );

@@ -179,7 +179,7 @@ pub async fn notify_startup(
     };
 
     let msg = format!(
-        "RustFox is online 🦊\nModel: {model}\nMCP: {mcp} server(s) connected\nSkills: {skills} loaded\nMemory: {memory}",
+        "HaosGreen is online 🌿\nModel: {model}\nMCP: {mcp} server(s) connected\nSkills: {skills} loaded\nMemory: {memory}",
         model = model, mcp = mcp_count, skills = skills_count, memory = memory_status,
     );
 
@@ -197,7 +197,7 @@ pub async fn notify_startup(
 /// Send shutdown notification to all allowed users.
 /// Best-effort: logs failures, never blocks shutdown.
 pub async fn notify_shutdown(bot: &teloxide::Bot, allowed_user_ids: &[u64]) {
-    let msg = "RustFox is going offline. Goodbye!";
+    let msg = "HaosGreen is going offline. Goodbye!";
 
     for &user_id in allowed_user_ids {
         let chat_id = teloxide::types::ChatId(user_id as i64);
@@ -684,7 +684,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
         .to_string();
 
     // Temp dir for file downloads — created lazily by download_telegram_file
-    let temp_dir = std::env::temp_dir().join(format!("rustfox_{}", uuid::Uuid::new_v4()));
+    let temp_dir = std::env::temp_dir().join(format!("haos_green_{}", uuid::Uuid::new_v4()));
 
     let mut attachments: Vec<Attachment> = Vec::new();
 

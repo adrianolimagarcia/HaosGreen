@@ -1,11 +1,11 @@
-use rustfox::supervisor::Supervisor;
+use haos_green::supervisor::Supervisor;
 
 #[tokio::test]
 async fn rigorous_code_task_creates_workspace_before_execute() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
 
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test_with_repo(
         dir.path().into(),
         dir.path().into(),

@@ -605,8 +605,8 @@ mod tests {
 
     #[test]
     fn test_link_converts_to_text_link_entity() {
-        let (text, entities) = markdown_to_entities("[RustFox](https://github.com)");
-        assert_eq!(text, "RustFox");
+        let (text, entities) = markdown_to_entities("[HaosGreen](https://github.com)");
+        assert_eq!(text, "HaosGreen");
         assert_eq!(entities.len(), 1);
         assert_eq!(entity_kind_name(&entities[0]), "text_link");
         if let teloxide::types::MessageEntityKind::TextLink { url } = &entities[0].kind {

@@ -1,15 +1,16 @@
 [Unit]
-Description=RustFox Telegram AI Assistant
+Description=HaosGreen Telegram AI Assistant
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={{RUSTFOX_BIN}} --config {{RUSTFOX_CONFIG}}
+ExecStart={{HAOS_GREEN_BIN}} --config {{HAOS_GREEN_CONFIG}}
 Restart=always
 RestartSec=5
+Environment=HAOS_GREEN_HOME={{HAOS_GREEN_HOME}}
 Environment=RUSTFOX_HOME={{RUSTFOX_HOME}}
-Environment=PATH={{RUSTFOX_PATH}}
+Environment=PATH={{HAOS_GREEN_PATH}}
 
 [Install]
 WantedBy=default.target

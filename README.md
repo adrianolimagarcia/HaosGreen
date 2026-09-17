@@ -1,21 +1,21 @@
 <p align="center">
-  <img src="assets/logo.jpeg" alt="RustFox Logo" width="200"/>
+  <img src="assets/logo.jpeg" alt="HaosGreen Logo" width="200"/>
 </p>
 
-# RustFox — Telegram AI Assistant
+# HaosGreen — Telegram AI Assistant
 
 [![CI](https://github.com/chinkan/RustFox/actions/workflows/ci.yml/badge.svg)](https://github.com/chinkan/RustFox/actions)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-%E2%98%95-yellow)](https://buymeacoffee.com/chinkan.ai)
 [![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/chinkan)
 
-**What is RustFox?**
+**What is HaosGreen?**
 
-An open-source, self-hosted Telegram AI assistant written in Rust. It solves a simple problem: most AI assistants are locked inside proprietary chat UIs with no access to your files, tools, or schedule. RustFox lives in Telegram — your everyday messaging app — and acts as a full agentic AI teammate.
+An open-source, self-hosted Telegram AI assistant written in Rust. It solves a simple problem: most AI assistants are locked inside proprietary chat UIs with no access to your files, tools, or schedule. HaosGreen lives in Telegram — your everyday messaging app — and acts as a full agentic AI teammate.
 
-**Why RustFox?**
+**Why HaosGreen?**
 
-Drop a file, ask a question, schedule a task — RustFox handles it. Powered by OpenRouter LLM (Kimi K2.6), it runs an agentic loop: receive your message, call sandboxed tools (file I/O, command execution, web search via MCP), and loop until done. It remembers context via SQLite + vector RAG, runs skills and sub-agents, and even verifies its own work.
+Drop a file, ask a question, schedule a task — HaosGreen handles it. Powered by OpenRouter LLM (Kimi K2.6), it runs an agentic loop: receive your message, call sandboxed tools (file I/O, command execution, web search via MCP), and loop until done. It remembers context via SQLite + vector RAG, runs skills and sub-agents, and even verifies its own work.
 
 **Self-hosted, no cloud dependency.** Single binary. Setup wizard. Runs as systemd/launchd service. `cargo install` and you're running in 2 minutes.
 
@@ -81,7 +81,7 @@ See [docs/roadmap/multi-session.md](docs/roadmap/multi-session.md) for detailed 
 Download from the [Releases page](https://github.com/chinkan/RustFox/releases):
 
 ```bash
-tar xzf rustfox-*.tar.gz
+tar xzf haos-green-*.tar.gz
 ```
 
 **Option B — Build from source**
@@ -94,10 +94,10 @@ cargo install --path . --locked
 
 ```bash
 # Browser wizard
-./rustfox --setup
+./haos-green --setup
 
 # Or terminal wizard
-./rustfox --setup --cli
+./haos-green --setup --cli
 ```
 
 The wizard guides you through: Telegram bot token, allowed user IDs, OpenRouter API key, model, and optional MCP tools.
@@ -105,16 +105,16 @@ The wizard guides you through: Telegram bot token, allowed user IDs, OpenRouter 
 ### 3. Run
 
 ```bash
-rustfox
+haos-green
 # or with a custom config:
-rustfox --config /path/to/config.toml
+haos-green --config /path/to/config.toml
 ```
 
 ### 4. (Optional) Background service
 
 ```bash
-rustfox --service install   # Linux (systemd), macOS (launchd), or Windows
-rustfox --service status
+haos-green --service install   # Linux (systemd), macOS (launchd), or Windows
+haos-green --service status
 ```
 
 ---
@@ -155,7 +155,7 @@ rustfox --service status
 
 ## Architecture
 
-RustFox runs an agentic loop: user message → LLM (OpenRouter) → tool calls → execute → loop until final response. Tools dispatch to built-in functions, MCP servers, or skill/agent directories.
+HaosGreen runs an agentic loop: user message → LLM (OpenRouter) → tool calls → execute → loop until final response. Tools dispatch to built-in functions, MCP servers, or skill/agent directories.
 
 → Full architecture with source tree and data flow: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 

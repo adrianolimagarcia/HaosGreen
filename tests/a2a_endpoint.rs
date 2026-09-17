@@ -6,10 +6,10 @@ use a2a::event::{StreamResponse, TaskStatusUpdateEvent};
 use a2a::types::{Task, TaskState, TaskStatus};
 use a2a_server::{AgentExecutor, ExecutorContext};
 use futures::stream::BoxStream;
-use rustfox::a2a::server::{build_state, router, spawn};
-use rustfox::a2a::NoopExecutor;
-use rustfox::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
-use rustfox::skills::SkillRegistry;
+use haos_green::a2a::server::{build_state, router, spawn};
+use haos_green::a2a::NoopExecutor;
+use haos_green::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
+use haos_green::skills::SkillRegistry;
 use std::collections::HashMap;
 
 struct StreamingExecutor;
@@ -66,7 +66,7 @@ fn config() -> A2aConfig {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
         card: A2aCardConfig {
-            name: "RustFox".to_string(),
+            name: "HaosGreen".to_string(),
             description: "test".to_string(),
             version: "1.0.2".to_string(),
         },
@@ -195,7 +195,7 @@ async fn agent_card_is_public() {
     );
 
     let card: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(card["name"], "RustFox");
+    assert_eq!(card["name"], "HaosGreen");
     assert!(card["supportedInterfaces"].is_array());
     assert!(card["securitySchemes"]["bearer"].is_object());
     handle.abort();
@@ -320,7 +320,7 @@ async fn card_advertises_the_real_port_for_an_ephemeral_bind() {
 #[tokio::test]
 async fn public_url_overrides_the_advertised_url() {
     let mut cfg = config();
-    cfg.public_url = Some("https://rustfox.example.com:8443".to_string());
+    cfg.public_url = Some("https://haos-green.example.com:8443".to_string());
     let addr = spawn(
         cfg,
         SkillRegistry::new(),
@@ -339,6 +339,6 @@ async fn public_url_overrides_the_advertised_url() {
             .unwrap();
     assert_eq!(
         card["supportedInterfaces"][0]["url"],
-        "https://rustfox.example.com:8443"
+        "https://haos-green.example.com:8443"
     );
 }

@@ -2,7 +2,7 @@
 //!
 //! Tiers 1-2 (sync, 0 LLM cost):
 //!   Tier 1: observation_mask — replace old tool results with placeholder,
-//!           neutralize old [RustFox compacted:...] markers
+//!           neutralize old [HaosGreen compacted:...] / [RustFox compacted:...] markers
 //!   Tier 2: collapse_context — remove oldest tool groups entirely,
 //!           insert boundary marker
 //!
@@ -109,8 +109,10 @@ const PROMPT_HARD_CAP_BYTES: usize = 100_000;
 /// Minimum message count to consider Tier 3 compact.
 const COMPACT_MIN_MESSAGE_COUNT: usize = 15;
 
-/// Keep for backward compat — `is_compacted_regurgitation` references this.
-pub const COMPACTION_MARKER_PREFIX: &str = "[RustFox compacted:";
+/// Main marker prefix for HaosGreen.
+pub const COMPACTION_MARKER_PREFIX: &str = "[HaosGreen compacted:";
+/// Old marker prefix kept for backward compatibility.
+pub const LEGACY_COMPACTION_MARKER_PREFIX: &str = "[RustFox compacted:";
 
 /// Statistics about prompt preparation and compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +350,16 @@ pub fn observation_mask(messages: &[ChatMessage], context_window: usize) -> Vec<
                                 .function
                                 .arguments
                                 .replace(COMPACTION_MARKER_PREFIX, "[compacted");
+                        }
+                        if call
+                            .function
+                            .arguments
+                            .contains(LEGACY_COMPACTION_MARKER_PREFIX)
+                        {
+                            call.function.arguments = call
+                                .function
+                                .arguments
+                                .replace(LEGACY_COMPACTION_MARKER_PREFIX, "[compacted");
                         }
                     }
                 }

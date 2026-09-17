@@ -1,9 +1,9 @@
-use rustfox::supervisor::{SubmitOutcome, Supervisor};
+use haos_green::supervisor::{SubmitOutcome, Supervisor};
 
 #[tokio::test]
 async fn submit_persists_task_and_writes_artifacts() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
     let sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
 
     let outcome = sup

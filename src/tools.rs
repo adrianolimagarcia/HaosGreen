@@ -40,7 +40,7 @@ pub fn validate_sandbox_path(sandbox_dir: &Path, requested: &str) -> Result<Path
     Ok(check_path)
 }
 
-/// Validates that a path is within the RustFox home directory.
+/// Validates that a path is within the HaosGreen home directory.
 /// Returns the canonicalized path if valid.
 pub fn validate_home_path(home_dir: &Path, requested: &str) -> Result<PathBuf> {
     let home_canonical = home_dir
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn test_validate_home_path_allows_home_files() {
         let dir = tempdir().unwrap();
-        let home = dir.path().join(".rustfox");
+        let home = dir.path().join(".haos-green");
         std::fs::create_dir_all(&home).unwrap();
         let soul = home.join("SOUL.md");
         std::fs::write(&soul, "# Soul").unwrap();
@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn test_validate_home_path_denies_outside() {
         let dir = tempdir().unwrap();
-        let home = dir.path().join(".rustfox");
+        let home = dir.path().join(".haos-green");
         std::fs::create_dir_all(&home).unwrap();
         let outside = dir.path().join("outside.txt");
         std::fs::write(&outside, "data").unwrap();

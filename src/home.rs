@@ -9,7 +9,7 @@ version: 1
 # Soul
 
 ## Who I Am
-I'm RustFox, a Telegram AI assistant. I use tools to help the user.
+I'm HaosGreen, a Telegram AI assistant. I use tools to help the user.
 
 ## My Values
 - Be genuinely helpful, not performatively helpful
@@ -50,7 +50,7 @@ pub fn resolve_home(
         if p.is_absolute() {
             return Ok(p.to_path_buf());
         }
-        tracing::warn!("RUSTFOX_HOME='{env}' is not absolute; ignoring it");
+        tracing::warn!("HAOS_GREEN_HOME/RUSTFOX_HOME='{env}' is not absolute; ignoring it");
     }
     if let Some(cfg) = config_home {
         if cfg.is_absolute() {
@@ -62,13 +62,19 @@ pub fn resolve_home(
         );
     }
     let home = os_home.ok_or_else(|| {
-        anyhow!("Could not determine the OS home directory; set RUSTFOX_HOME or [general].home")
+        anyhow!("Could not determine the OS home directory; set HAOS_GREEN_HOME or [general].home")
     })?;
-    Ok(home.join(".rustfox"))
+    let new_home = home.join(".haos-green");
+    let legacy_home = home.join(".rustfox");
+    if !new_home.exists() && legacy_home.exists() {
+        Ok(legacy_home)
+    } else {
+        Ok(new_home)
+    }
 }
 
 /// The home root used purely for *config-file discovery*, before the config is
-/// loaded. Uses only `RUSTFOX_HOME` (if absolute) or `<os_home>/.rustfox`.
+/// loaded. Uses only `HAOS_GREEN_HOME` / `RUSTFOX_HOME` (if absolute) or `<os_home>/.haos-green` (or `<os_home>/.rustfox`).
 pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<PathBuf> {
     if let Some(env) = env_home {
         let p = Path::new(env);
@@ -76,7 +82,15 @@ pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<Pa
             return Some(p.to_path_buf());
         }
     }
-    os_home.map(|h| h.join(".rustfox"))
+    os_home.map(|h| {
+        let new_home = h.join(".haos-green");
+        let legacy_home = h.join(".rustfox");
+        if !new_home.exists() && legacy_home.exists() {
+            legacy_home
+        } else {
+            new_home
+        }
+    })
 }
 
 /// Resolve the config file path to use at startup.
@@ -85,8 +99,8 @@ pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<Pa
 /// 1. `env_config_path` if `Some`, used verbatim (no existence check — the
 ///    caller decides what to do with a missing file).
 /// 2. `<cwd>/config.toml` if it exists.
-/// 3. `<home>/config.toml` where `home` comes from `RUSTFOX_HOME` (absolute)
-///    or `<os_home>/.rustfox`. Only returned if the candidate file exists.
+/// 3. `<home>/config.toml` where `home` comes from `HAOS_GREEN_HOME` / `RUSTFOX_HOME` (absolute)
+///    or `<os_home>/.haos-green` (falling back to `<os_home>/.rustfox`). Only returned if the candidate file exists.
 /// 4. Falls back to `<cwd>/config.toml` (the wizard treats a non-existent
 ///    candidate as "no config found" and writes the first-run config there).
 ///
@@ -261,13 +275,22 @@ mod tests {
             Some(Path::new("/os/home")),
         )
         .unwrap();
-        assert_eq!(got, PathBuf::from("/os/home/.rustfox"));
+        assert_eq!(got, PathBuf::from("/os/home/.haos-green"));
     }
 
     #[test]
-    fn default_is_os_home_dot_rustfox() {
+    fn default_is_os_home_dot_haos_green() {
         let got = resolve_home(None, None, Some(Path::new("/os/home"))).unwrap();
-        assert_eq!(got, PathBuf::from("/os/home/.rustfox"));
+        assert_eq!(got, PathBuf::from("/os/home/.haos-green"));
+    }
+
+    #[test]
+    fn default_falls_back_to_legacy_rustfox_if_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy_home = tmp.path().join(".rustfox");
+        std::fs::create_dir_all(&legacy_home).unwrap();
+        let got = resolve_home(None, None, Some(tmp.path())).unwrap();
+        assert_eq!(got, legacy_home);
     }
 
     #[test]
@@ -284,52 +307,52 @@ mod tests {
         );
         assert_eq!(
             default_home(None, Some(Path::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.rustfox"))
+            Some(PathBuf::from("/home/u/.haos-green"))
         );
         assert_eq!(
             default_home(Some("rel"), Some(Path::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.rustfox"))
+            Some(PathBuf::from("/home/u/.haos-green"))
         );
     }
 
     #[test]
     fn unset_path_resolves_under_home() {
         let (path, origin) =
-            resolve_data_path(Path::new(""), Path::new("/h/.rustfox"), "rustfox.db");
-        assert_eq!(path, PathBuf::from("/h/.rustfox/rustfox.db"));
+            resolve_data_path(Path::new(""), Path::new("/h/.haos-green"), "haos-green.db");
+        assert_eq!(path, PathBuf::from("/h/.haos-green/haos-green.db"));
         assert_eq!(origin, PathOrigin::Default);
     }
 
     #[test]
     fn absolute_path_used_verbatim() {
         let (path, origin) = resolve_data_path(
-            Path::new("/data/rustfox.db"),
-            Path::new("/h/.rustfox"),
-            "rustfox.db",
+            Path::new("/data/haos-green.db"),
+            Path::new("/h/.haos-green"),
+            "haos-green.db",
         );
-        assert_eq!(path, PathBuf::from("/data/rustfox.db"));
+        assert_eq!(path, PathBuf::from("/data/haos-green.db"));
         assert_eq!(origin, PathOrigin::Absolute);
     }
 
     #[test]
     fn relative_path_is_legacy() {
         let (path, origin) = resolve_data_path(
-            Path::new("rustfox.db"),
-            Path::new("/h/.rustfox"),
-            "rustfox.db",
+            Path::new("haos-green.db"),
+            Path::new("/h/.haos-green"),
+            "haos-green.db",
         );
-        assert_eq!(path, PathBuf::from("rustfox.db"));
+        assert_eq!(path, PathBuf::from("haos-green.db"));
         assert_eq!(origin, PathOrigin::RelativeLegacy);
     }
 
     #[test]
     fn ensure_dirs_creates_full_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let paths = ResolvedPaths {
             home: home.clone(),
             workspace: home.join("workspace"),
-            database: home.join("rustfox.db"),
+            database: home.join("haos-green.db"),
             skills: home.join("skills"),
             agents: home.join("agents"),
             artifacts: home.join("artifacts"),
@@ -355,13 +378,13 @@ mod tests {
     fn warning_render_includes_paths_and_commands() {
         let w = LegacyPathWarning {
             label: "memory.database_path".to_string(),
-            current: PathBuf::from("/work/rustfox.db"),
-            home_default: PathBuf::from("/h/.rustfox/rustfox.db"),
+            current: PathBuf::from("/work/haos-green.db"),
+            home_default: PathBuf::from("/h/.haos-green/haos-green.db"),
         };
         let s = w.render();
         assert!(s.contains("memory.database_path"));
-        assert!(s.contains("/work/rustfox.db"));
-        assert!(s.contains("/h/.rustfox/rustfox.db"));
+        assert!(s.contains("/work/haos-green.db"));
+        assert!(s.contains("/h/.haos-green/haos-green.db"));
         assert!(s.contains("cp -rT"));
     }
     // ── resolve_config_path tests ───────────────────────────────────
@@ -371,11 +394,11 @@ mod tests {
         // env var wins regardless of whether the file exists — the caller
         // decides what to do with a missing path.
         let got = resolve_config_path(
-            Some("/etc/rustfox/override.toml"),
+            Some("/etc/haos-green/override.toml"),
             Path::new("/work"),
             Some(Path::new("/home/u")),
         );
-        assert_eq!(got, PathBuf::from("/etc/rustfox/override.toml"));
+        assert_eq!(got, PathBuf::from("/etc/haos-green/override.toml"));
     }
 
     #[test]
@@ -398,7 +421,7 @@ mod tests {
         std::fs::write(&cwd_config, b"[telegram]\nbot_token = \"x\"\n").unwrap();
 
         // Set up a "home" candidate that must be ignored in this scenario.
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(
             home.join("config.toml"),
@@ -414,7 +437,7 @@ mod tests {
     fn resolve_config_path_falls_back_to_home_when_cwd_missing() {
         // CWD has no config.toml; <home>/config.toml exists → use it.
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         std::fs::create_dir_all(&home).unwrap();
         let home_config = home.join("config.toml");
         std::fs::write(&home_config, b"[telegram]\nbot_token = \"home\"\n").unwrap();
@@ -436,7 +459,7 @@ mod tests {
         let cwd = tmp.path().join("empty-cwd");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        // Home is provided but its .rustfox dir doesn't exist on disk.
+        // Home is provided but its .haos-green dir doesn't exist on disk.
         let got = resolve_config_path(None, &cwd, Some(tmp.path()));
         assert_eq!(got, cwd.join("config.toml"));
     }

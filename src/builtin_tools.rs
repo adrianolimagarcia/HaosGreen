@@ -29,7 +29,7 @@ pub const SOUL_FILE_NAMES: [&str; 3] = ["SOUL.md", "AGENTS.md", "USER.md"];
 /// The allowlist alone is sufficient — none of the three names contains a path
 /// separator, so `home.join(name)` cannot escape `home` — but the check is
 /// exact-match rather than a traversal heuristic on purpose: `config.toml`,
-/// `rustfox.db`, `skills-lock.json` and `user_model.md` live in the same
+/// `haos-green.db`, `skills-lock.json` and `user_model.md` live in the same
 /// directory as the soul files and must stay unreadable through this tool.
 fn validate_soul_file_name(file_name: &str) -> anyhow::Result<()> {
     if !SOUL_FILE_NAMES.contains(&file_name) {

@@ -383,20 +383,20 @@ mod tests {
     #[test]
     fn public_url_overrides_the_derived_url() {
         let mut cfg = test_config();
-        cfg.public_url = Some("https://rustfox.example.com:8443".to_string());
+        cfg.public_url = Some("https://haos-green.example.com:8443".to_string());
         assert_eq!(
             resolve_endpoint_url(&cfg, bound("0.0.0.0:54321")),
-            "https://rustfox.example.com:8443"
+            "https://haos-green.example.com:8443"
         );
     }
 
     #[test]
     fn public_url_is_trimmed() {
         let mut cfg = test_config();
-        cfg.public_url = Some("  https://rustfox.example.com  ".to_string());
+        cfg.public_url = Some("  https://haos-green.example.com  ".to_string());
         assert_eq!(
             resolve_endpoint_url(&cfg, bound("127.0.0.1:54321")),
-            "https://rustfox.example.com"
+            "https://haos-green.example.com"
         );
     }
 

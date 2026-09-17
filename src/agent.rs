@@ -793,7 +793,7 @@ impl Agent {
 
         self.langsmith.start_run(crate::langsmith::RunParams {
             id: chain_run_id.clone(),
-            name: "rustfox_request".to_string(),
+            name: "haos_green_request".to_string(),
             run_type: crate::langsmith::RunType::Chain,
             parent_run_id: None,
             inputs: serde_json::json!({ "message": incoming.text }),
@@ -1839,21 +1839,25 @@ const REGURGITATION_ERROR_MSG: &str = "Error: Your tool call arguments are in co
 /// tool call arguments.  This happens when the model learns the marker from a
 /// compacted history entry and outputs it verbatim instead of real JSON.
 ///
-/// Handles two formats:
-/// - Old (backward compat): JSON object with `_rustfox_compacted_arguments: true`
-/// - New: plain-text that starts with `COMPACTION_MARKER_PREFIX`
+/// Handles three formats:
+/// - Old (backward compat): JSON object with `_rustfox_compacted_arguments: true` or `_haos_green_compacted_arguments: true`
+/// - Legacy text: plain-text starting with `[RustFox compacted:`
+/// - Current text: plain-text starting with `COMPACTION_MARKER_PREFIX` (`[HaosGreen compacted:`)
 #[allow(dead_code)]
 fn is_compacted_regurgitation(raw: &str, parsed: &serde_json::Value) -> bool {
     // Old JSON format — lookup the marker key in the parsed object.
     if parsed
-        .get("_rustfox_compacted_arguments")
+        .get("_haos_green_compacted_arguments")
+        .or_else(|| parsed.get("_rustfox_compacted_arguments"))
         .and_then(|v| v.as_bool())
         == Some(true)
     {
         return true;
     }
-    // New plain-text format — the raw string itself starts with the marker.
-    if raw.starts_with(crate::agent_prompt::COMPACTION_MARKER_PREFIX) {
+    // Plain-text format — check both current and legacy marker prefixes.
+    if raw.starts_with(crate::agent_prompt::COMPACTION_MARKER_PREFIX)
+        || raw.starts_with(crate::agent_prompt::LEGACY_COMPACTION_MARKER_PREFIX)
+    {
         return true;
     }
     false
@@ -2114,21 +2118,31 @@ mod tests {
 
     #[test]
     fn test_is_compacted_regurgitation_new_plain_text_format_detected() {
-        let raw = "[RustFox compacted: previous invoke_subagent call with 1200 bytes of arguments]";
+        let raw =
+            "[HaosGreen compacted: previous invoke_subagent call with 1200 bytes of arguments]";
         let parsed: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
         assert!(is_compacted_regurgitation(raw, &parsed));
+
+        let legacy_raw =
+            "[RustFox compacted: previous invoke_subagent call with 1200 bytes of arguments]";
+        let legacy_parsed: serde_json::Value = serde_json::from_str(legacy_raw).unwrap_or_default();
+        assert!(is_compacted_regurgitation(legacy_raw, &legacy_parsed));
     }
 
     #[test]
     fn test_is_compacted_regurgitation_old_json_format_detected() {
-        let raw = r#"{"_rustfox_compacted_arguments": true, "tool_name": "invoke_subagent", "original_char_count": 1200, "preview": "{\"skill\": \"test\"}"}"#;
+        let raw = r#"{"_haos_green_compacted_arguments": true, "tool_name": "invoke_subagent", "original_char_count": 1200, "preview": "{\"skill\": \"test\"}"}"#;
         let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(is_compacted_regurgitation(raw, &parsed));
+
+        let legacy_raw = r#"{"_rustfox_compacted_arguments": true, "tool_name": "invoke_subagent", "original_char_count": 1200, "preview": "{\"skill\": \"test\"}"}"#;
+        let legacy_parsed: serde_json::Value = serde_json::from_str(legacy_raw).unwrap();
+        assert!(is_compacted_regurgitation(legacy_raw, &legacy_parsed));
     }
 
     #[test]
     fn test_is_compacted_regurgitation_old_json_false_not_detected() {
-        let raw = r#"{"_rustfox_compacted_arguments": false, "tool_name": "invoke_subagent"}"#;
+        let raw = r#"{"_haos_green_compacted_arguments": false, "tool_name": "invoke_subagent"}"#;
         let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(!is_compacted_regurgitation(raw, &parsed));
     }

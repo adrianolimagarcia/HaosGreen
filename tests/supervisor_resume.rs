@@ -1,9 +1,9 @@
-use rustfox::supervisor::Supervisor;
+use haos_green::supervisor::Supervisor;
 
 #[tokio::test]
 async fn supervisor_restores_paused_tasks_on_startup() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
 
     let task_id = {
         let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
@@ -26,10 +26,10 @@ async fn supervisor_restores_paused_tasks_on_startup() {
 #[tokio::test]
 async fn supervisor_resume_runs_task_to_completion() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos_green::memory::MemoryStore::open_in_memory().unwrap();
 
     let mut sup =
-        rustfox::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection());
+        haos_green::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("resumed:{p}")) });
 
     let outcome = sup
@@ -43,5 +43,5 @@ async fn supervisor_resume_runs_task_to_completion() {
     assert!(report.contains("resumed:"));
 
     let final_state = sup.state(&id).await.unwrap();
-    assert_eq!(final_state, rustfox::supervisor::task::TaskStatus::Done);
+    assert_eq!(final_state, haos_green::supervisor::task::TaskStatus::Done);
 }

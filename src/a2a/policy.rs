@@ -5,7 +5,7 @@ use tracing::warn;
 
 /// Tools granted to a peer that declares no `tools` key.
 ///
-/// This is an **allowlist**, deliberately. A tool added to RustFox in future is
+/// This is an **allowlist**, deliberately. A tool added to HaosGreen in future is
 /// not reachable by any peer until it is added here. A denylist would silently
 /// grant every new tool to every peer, which is the failure mode this list
 /// exists to prevent.
@@ -23,7 +23,7 @@ use tracing::warn;
 /// - `search_memory` searches the **entire** conversation database — every
 ///   user, every chat — not a peer-scoped subset.
 /// - `recall` reads the global `knowledge` table with no per-peer scoping.
-/// - `remember` **writes** to the `knowledge` table in `rustfox.db`. This is
+/// - `remember` **writes** to the `knowledge` table in `haos-green.db`. This is
 ///   the one mutating entry here; it is granted because it is memory-scoped
 ///   and cannot reach the filesystem, but it is a write.
 ///
@@ -38,7 +38,7 @@ use tracing::warn;
 /// The exclusion is kept as defence in depth, because both remain the most
 /// powerful read primitives in the set:
 ///
-/// - `read_soul_file` reads from the RustFox **home**, not the sandbox. Its
+/// - `read_soul_file` reads from the HaosGreen **home**, not the sandbox. Its
 ///   containment rests on a hand-written allowlist plus an `O_NOFOLLOW` open,
 ///   and anything that regresses either one re-exposes `config.toml` — which
 ///   holds the OpenRouter API key and every A2A peer bearer token.
@@ -178,7 +178,7 @@ mod tests {
             "invoke_agent",
             "call_a2a_agent",
             // Both of these can read outside the sandbox: read_soul_file
-            // reaches the RustFox home (config.toml holds the API key and the
+            // reaches the HaosGreen home (config.toml holds the API key and the
             // peer tokens) and accepts an unvalidated file name; plan_view
             // joins an unvalidated title onto the plans directory, and an
             // absolute title discards the prefix.
@@ -304,14 +304,14 @@ mod tests {
         let agents: Arc<RwLock<SkillRegistry>> = Arc::new(RwLock::new(SkillRegistry::new()));
 
         let builtin = BuiltinTools::new(
-            PathBuf::from("/tmp/rustfox-test/skills"),
+            PathBuf::from("/tmp/haos-green-test/skills"),
             Arc::clone(&skills),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
         let skill_tools = SkillTools::new(
-            PathBuf::from("/tmp/rustfox-test/skills"),
-            PathBuf::from("/tmp/rustfox-test/agents"),
+            PathBuf::from("/tmp/haos-green-test/skills"),
+            PathBuf::from("/tmp/haos-green-test/agents"),
             Arc::clone(&skills),
             agents,
         );

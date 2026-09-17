@@ -36,7 +36,7 @@ pub fn parse_args() -> Option<Command> {
                     "start" => service::Action::Start,
                     "stop" => service::Action::Stop,
                     _ => {
-                        eprintln!("Usage: rustfox --service <install|remove|status|start|stop>");
+                        eprintln!("Usage: haos-green --service <install|remove|status|start|stop>");
                         std::process::exit(1);
                     }
                 };
@@ -53,6 +53,7 @@ pub fn parse_args() -> Option<Command> {
     }
 
     if let Some(path) = config_path {
+        std::env::set_var("HAOS_GREEN_CONFIG_PATH", &path);
         std::env::set_var("RUSTFOX_CONFIG_PATH", path);
     }
 

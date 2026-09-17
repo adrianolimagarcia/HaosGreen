@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustfox::config::ProviderType;
-use rustfox::conversation::{CompactionContext, ConversationManager};
-use rustfox::llm::{ChatMessage, LlmClient, MessageContent};
-use rustfox::memory::MemoryStore;
-use rustfox::provider::{OpenRouterProvider, ProviderConfig, ProviderRegistry};
+use haos_green::config::ProviderType;
+use haos_green::conversation::{CompactionContext, ConversationManager};
+use haos_green::llm::{ChatMessage, LlmClient, MessageContent};
+use haos_green::memory::MemoryStore;
+use haos_green::provider::{OpenRouterProvider, ProviderConfig, ProviderRegistry};
 
 fn failing_llm() -> LlmClient {
     let config = ProviderConfig {
@@ -26,7 +26,8 @@ fn failing_llm() -> LlmClient {
         context_window_cache: Arc::new(tokio::sync::RwLock::new(None)),
         parse_retry_limit: 0,
     };
-    let provider: Arc<dyn rustfox::provider::Provider> = Arc::new(OpenRouterProvider::new(config));
+    let provider: Arc<dyn haos_green::provider::Provider> =
+        Arc::new(OpenRouterProvider::new(config));
     let mut providers = HashMap::new();
     providers.insert("test".to_string(), provider);
     LlmClient::new(Arc::new(ProviderRegistry::new(
@@ -61,10 +62,10 @@ async fn compaction_never_loses_user_request() {
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: None,
-            tool_calls: Some(vec![rustfox::llm::ToolCall {
+            tool_calls: Some(vec![haos_green::llm::ToolCall {
                 id: format!("call_{i}"),
                 call_type: "function".to_string(),
-                function: rustfox::llm::FunctionCall {
+                function: haos_green::llm::FunctionCall {
                     name: "search".to_string(),
                     arguments: format!(r#"{{"q":"{}"}}"#, "y".repeat(120)),
                 },
@@ -91,7 +92,7 @@ async fn compaction_never_loses_user_request() {
         "telegram",
         "intent_u1",
         "system prompt".to_string(),
-        &rustfox::skills::SkillRegistry::new(),
+        &haos_green::skills::SkillRegistry::new(),
         &minimal_config(),
     )
     .await
@@ -100,7 +101,7 @@ async fn compaction_never_loses_user_request() {
     let original_len = cmgr.messages().len();
 
     let llm = failing_llm();
-    let window = rustfox::agent_prompt::estimate_tokens(cmgr.messages());
+    let window = haos_green::agent_prompt::estimate_tokens(cmgr.messages());
     let ctx = CompactionContext {
         llm: &llm,
         context_window: window,
@@ -134,7 +135,7 @@ async fn compaction_never_loses_user_request() {
     );
 }
 
-fn minimal_config() -> rustfox::config::Config {
+fn minimal_config() -> haos_green::config::Config {
     // keep(): the temp dir must outlive the loaded config file.
     let dir = tempfile::tempdir().unwrap().keep();
     let path = dir.join("config.toml");
@@ -153,5 +154,5 @@ allowed_directory = "."
 "#,
     )
     .unwrap();
-    rustfox::config::Config::load(&path).unwrap()
+    haos_green::config::Config::load(&path).unwrap()
 }
