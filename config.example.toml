@@ -324,3 +324,20 @@ Be concise and helpful."""
 # timeout_secs = 30                           # HTTP request timeout in seconds (default: 30)
 # poll_interval_ms = 250                      # Polling interval in ms when awaiting async tasks (default: 250)
 # poll_timeout_secs = 60                      # Maximum duration to wait for task completion (default: 60)
+
+# ── Web Dashboard (optional) ────────────────────────────────────────────────
+#
+# An embedded dashboard with chat, supervisor, log, and A2A views.
+#
+# SECURITY: an authenticated dashboard user runs the same agent as the Telegram
+# operator, including shell execution. It ships DISABLED, binds to loopback,
+# and starts with the password `admin`/`admin`. Change the password in the
+# dashboard Settings page before exposing the port to anything.
+#
+# [web]
+# enabled = false
+# bind = "127.0.0.1:8787"
+# public_url = ""            # e.g. "https://haos.example.com"; enables Secure cookies
+# session_ttl_hours = 12
+# allow_ips = []             # empty = any source IP; non-empty = strict allowlist
+#                            # entries may be single IPs or CIDR ranges

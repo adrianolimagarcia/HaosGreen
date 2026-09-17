@@ -35,6 +35,8 @@ pub struct Config {
     pub subagents: SubagentsConfig,
     #[serde(default)]
     pub a2a: A2aConfig,
+    #[serde(default)]
+    pub web: WebConfig,
     /// Explicit provider sections (multi-provider mode). Optional —
     /// when empty, `build_providers()` synthesizes a single OpenRouter
     /// provider from the legacy `[openrouter]` section.
@@ -294,6 +296,87 @@ impl A2aConfig {
                 );
             }
         }
+    }
+}
+
+/// Web dashboard configuration.
+///
+/// Secrets (the password hash and the bearer token) live in
+/// `<home>/web-auth.toml`, never here, because `config.toml` is the file
+/// users copy, share, and paste into issues.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Off by default: a dashboard that can run shell commands must never
+    /// appear because a config file omitted a key.
+    pub enabled: bool,
+    pub bind: String,
+    /// Externally reachable URL. When it is https, session cookies get the
+    /// `Secure` flag. Unset means "derive from the bound address".
+    pub public_url: Option<String>,
+    pub session_ttl_hours: u64,
+    /// Empty means any source IP may attempt login. Non-empty is a strict
+    /// allowlist, enforced before authentication.
+    pub allow_ips: Vec<String>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8787".to_string(),
+            public_url: None,
+            session_ttl_hours: 12,
+            allow_ips: Vec::new(),
+        }
+    }
+}
+
+impl WebConfig {
+    /// Validate the `[web]` block.
+    ///
+    /// Callers must not start the listener when this returns `Err`, but must
+    /// keep running the Telegram bot: a dashboard misconfiguration is not a
+    /// reason to lose the bot. Every condition here also fails closed at
+    /// request time; the point of checking up front is that the failure is
+    /// *loud* and happens once at startup instead of silently per request.
+    ///
+    /// A non-loopback `bind` is deliberately not rejected — the design allows
+    /// raising it — but `spawn()` warns about it.
+    pub fn validate(&self) -> Result<()> {
+        use std::net::ToSocketAddrs;
+
+        if self.bind.trim().parse::<SocketAddr>().is_err() && self.bind.to_socket_addrs().is_err() {
+            bail!("web.bind '{0}' is not a valid address", self.bind.trim());
+        }
+
+        if self.session_ttl_hours == 0 {
+            bail!("web.session_ttl_hours must be at least 1");
+        }
+
+        if let Some(url) = self
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            let lower = url.to_ascii_lowercase();
+            if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+                bail!("web.public_url '{url}' must start with http:// or https://");
+            }
+        }
+
+        for entry in &self.allow_ips {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                bail!("web.allow_ips contains an empty entry");
+            }
+            if trimmed.parse::<IpNet>().is_err() && trimmed.parse::<IpAddr>().is_err() {
+                bail!("web.allow_ips entry '{trimmed}' is not an IP address or CIDR range");
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2055,5 +2138,96 @@ public_url = "https://haos-green.example.com"
         cfg.public_url = Some("  https://haos-green.example.com  ".to_string());
         cfg.validate()
             .expect("a padded but valid URL must be accepted");
+    }
+
+    // ── [web] dashboard configuration ───────────────────────────────────────
+
+    #[test]
+    fn web_disabled_by_default() {
+        // The example config is what users copy. If it ever ships `[web]`
+        // uncommented or enabled, a dashboard with shell access appears
+        // without the operator asking for it.
+        let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert!(!cfg.web.enabled);
+    }
+
+    #[test]
+    fn web_binds_localhost_by_default() {
+        assert_eq!(WebConfig::default().bind, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn web_session_ttl_defaults_to_twelve_hours() {
+        assert_eq!(WebConfig::default().session_ttl_hours, 12);
+    }
+
+    #[test]
+    fn web_allow_ips_defaults_to_empty() {
+        assert!(WebConfig::default().allow_ips.is_empty());
+    }
+
+    #[test]
+    fn web_validate_accepts_a_well_formed_config() {
+        let cfg = WebConfig {
+            enabled: true,
+            bind: "127.0.0.1:8787".into(),
+            public_url: Some("https://haos.example.com".into()),
+            session_ttl_hours: 12,
+            allow_ips: vec!["10.0.0.0/8".into(), "192.168.1.5".into()],
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn web_validate_rejects_an_unparseable_bind() {
+        let cfg = WebConfig {
+            bind: "not-an-address".into(),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("bind"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn web_validate_rejects_zero_session_ttl() {
+        // A zero TTL would mint sessions that never authenticate, or — with a
+        // different comparison — never expire. Refuse it at startup instead.
+        let cfg = WebConfig {
+            session_ttl_hours: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn web_validate_rejects_a_public_url_without_a_scheme() {
+        // `public_url` decides the `Secure` cookie flag. A schemeless value
+        // would silently mean "plain http" for a URL the operator believes is
+        // https, so it is rejected rather than guessed at.
+        let cfg = WebConfig {
+            public_url: Some("haos.example.com".into()),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("public_url"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn web_validate_rejects_an_unparseable_allow_ip_entry() {
+        let cfg = WebConfig {
+            allow_ips: vec!["999.1.1.1".into()],
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("allow_ips"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn web_validate_treats_a_blank_public_url_as_unset() {
+        let cfg = WebConfig {
+            public_url: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

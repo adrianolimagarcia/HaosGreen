@@ -80,6 +80,9 @@ base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"
 
+# Argon2id password hashing for the web dashboard
+argon2 = "0.5"
+
 # Secret-redaction filter
 regex = "1"
 
