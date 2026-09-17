@@ -6,6 +6,59 @@ use tokio::sync::Mutex;
 use crate::supervisor::job::{Job, JobStatus, JobType};
 use crate::supervisor::task::{ExecutionMode, RiskLevel, Task, TaskStatus, TaskType};
 
+/// Hard upper bound on how many tasks [`TaskStore::list_recent`] will ever
+/// return, whatever the caller asks for.
+pub const MAX_RECENT_TASKS: usize = 20;
+
+/// Columns of `sup_tasks` that [`Task`] is reconstructed from. Shared by every
+/// read path so a new query cannot silently drift from the row mapping.
+const TASK_COLUMNS: &str = concat!(
+    "id,title,user_request,task_type,priority,risk_level,execution_mode,state,",
+    "required_capabilities"
+);
+
+/// Maps one `sup_tasks` row selected with [`TASK_COLUMNS`] into a [`Task`].
+///
+/// `constraints`, `inputs` and `expected_outputs` are intentionally `Null`:
+/// they are written on insert but never read back (M3 lossy reconstruction).
+fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        user_request: r.get(2)?,
+        task_type: serde_json::from_str::<TaskType>(&r.get::<_, String>(3)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        priority: r.get(4)?,
+        risk_level: serde_json::from_str::<RiskLevel>(&r.get::<_, String>(5)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        execution_mode: serde_json::from_str::<ExecutionMode>(&r.get::<_, String>(6)?).map_err(
+            |e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            },
+        )?,
+        status: serde_json::from_str::<TaskStatus>(&r.get::<_, String>(7)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        required_capabilities: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(8)?)
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        constraints: serde_json::Value::Null,
+        inputs: serde_json::Value::Null,
+        expected_outputs: serde_json::Value::Null,
+    })
+}
+
 #[derive(Clone)]
 pub struct TaskStore {
     conn: Arc<Mutex<Connection>>,
@@ -65,69 +118,35 @@ impl TaskStore {
 
     pub async fn get(&self, id: &str) -> Result<Option<Task>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id,title,user_request,task_type,priority,risk_level,execution_mode,state,
-                    required_capabilities
-             FROM sup_tasks WHERE id=?1",
-        )?;
-        let mut rows = stmt.query_map([id], |r| {
-            Ok(Task {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                user_request: r.get(2)?,
-                task_type: serde_json::from_str::<TaskType>(&r.get::<_, String>(3)?).map_err(
-                    |e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    },
-                )?,
-                priority: r.get(4)?,
-                risk_level: serde_json::from_str::<RiskLevel>(&r.get::<_, String>(5)?).map_err(
-                    |e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    },
-                )?,
-                execution_mode: serde_json::from_str::<ExecutionMode>(&r.get::<_, String>(6)?)
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
-                status: serde_json::from_str::<TaskStatus>(&r.get::<_, String>(7)?).map_err(
-                    |e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            7,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    },
-                )?,
-                required_capabilities: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(8)?)
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            8,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
-                constraints: serde_json::Value::Null,
-                inputs: serde_json::Value::Null,
-                expected_outputs: serde_json::Value::Null,
-            })
-        })?;
+        let mut stmt =
+            conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM sup_tasks WHERE id=?1"))?;
+        let mut rows = stmt.query_map([id], row_to_task)?;
         Ok(match rows.next() {
             Some(Ok(t)) => Some(t),
             _ => None,
         })
+    }
+
+    /// Newest-first task listing for the dashboard.
+    ///
+    /// The limit is clamped to [`MAX_RECENT_TASKS`] rather than trusted, so no
+    /// caller can turn the dashboard into a way to page the entire task history
+    /// into memory. A limit of `0` is clamped up to `1` for the same reason
+    /// (`LIMIT 0` would be a silently useless answer).
+    ///
+    /// `created_at` is `TEXT NOT NULL DEFAULT (datetime('now'))` with
+    /// one-second resolution, so tasks created in the same second tie and the
+    /// order would be non-deterministic. `rowid` breaks the tie and keeps
+    /// paging and display order stable.
+    pub async fn list_recent(&self, limit: usize) -> Result<Vec<Task>> {
+        let limit = limit.clamp(1, MAX_RECENT_TASKS);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM sup_tasks ORDER BY created_at DESC, rowid DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit as i64], row_to_task)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub async fn update_classification(&self, t: &Task) -> Result<()> {
@@ -406,6 +425,82 @@ mod tests {
         let jobs = store.jobs_for_task(&task.id).await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, job.id);
+    }
+
+    #[tokio::test]
+    async fn list_recent_returns_tasks_newest_first() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let a = Task::new("first", "req a");
+        let b = Task::new("second", "req b");
+        let c = Task::new("third", "req c");
+        for t in [&a, &b, &c] {
+            store.create(t, "telegram", "u1", None).await.unwrap();
+        }
+        let rows = store.list_recent(20).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec![c.id.as_str(), b.id.as_str(), a.id.as_str()]);
+    }
+
+    /// `created_at` has one-second resolution, so tasks created in the same
+    /// second tie. Forcing the tie here (rather than hoping the three inserts
+    /// straddle a second boundary) is what makes this test deterministic.
+    #[tokio::test]
+    async fn list_recent_breaks_same_second_ties_by_rowid() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let a = Task::new("first", "req a");
+        let b = Task::new("second", "req b");
+        let c = Task::new("third", "req c");
+        for t in [&a, &b, &c] {
+            store.create(t, "telegram", "u1", None).await.unwrap();
+        }
+        {
+            let conn = memory.connection();
+            let conn = conn.lock().await;
+            conn.execute("UPDATE sup_tasks SET created_at='2026-01-01 00:00:00'", [])
+                .unwrap();
+        }
+        let rows = store.list_recent(20).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec![c.id.as_str(), b.id.as_str(), a.id.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn list_recent_clamps_an_oversized_limit_to_twenty() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        for i in 0..25 {
+            let t = Task::new(&format!("t{i}"), "req");
+            store.create(&t, "telegram", "u1", None).await.unwrap();
+        }
+        let rows = store.list_recent(1000).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            MAX_RECENT_TASKS,
+            "the dashboard must never ask for more than 20"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_recent_clamps_a_zero_limit_to_one() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        for i in 0..3 {
+            let t = Task::new(&format!("t{i}"), "req");
+            store.create(&t, "telegram", "u1", None).await.unwrap();
+        }
+        // A limit of 0 must not be passed through to SQLite as `LIMIT 0`
+        // (which would return nothing) nor widened to the full history.
+        let rows = store.list_recent(0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_recent_on_an_empty_store_is_empty_not_an_error() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.list_recent(20).await.unwrap().is_empty());
     }
 
     #[tokio::test]
