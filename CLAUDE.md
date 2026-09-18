@@ -49,6 +49,36 @@ home default. Run isolated instances with `HAOS_GREEN_HOME=...`. See
 Bundled skills/agents are seed-copied on first run; `/update-skills` re-syncs
 them using `<home>/skills-lock.json`.
 
+### Shutdown
+
+One `tokio::sync::broadcast::<()>` (capacity 1, shared as `Arc`) is the single
+shutdown signal. The A2A listener (`start_listener_with_shutdown`), the web
+dashboard (`spawn_with_shutdown`) and the Telegram platform each hold a
+`subscribe()`. A listener that fails to start is logged and never fatal to the
+others, so a bad A2A bind cannot stop the bot.
+
+The trigger is SIGINT or SIGTERM, or the Telegram dispatcher returning on its
+own. On a signal the order is deliberate: abort the dispatch handle and wait up
+to **1 s** for it, broadcast shutdown, send the Telegram "shutting down"
+notification under a **1 s** bound, sleep **2 s** so it can be delivered, then
+log `Shutdown complete.` — so no detached work outlives the broadcast and the
+notification still has a window. When the dispatcher returns by itself the
+broadcast and notification happen *before* its error is propagated, so the
+process never exits leaving the listeners running.
+
+Two semantics are load-bearing:
+
+- **A dropped sender is not a shutdown.** `wait_for_shutdown` maps
+  `broadcast::error::RecvError::Closed` to `pending` and keeps looping, so a
+  vanished sender cannot silently stop a listener; only an actual `()` does.
+  `Lagged` continues too — the payload is `()` and carries no state.
+- **Active SSE streams must end.** The chat and log SSE handlers select on the
+  same broadcast, so a graceful shutdown terminates them instead of hanging on a
+  client that is holding the connection open.
+
+The broadcast is idempotent: it may be sent on both paths, and a receiver that
+already saw it stays stopped rather than treating a second send as a restart.
+
 ## Architecture
 
 The crate is both a library (`src/lib.rs`) and a binary (`src/main.rs`).
@@ -253,6 +283,22 @@ integration files in `tests/`). When adding tests:
   `RUSTFOX_A2A_LIVE=1` respectively, so plain `cargo test` passes with both
   unset — which is how CI runs it.
 
+> **Mutation testing: never share `target/` between the repo and a scratch copy.**
+> Cargo does **not** key build artifacts by source directory — the unit hash
+> depends on the target's relative path, not the package directory — so a
+> scratch tree that builds with `CARGO_TARGET_DIR=<this repo>/target` writes
+> artifacts with the *same filenames* as this repo's, and cargo will then happily
+> run a **mutant binary** for a plain `cargo test` here. The target-dir lock only
+> serializes writers; it does not isolate projects. This actually happened: a
+> mutation script running with `cwd=/tmp/rfmut` and this repo's target dir made
+> the lease concurrency test fail with `left: 2` — the mutant's signature, not a
+> real defect — which cost a full root-cause investigation. Two rules follow:
+> mutate only in a copy with its **own** `CARGO_TARGET_DIR`, and after any
+> mutation round rebuild here (`cargo clean -p haos-green`) before trusting a
+> result. A failure whose signature exactly matches a mutant you just ran is a
+> stale artifact until proven otherwise; a failure that does **not** reproduce on
+> a freshly built binary is not a flake to be re-run away.
+
 ## Common Tasks
 
 ### Adding a new built-in tool
@@ -339,7 +385,8 @@ Optional and **disabled by default**. When `[a2a].enabled = true`, `main.rs` sta
 
 ### Configuration
 - Server config lives in `[a2a]`, `[a2a.card]` and `[a2a.peers.<name>]`.
-- Outbound client peers are configured under `[a2a.outbound.peers.<name>]` with keys `url`, `token`, `timeout_secs`, `poll_interval_ms`, and `poll_timeout_secs`. See `config.example.toml`.
+- Outbound client peers are configured under `[a2a.outbound.peers.<name>]` with keys `url`, `token`, `timeout_secs`, `send_timeout_secs`, `poll_interval_ms`, and `poll_timeout_secs`. See `config.example.toml`.
+- `send_timeout_secs` bounds a **complete synchronous `SendMessage`**, and is validated to `1..=300` at load; omitted, it falls back to `timeout_secs`. The HTTP transport timeout is set to `max(send_timeout_secs, timeout_secs) + 1`, so the typed `A2aTimeoutError::SendMessage` always wins the race and a transport error can never mask it. Only `SendMessage` is bounded this way — `GetTask` polling keeps its own `poll_timeout_secs`.
 
 `A2aConfig::validate()` runs at startup and refuses to start the listener on duplicate tokens, an empty token, an empty `ip` list, an unparseable IP/CIDR, or any request for TLS (not implemented — rejected rather than silently served as plaintext). A listener failure never prevents the Telegram bot from starting.
 
@@ -653,10 +700,28 @@ fields to tighten the gate.
 | `/approve <id>`     | Approve a task that hit `RequireApproval` |
 | `/clarify <id> <text>` | Reply to a `Clarify` prompt |
 
-The command **parser** is wired and emits a startup log line in `main.rs`;
-routing user commands into supervisor handlers in the live Telegram dispatcher
-is a minimum-viable integration (M3.8 / M7.3) and the full handler surface is
-a follow-up task.
+The six commands are routed by `dispatch_supervisor_command` in
+`src/platform/telegram.rs`, reachable only from users in
+`telegram.allowed_user_ids` — checked by the dispatcher's filter **and** again
+as the first statement of the handler, before any argument parsing, store read
+or send, so an unauthorized user gets no action, no data and no reply.
+
+Argument handling is bounded and fails closed: a missing argument answers with
+a usage line, a malformed task id is refused rather than echoed (ids are
+UUID-shaped and at most `MAX_TASK_ID_CHARS`), and task text is capped at
+`MAX_TASK_TEXT_CHARS` (2000). Every reply is redacted and passed through
+`bounded_reply` before it is sent.
+
+`/supervise` deliberately does **not** run the pipeline — it creates and routes
+the task, exactly like `POST /api/supervisor/tasks`, which leaves it parked in
+`Route` or `Clarify`. Running it there would be a second execution path beside
+`/approve` and `/resume`, and would block the bot's message handler for the
+length of a plan. The reply therefore names the command that moves the task on:
+`/approve <id>`, or `/clarify <id> <text>` for a clarification prompt.
+
+`/clarify` calls `Supervisor::clarify`, which takes `Clarify -> Execute` only
+for a task actually in `Clarify` (stricter than the state table, mirroring
+`resume`) and then delegates to the existing `execute_now`.
 
 ### Artifacts
 
@@ -677,8 +742,55 @@ and `result` (Reporter Markdown summary).
 | `sup_jobs`        | One row per job dispatched within a task — backend, goal, prompt, status, result_summary, error, optional `parent_job_id` for spawned subjobs |
 | `sup_transitions` | Append-only audit log of every state change (`from_state`, `to_state`, `actor`, `reason`, `occurred_at`) |
 | `sup_artifacts`   | Index of files written under `artifacts_dir` (`task_id`, `job_id`, `kind`, `path`, `sha256`, `bytes`) |
+| `sup_execution_leases` | One row per running task — `owner_id`, `expires_at`, `renewed_at`. The cross-process execution fence; see below |
 
-All four tables are created idempotently in `MemoryStore` at startup.
+All five tables are created idempotently in `MemoryStore` at startup.
+
+### Cross-process execution lease
+
+`Supervisor`'s in-flight guard (`InFlight`) only covers one process, so two
+supervisors over the same database — a restart racing a still-running instance,
+or two hosts on one home — could execute the same task at once. `execute_now`
+therefore takes a row in `sup_execution_leases` before it does anything else.
+
+- **Acquire** is one conditional statement:
+  `INSERT ... ON CONFLICT(task_id) DO UPDATE ... WHERE expires_at <= ?now`,
+  so it is atomic without an explicit transaction. `changed == 1` is the only
+  success. The plan's `OR owner_id = ?owner` term is deliberately **omitted**: a
+  second claim by the same owner is a second run of the same task, which is
+  exactly what the lease exists to refuse.
+- **Renew** is owner-checked and refuses an expired row
+  (`expires_at > ?now`), so a lapsed lease is never resurrected — it must be
+  taken over by a fresh claim. **Release** deletes only a row this owner holds.
+- The owner id is minted **per run** (`new_lease_owner_id()`), not per
+  `Supervisor`, so a detached release from a cancelled run cannot free a later
+  run's lease.
+- A heartbeat renews every 60 s against a 300 s TTL, with bounded backoff
+  (worst case ~20.7 s, well inside the TTL). It owns the **only**
+  `watch::Sender`, so a heartbeat that returns, is aborted or **panics** all
+  read as a lost lease.
+- Losing the lease aborts the in-progress pipeline: the `execute_now` future is
+  dropped, which drops the backends' subprocesses. `SupervisorError::LeaseLost`
+  maps to **409** through `lifecycle_failure_status`; its message is
+  cause-neutral, because a store outage produces the same variant as a takeover.
+
+Known bounds — documented, not hidden:
+
+- takeover is noticed at the next heartbeat, so up to ~60–80 s of two-owner
+  overlap is possible;
+- committed side effects (job rows, artifacts, workspace branches, sent LLM/MCP
+  calls) are **not** rolled back;
+- `kill_on_drop` kills only the **direct** child — a backgrounded grandchild of
+  a compound `sh -c` can survive, and an in-flight MCP tool call is abandoned
+  rather than stopped (`McpBackend` has no timeout or cancellation);
+- a stale row from a crashed process makes its task unresumable for up to
+  `LEASE_TTL_SECS` (300 s); there is no liveness probe or operator override;
+- the TTL is wall-clock, so a backward clock step larger than the TTL can expire
+  a live lease early;
+- the heartbeat is an ordinary task, so all-worker starvation stops renewals and
+  the row lapses with no signal;
+- the lease table is write-only from the app's point of view — no UI or route
+  shows who holds a lease or when it expires.
 
 ## Agent skills
 

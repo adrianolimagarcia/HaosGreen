@@ -36,6 +36,7 @@ Star the repo ⭐, fork to contribute, or open an issue for feedback.
 | 🧬 **Skills & Agents** | Folder-based skill instructions auto-loaded at startup; subagent skills with own model and tool whitelist |
 | 🤝 **Agent Layer** | Isolated agentic mini-loops in `agents/` with own model/tools; `invoke_agent`, `spawn_agents`, zero-trust verifier |
 | 🔄 **Task Scheduling** | Cron and one-shot task scheduler with SQLite persistence |
+| 🧭 **Supervisor** | Autonomous task runner: classify → plan → execute → verify, driven from Telegram (`/supervise`, `/tasks`, `/approve`, `/clarify`) or the dashboard |
 | 🖥️ **Web Dashboard** | Optional embedded dashboard (off by default): chat with the same agent, supervisor tasks, live logs, A2A peers, settings |
 | 📦 **Self-Hosting** | Single binary, 2-min setup wizard, background service (systemd/launchd/Windows Service) |
 
@@ -158,6 +159,43 @@ bearer token, and the invariants that must not be weakened — see
 [CLAUDE.md → Web Dashboard](CLAUDE.md#web-dashboard).
 
 → Full configuration reference: [docs/GUIDE.md](docs/GUIDE.md#configuration)
+
+### Supervisor (optional)
+
+The supervisor runs tasks on its own: it classifies a free-form request, picks a
+plan, dispatches the work to backends (reasoning, shell, MCP, Claude Code, Codex,
+scripts), verifies the result, and keeps an audit trail in SQLite. Drive it from
+Telegram — only users in `telegram.allowed_user_ids` get an answer:
+
+| Command | What it does |
+|---------|--------------|
+| `/supervise <text>` | Create a task. It is **not** started — the reply names the command that runs it |
+| `/tasks` | List recent tasks with their state |
+| `/approve <id>` | Approve a task waiting for approval, and run it |
+| `/clarify <id> <text>` | Answer a clarification prompt, and run it |
+| `/resume <id>` | Resume a paused task |
+| `/cancel <id>` | Cancel a task |
+
+`/supervise` deliberately stops at `Route`/`Clarify` rather than executing, so a
+long plan never blocks the bot; `/approve` and `/clarify` are what start it.
+
+```toml
+[supervisor]
+default_autonomy_mode = "standard"   # "fast" | "standard" | "rigorous"
+artifacts_dir         = "supervisor/artifacts"
+
+[supervisor.risk]
+auto_execute_only_low = true         # escalate anything above Low to approval
+```
+
+A running task holds a **lease** row in `haos-green.db`, so two HaosGreen
+processes sharing one home cannot execute the same task at once. The lease
+expires after 300 s and is renewed every 60 s while the task runs; if a process
+dies, its task becomes runnable again once the lease lapses. Takeover is noticed
+at the next heartbeat, so a brief overlap is possible, and side effects already
+committed are not rolled back — see
+[CLAUDE.md → Cross-process execution lease](CLAUDE.md#cross-process-execution-lease)
+for the exact bounds.
 
 ---
 
