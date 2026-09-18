@@ -348,10 +348,11 @@ fn check_bwrap_version_at_within(
 /// in Task 8; the fields are what the argv is built from, and the shipped
 /// default is the empty set (spec §4).
 ///
-/// `Serialize`/`Deserialize` are here because `Task` and `Job` both carry a
-/// declaration and both are serde types (`src/supervisor/task.rs:56`,
-/// `src/supervisor/job.rs:52`); the field is `#[serde(default)]` so a stored
-/// task without one reads back as "declares nothing".
+/// `Serialize`/`Deserialize` are here because the declaration is carried by
+/// `Task` and `Job`, which are serde types (`src/supervisor/task.rs`,
+/// `src/supervisor/job.rs`). Neither carries one yet — Task 8 adds them, and
+/// they are `#[serde(default)]` there so a stored task written before that reads
+/// back as "declares nothing" rather than failing to load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grants {
     /// Host paths the job may mount read-write. Absolute, canonicalised.
@@ -396,6 +397,13 @@ pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String>
         "--disable-userns".into(),
         // --disable-userns *asks*; this *verifies*, and fails the run if the
         // restriction did not take effect on this kernel.
+        //
+        // The probe cannot detect this flag's removal while `--disable-userns`
+        // remains: with that flag present the observable behaviour is identical,
+        // because this one verifies rather than acts, so a mutation removing only
+        // this line survives the whole suite. It is here for the failure mode
+        // where `--disable-userns` silently does *not* take effect. Do not delete
+        // it on the strength of a green probe.
         "--assert-userns-disabled".into(),
         // Detach the controlling terminal, or TIOCSTI lets the job inject
         // input into the operator's terminal.
@@ -485,8 +493,11 @@ pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String>
 ///
 /// A hang detector, not a performance assertion — the same reasoning as
 /// `supervisor::bounded`. The probe runs at startup, so one wedged step would
-/// hold the process before it ever serves a message; the longest legitimate
-/// step is the network check, which carries curl's own `--max-time 3`.
+/// hold the process before it ever serves a message. Both curl steps carry their
+/// own `--connect-timeout 2 --max-time 3` (see [`HTTPS_SCRIPT`] and
+/// [`loopback_script`]), so this bound is only ever reached by a wedge, never by
+/// a slow network — a blackholed connection must be reported as a network
+/// condition, not as a sandbox failure.
 pub const PROBE_STEP_TIMEOUT_SECS: u64 = 10;
 
 /// The canary the probe sets in its **own** environment. The sandbox must not
@@ -587,52 +598,11 @@ pub async fn probe_at(
         "the base properties",
     )
     .await?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let field = |k: &str| {
-        stdout
-            .lines()
-            .find_map(|l| l.strip_prefix(&format!("{k}=")))
-            .map(str::to_string)
-    };
-    let expect = |k: &str, want: &str, what: &str| -> Result<(), IsolationUnavailable> {
-        match field(k).as_deref() {
-            Some(v) if v == want => Ok(()),
-            other => Err(smoke(what, format!("expected {k}={want}, got {other:?}"))),
-        }
-    };
-
-    let home = job_dir.to_string_lossy().to_string();
-    expect("shell", "ok", "the shell starts")?;
-    expect("home", &home, "$HOME is the job directory")?;
-    expect("path", "/usr/bin:/bin", "$PATH is the set value")?;
-    // NOT `$HOME`/`$PATH`: `--setenv` sets exactly those two, so measured, a
-    // probe asserting them passes with `--clearenv` removed. The canary is what
-    // has teeth.
-    expect(
-        "canary",
-        "unset",
-        "the inherited canary is absent (--clearenv ran)",
+    verdict_base(
+        &out,
+        &job_dir.to_string_lossy(),
+        Path::new(SMOKE_CA_BUNDLE).exists(),
     )?;
-    expect(
-        "pwd",
-        &home,
-        "the cwd is the job directory (--chdir took effect)",
-    )?;
-    expect("hostname", "haos-sandbox", "the hostname is haos-sandbox")?;
-    expect("passwd", "unreadable", "/etc/passwd is unreadable")?;
-    expect("shadow", "absent", "/etc/shadow is absent")?;
-    // Guarded by the same rule the argv uses to decide what to bind
-    // (`push_ro_bind_if_present`): a certificate path the host does not have is
-    // skipped, never demanded. On Debian/Ubuntu the second path is absent; on
-    // Fedora both are, and the base set as specified has no CA store at all.
-    if Path::new(SMOKE_CA_BUNDLE).exists() {
-        expect(
-            "cabundle",
-            "readable",
-            "the CA bundle is readable inside the sandbox",
-        )?;
-    }
-    expect("writable", "yes", "the job directory is writable")?;
 
     // `--disable-userns` asks; with `--assert-userns-disabled` this is what
     // proves the restriction took effect on this kernel.
@@ -640,17 +610,12 @@ pub async fn probe_at(
         bwrap,
         &job_dir,
         grants,
-        "unshare --user true 2>/dev/null && echo nested=allowed || echo nested=blocked",
+        NESTED_SCRIPT,
         probe_cwd,
-        "nested user namespaces are blocked",
+        STEP_NESTED,
     )
     .await?;
-    if !String::from_utf8_lossy(&out.stdout).contains("nested=blocked") {
-        return Err(smoke(
-            "nested user namespaces are blocked",
-            "`unshare --user` succeeded inside the sandbox",
-        ));
-    }
+    verdict_nested(&out)?;
 
     // This is the check the two certificate binds exist for. curl is in `/usr`,
     // which the base set binds; if it is not there the probe **fails**, naming
@@ -668,28 +633,9 @@ pub async fn probe_at(
     // therefore checked network-free by the `cabundle` field above, and
     // end-to-end here only when there is a network to reach.
     if grants.network {
-        let out = run_in_sandbox(
-            bwrap,
-            &job_dir,
-            grants,
-            "curl -fsS -o /dev/null -w 'http=%{http_code}' https://example.com",
-            probe_cwd,
-            "HTTPS works",
-        )
-        .await?;
-        let body = String::from_utf8_lossy(&out.stdout);
-        if !body.contains("http=2") {
-            return Err(smoke(
-                "HTTPS works",
-                format!(
-                    "curl exited {:?} with {body:?} / {:?}; a `(77) error adding trust anchors` \
-                     means the /etc/ssl/certs and /etc/ca-certificates binds are missing or \
-                     unresolvable",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            ));
-        }
+        let out =
+            run_in_sandbox(bwrap, &job_dir, grants, HTTPS_SCRIPT, probe_cwd, STEP_HTTPS).await?;
+        verdict_https(&out)?;
     }
 
     // The network, asserted against the grant set **actually in force**, so both
@@ -707,36 +653,248 @@ pub async fn probe_at(
         bwrap,
         &job_dir,
         grants,
-        &format!(
-            "curl -sS --connect-timeout 2 --max-time 3 -o /dev/null \
-             http://127.0.0.1:{port}/ ; echo exit=$?"
-        ),
+        &loopback_script(port),
         probe_cwd,
-        "the host network is reachable only under a grant",
+        STEP_LOOPBACK,
     )
     .await?;
-    let reachable = !String::from_utf8_lossy(&out.stdout).contains("exit=7");
-    match (grants.network, reachable) {
-        (true, false) => {
-            return Err(smoke(
-                "the host network is reachable under a grant",
-                "the network grant is held but 127.0.0.1 is unreachable: --share-net did not \
-                 take effect",
-            ))
-        }
-        (false, true) => {
-            return Err(smoke(
-                "the host network is unreachable without a grant",
-                "no network grant is held but 127.0.0.1 is reachable",
-            ))
-        }
-        _ => {}
-    }
+    let verdict = verdict_loopback(&out, grants);
     // The listener is still open here on purpose — dropping it would close the
     // port and make the "reachable" case fail. The `drop` is explicit so the
     // intent survives a later reordering of this function.
     drop(listener);
+    verdict
+}
+
+/// The step names, shared by the invocation and the verdict, so the two cannot
+/// drift: a spawn failure, a timeout and a failed assertion must name the same
+/// property.
+const STEP_NESTED: &str = "nested user namespaces are blocked";
+const STEP_HTTPS: &str = "HTTPS works";
+const STEP_LOOPBACK: &str = "the host network is reachable only under a grant";
+
+/// The nested-user-namespace check, as one command.
+const NESTED_SCRIPT: &str =
+    "unshare --user true 2>/dev/null && echo nested=allowed || echo nested=blocked";
+
+/// The HTTPS check, as one command.
+///
+/// `--connect-timeout` and `--max-time` are load-bearing: without them a
+/// blackholed connection to `example.com` runs until the probe's own step
+/// timeout, and is then reported as a sandbox failure rather than as the network
+/// condition it is.
+const HTTPS_SCRIPT: &str =
+    "curl -fsS --connect-timeout 2 --max-time 3 -o /dev/null -w 'http=%{http_code}' \
+     https://example.com";
+
+/// The loopback check, as one command.
+///
+/// `command -v curl` is not decoration. The `echo exit=$?` runs whatever `curl`
+/// does, so on a host without `/usr/bin/curl` the transcript reads `exit=127` —
+/// a code the verdict must not read as "reachable" (see [`loopback_reachable`]).
+/// Proving curl is there lets the verdict name a missing binary instead of
+/// guessing from a number.
+fn loopback_script(port: u16) -> String {
+    format!(
+        "if command -v curl >/dev/null 2>&1; then \
+         curl -sS --connect-timeout 2 --max-time 3 -o /dev/null http://127.0.0.1:{port}/ ; \
+         echo exit=$?; else echo curl=missing; fi"
+    )
+}
+
+/// What bubblewrap said, when it said it somewhere other than stdout.
+///
+/// bubblewrap reports a failed setup on **stderr** and exits non-zero with
+/// nothing on stdout — `bwrap: Can't find source path ...`, and the single most
+/// common failure on a fresh host, `bwrap: No permissions to creating new
+/// namespace`. An assertion that reads only stdout reports `expected shell=ok,
+/// got None` and throws away the one line that names the cause. Empty when the
+/// invocation succeeded and said nothing, so a genuine assertion mismatch is not
+/// padded with noise.
+fn bwrap_cause(out: &std::process::Output) -> String {
+    if out.status.success() && out.stderr.iter().all(u8::is_ascii_whitespace) {
+        return String::new();
+    }
+    format!(
+        "; bubblewrap {} and said {}",
+        describe_status(out.status),
+        describe_output(&out.stderr)
+    )
+}
+
+/// The verdict on the base-properties transcript.
+///
+/// Split out of [`probe_at`] so every branch is reachable from a unit test. A
+/// check that can only be reached by a successful sandbox invocation is a check
+/// that cannot be tested without one — which is how a fail-open default survives
+/// review.
+fn verdict_base(
+    out: &std::process::Output,
+    home: &str,
+    cabundle_required: bool,
+) -> Result<(), IsolationUnavailable> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let field = |k: &str| -> Option<String> {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .map(str::to_string)
+    };
+    let cause = bwrap_cause(out);
+    let expect = |k: &str, want: &str, what: &str| -> Result<(), IsolationUnavailable> {
+        match field(k).as_deref() {
+            Some(v) if v == want => Ok(()),
+            other => Err(smoke(
+                what,
+                format!("expected {k}={want}, got {other:?}{cause}"),
+            )),
+        }
+    };
+
+    expect("shell", "ok", "the shell starts")?;
+    expect("home", home, "$HOME is the job directory")?;
+    expect("path", "/usr/bin:/bin", "$PATH is the set value")?;
+    // NOT `$HOME`/`$PATH`: `--setenv` sets exactly those two, so measured, a
+    // probe asserting them passes with `--clearenv` removed. The canary is what
+    // has teeth.
+    expect(
+        "canary",
+        "unset",
+        "the inherited canary is absent (--clearenv ran)",
+    )?;
+    expect(
+        "pwd",
+        home,
+        "the cwd is the job directory (--chdir took effect)",
+    )?;
+    expect("hostname", "haos-sandbox", "the hostname is haos-sandbox")?;
+    expect("passwd", "unreadable", "/etc/passwd is unreadable")?;
+    expect("shadow", "absent", "/etc/shadow is absent")?;
+    // `cabundle_required` is the caller's `Path::new(SMOKE_CA_BUNDLE).exists()`
+    // — the same rule the argv binds with (`push_ro_bind_if_present`), so a
+    // certificate path the host does not have is skipped, never demanded. It is
+    // a parameter rather than a lookup in here so that **both** branches are
+    // testable on a host that does have the bundle.
+    if cabundle_required {
+        expect(
+            "cabundle",
+            "readable",
+            "the CA bundle is readable inside the sandbox",
+        )?;
+    }
+    expect("writable", "yes", "the job directory is writable")?;
     Ok(())
+}
+
+/// The verdict on the nested-user-namespace transcript.
+fn verdict_nested(out: &std::process::Output) -> Result<(), IsolationUnavailable> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.contains("nested=blocked") {
+        return Ok(());
+    }
+    if stdout.contains("nested=allowed") {
+        return Err(smoke(
+            STEP_NESTED,
+            "`unshare --user` succeeded inside the sandbox",
+        ));
+    }
+    // Neither line: the check did not run. Saying "`unshare --user` succeeded"
+    // here would name the wrong cause — bwrap failing to start looks the same.
+    Err(smoke(
+        STEP_NESTED,
+        format!("the check did not run{}", bwrap_cause(out)),
+    ))
+}
+
+/// The verdict on the HTTPS transcript.
+fn verdict_https(out: &std::process::Output) -> Result<(), IsolationUnavailable> {
+    let body = String::from_utf8_lossy(&out.stdout);
+    if body.contains("http=2") {
+        return Ok(());
+    }
+    if !body.contains("http=") {
+        // No marker at all: curl never ran, so nothing here is about the
+        // certificate binds.
+        return Err(smoke(
+            STEP_HTTPS,
+            format!("curl did not run{}", bwrap_cause(out)),
+        ));
+    }
+    Err(smoke(
+        STEP_HTTPS,
+        format!(
+            "curl exited {:?} with {body:?} / {:?}; a `(77) error adding trust anchors` \
+             means the /etc/ssl/certs and /etc/ca-certificates binds are missing or \
+             unresolvable",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    ))
+}
+
+/// Whether the host's loopback was reachable from inside the sandbox.
+///
+/// The marker is required **before** it is interpreted. Reading "not 7" as
+/// reachable makes every other outcome reachable too, and the outcomes are not
+/// hypothetical:
+///
+/// - an **empty capture** (bwrap failed to set up) read as reachable, so under a
+///   network grant a broken sandbox passed the one check whose job is to notice
+///   reachability — a latent fail-open;
+/// - `exit=127` read as reachable, because `sh` runs the `echo exit=$?` after a
+///   missing `curl`. Under the shipped empty grant set that produced
+///   `the host network is unreachable without a grant`, refusing shell jobs on a
+///   **correct** sandbox and sending the operator to `/allow-net` for what is a
+///   missing binary.
+///
+/// So only curl's own outcomes are interpreted, and anything else fails closed
+/// with the code it saw.
+fn loopback_reachable(stdout: &str) -> Result<bool, String> {
+    if stdout.contains("curl=missing") {
+        return Err("curl is not available inside the sandbox".to_string());
+    }
+    let Some(code) = stdout.lines().find_map(|l| l.strip_prefix("exit=")) else {
+        return Err("curl did not run".to_string());
+    };
+    match code.trim() {
+        // Could not connect: the sandbox has no route to the host's loopback.
+        "7" => Ok(false),
+        // Connected, then waited for a response that never comes (28), or got
+        // one (0). Either way the host's listener was reachable.
+        "0" | "28" => Ok(true),
+        other => Err(format!(
+            "cannot tell whether the host network is reachable: curl exited {other}"
+        )),
+    }
+}
+
+/// The verdict on the loopback transcript, against the grant set in force.
+fn verdict_loopback(
+    out: &std::process::Output,
+    grants: &Grants,
+) -> Result<(), IsolationUnavailable> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reachable = match loopback_reachable(&stdout) {
+        Ok(reachable) => reachable,
+        Err(detail) => {
+            return Err(smoke(
+                STEP_LOOPBACK,
+                format!("{detail}{}", bwrap_cause(out)),
+            ))
+        }
+    };
+    match (grants.network, reachable) {
+        (true, false) => Err(smoke(
+            "the host network is reachable under a grant",
+            "the network grant is held but 127.0.0.1 is unreachable: --share-net did not \
+             take effect",
+        )),
+        (false, true) => Err(smoke(
+            "the host network is unreachable without a grant",
+            "no network grant is held but 127.0.0.1 is reachable",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Run the production argv in the sandbox, bounded. `step` names what the
@@ -764,9 +922,12 @@ async fn run_in_sandbox(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = cmd
-        .spawn()
-        .map_err(|e| smoke(step, format!("cannot run {}: {e}", bwrap.display())))?;
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        // The same outcome the version probe reports, so `probe()` called on its
+        // own does not describe a missing binary as a smoke-test failure.
+        std::io::ErrorKind::NotFound => IsolationUnavailable::NotInstalled,
+        _ => smoke(step, format!("cannot run {}: {e}", bwrap.display())),
+    })?;
     let bound = std::time::Duration::from_secs(PROBE_STEP_TIMEOUT_SECS);
     match tokio::time::timeout(bound, child.wait_with_output()).await {
         Ok(Ok(out)) => Ok(out),
@@ -1201,6 +1362,11 @@ mod tests {
         // the user namespace cannot be created, so it must be named explicitly.
         assert!(a.contains(&"--unshare-user".to_string()));
         assert!(a.contains(&"--disable-userns".to_string()));
+        // Asserted here because nothing else can: the probe cannot detect this
+        // flag's removal while `--disable-userns` remains — with that flag
+        // present the behaviour is identical, because this one verifies rather
+        // than acts — so a mutation removing only this line survives the whole
+        // suite. See the flag's own comment in `build_argv`.
         assert!(a.contains(&"--assert-userns-disabled".to_string()));
     }
 
@@ -1288,7 +1454,21 @@ mod tests {
             network: true,
         };
         assert!(!build_argv(Path::new("/j"), &none, "x").contains(&"--share-net".to_string()));
-        assert!(build_argv(Path::new("/j"), &net, "x").contains(&"--share-net".to_string()));
+        let a = build_argv(Path::new("/j"), &net, "x");
+        assert!(a.contains(&"--share-net".to_string()));
+        // Presence is not enough: order is load-bearing. `--share-net` before
+        // `--unshare-all` is re-unshared by it, so the grant becomes a silent
+        // no-op — measured against the real binary, the inverted order leaves the
+        // sandbox with `lo` alone (1 interface against 16), which the probe
+        // reports as "the host network is reachable under a grant". Presence
+        // alone passes either way.
+        let unshare = a.iter().position(|x| x == "--unshare-all").unwrap();
+        let share = a.iter().position(|x| x == "--share-net").unwrap();
+        assert!(
+            share > unshare,
+            "--share-net at {share} precedes --unshare-all at {unshare}, which re-unshares \
+             the network and makes the grant a silent no-op"
+        );
     }
 
     #[test]
@@ -1305,6 +1485,23 @@ mod tests {
             a.windows(3)
                 .any(|w| w[0] == "--bind" && w[1] == "/var/lib" && w[2] == "/var/lib"),
             "a granted path must be bound read-write, got {a:?}"
+        );
+        // Presence is not enough here either: a later bind wins, so a grant
+        // mounted *before* the read-only base is covered by it and grants
+        // nothing. Measured: `--bind /usr/share /usr/share` then
+        // `--ro-bind /usr /usr` leaves `/usr/share` read-only.
+        let grant_at = a
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/var/lib")
+            .unwrap();
+        let base_at = a
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[2] == "/usr")
+            .unwrap();
+        assert!(
+            grant_at > base_at,
+            "the grant at {grant_at} precedes --ro-bind /usr at {base_at}, which mounts over \
+             it and silently grants nothing"
         );
         // And nothing is bound read-write without a grant.
         let none = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
@@ -1452,5 +1649,353 @@ mod tests {
             !Path::new(seen.trim()).starts_with(&job_dir),
             "the probe spawned bwrap from inside the job directory: {seen}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failing_bwrap_explains_itself_in_the_error() {
+        // Measured with real bwrap: a failed setup exits non-zero, prints
+        // **nothing** on stdout, and explains itself on stderr — `bwrap: Can't
+        // find source path ...`, or the single most common failure on a fresh
+        // host, `bwrap: No permissions to creating new namespace`. Reading only
+        // stdout reported `expected shell=ok, got None` and threw away the one
+        // line that names the cause.
+        let scratch = tempfile::tempdir().unwrap();
+        let (_dir, bin) = stub_bwrap_running(
+            "echo 'bwrap: No permissions to creating new namespace' >&2\nexit 42",
+        );
+        let e = probe_at(&bin, &Grants::default(), scratch.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("the shell starts"),
+            "the failing step must still be named, got {e:?}"
+        );
+        assert!(
+            e.contains("No permissions to creating new namespace"),
+            "the cause bwrap printed on stderr must survive into the error, got {e:?}"
+        );
+        assert!(
+            e.contains("42"),
+            "the exit status must be reported, got {e:?}"
+        );
+    }
+
+    /// A fake `bwrap` that reads the argv it was given and answers with the
+    /// transcript a **working** sandbox would produce.
+    ///
+    /// The probe's positive path — the one that returns `Ok(())` — had no test:
+    /// both other probe tests accept an `Err`, so a mutation making `probe_at`
+    /// fail unconditionally passed the whole module suite. This gives `Ok(())`
+    /// teeth without real bubblewrap, so plain `cargo test` stays green on a host
+    /// that has none.
+    ///
+    /// It derives `home` and `pwd` from `--setenv HOME` and `--chdir` in `"$@"`,
+    /// and reachability from `--share-net`, so it answers as the argv asks rather
+    /// than echoing constants: a missing `--chdir` yields `pwd=` and a missing
+    /// `--share-net` under a grant yields `exit=7`, and both fail the probe.
+    fn stub_bwrap_answering_transcript() -> (tempfile::TempDir, PathBuf) {
+        stub_bwrap_running(
+            r#"home=""; cwd=""; net=no; cmd=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --chdir) cwd="$a" ;;
+    HOME) home="$a" ;;
+  esac
+  [ "$a" = "--share-net" ] && net=yes
+  prev="$a"
+  cmd="$a"
+done
+case "$cmd" in
+  *unshare*) echo nested=blocked ;;
+  *https://*) if [ "$net" = yes ]; then echo http=200; else echo http=000; fi ;;
+  *127.0.0.1*) if [ "$net" = yes ]; then echo exit=28; else echo exit=7; fi ;;
+  *)
+    echo shell=ok
+    echo "home=$home"
+    echo path=/usr/bin:/bin
+    echo "pwd=$cwd"
+    echo hostname=haos-sandbox
+    echo canary=unset
+    echo passwd=unreadable
+    echo shadow=absent
+    echo cabundle=readable
+    echo writable=yes ;;
+esac
+exit 0"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_probe_passes_a_working_sandbox() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (_dir, bin) = stub_bwrap_answering_transcript();
+        let r = probe_at(&bin, &Grants::default(), scratch.path()).await;
+        assert!(
+            r.is_ok(),
+            "a working sandbox must pass the probe, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_probe_passes_a_working_sandbox_under_a_network_grant() {
+        // The other half of the `(grants.network, reachable)` matrix, answered
+        // from the argv: the stub reports reachability only if `--share-net` is
+        // there, so this also fails if the grant stops reaching the argv.
+        let scratch = tempfile::tempdir().unwrap();
+        let (_dir, bin) = stub_bwrap_answering_transcript();
+        let grants = Grants {
+            write: Default::default(),
+            network: true,
+        };
+        let r = probe_at(&bin, &grants, scratch.path()).await;
+        assert!(
+            r.is_ok(),
+            "a granted sandbox must pass the probe, got {r:?}"
+        );
+    }
+
+    /// An [`std::process::Output`] for a verdict test, so a verdict can be
+    /// reached without running bubblewrap. `code` is the exit code; the raw form
+    /// a normal exit takes is `code << 8`.
+    fn output_of(stdout: &str, stderr: &str, code: i32) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// Every base property, one at a time. A check that only fails when several
+    /// fields are wrong is a check that hides which one broke, and a check that
+    /// is never exercised at all is the reason the fail-open loopback rule
+    /// survived review.
+    #[test]
+    fn every_base_property_is_checked() {
+        let home = "/jobs/t/j";
+        let fields = [
+            ("shell", "ok"),
+            ("home", home),
+            ("path", "/usr/bin:/bin"),
+            ("pwd", home),
+            ("hostname", "haos-sandbox"),
+            ("canary", "unset"),
+            ("passwd", "unreadable"),
+            ("shadow", "absent"),
+            ("cabundle", "readable"),
+            ("writable", "yes"),
+        ];
+        let transcript = |wrong: Option<usize>| {
+            fields
+                .iter()
+                .enumerate()
+                .map(|(i, (k, v))| {
+                    if Some(i) == wrong {
+                        format!("{k}=WRONG")
+                    } else {
+                        format!("{k}={v}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert!(
+            verdict_base(&output_of(&transcript(None), "", 0), home, true).is_ok(),
+            "a well-formed transcript must pass"
+        );
+        for (i, (name, _)) in fields.iter().enumerate() {
+            assert!(
+                verdict_base(&output_of(&transcript(Some(i)), "", 0), home, true).is_err(),
+                "{name} must be checked, but a wrong value passed"
+            );
+        }
+
+        // The bundle is demanded only when the host has it — the same rule the
+        // argv binds with — and both branches are reachable from here because
+        // the guard is a parameter, not a host lookup inside the verdict.
+        let without_bundle = output_of(
+            &fields
+                .iter()
+                .filter(|(k, _)| *k != "cabundle")
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "",
+            0,
+        );
+        assert!(
+            verdict_base(&without_bundle, home, false).is_ok(),
+            "a host without the bundle must not be asked for it"
+        );
+        assert!(
+            verdict_base(&without_bundle, home, true).is_err(),
+            "a host with the bundle must be"
+        );
+    }
+
+    /// A clean invocation must not pad the message, or the bwrap cause added for
+    /// a failed setup would make every ordinary assertion failure unreadable.
+    #[test]
+    fn a_clean_invocation_does_not_pad_the_message() {
+        match verdict_base(&output_of("shell=WRONG\n", "", 0), "/jobs/t/j", false) {
+            Err(IsolationUnavailable::SmokeTestFailed(msg)) => assert_eq!(
+                msg,
+                "the shell starts: expected shell=ok, got Some(\"WRONG\")"
+            ),
+            other => panic!("expected SmokeTestFailed, got {other:?}"),
+        }
+    }
+
+    /// The loopback verdict must read a **positive** signal, not the absence of
+    /// one. Every input here is reachable from a real invocation.
+    #[test]
+    fn the_loopback_verdict_requires_curl_to_have_run() {
+        let none = Grants::default();
+        let net = Grants {
+            write: Default::default(),
+            network: true,
+        };
+        // Nothing on stdout: bwrap failed to set up. The old
+        // `!contains("exit=7")` rule read this as reachable — a fail-open under
+        // a grant, and a false failure naming /allow-net under no grant.
+        for stdout in ["", "bwrap: setting up uid map: Permission denied\n"] {
+            let out = output_of(stdout, "bwrap: Can't find source path /nope\n", 1);
+            for grants in [&none, &net] {
+                let e = verdict_loopback(&out, grants).unwrap_err().to_string();
+                assert!(e.contains("did not run"), "got {e:?}");
+                assert!(
+                    e.contains("Can't find source path"),
+                    "the cause on stderr must survive, got {e:?}"
+                );
+            }
+        }
+
+        // What the script emits when curl is not installed.
+        let e = verdict_loopback(&output_of("curl=missing\n", "", 0), &none)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("curl is not available"),
+            "a missing curl must be named, not read as reachability: {e:?}"
+        );
+
+        // A bare 127 — an older script, or a shell that ignored the guard — must
+        // fail closed too, because `sh` runs `echo exit=$?` whatever curl does.
+        let e = verdict_loopback(&output_of("exit=127\n", "sh: curl: not found\n", 0), &none)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot tell"), "got {e:?}");
+        assert!(
+            e.contains("127"),
+            "the code it saw must be named, got {e:?}"
+        );
+    }
+
+    /// Both states of the grant, so neither is assumed.
+    #[test]
+    fn the_loopback_verdict_follows_the_grant_in_force() {
+        let none = Grants::default();
+        let net = Grants {
+            write: Default::default(),
+            network: true,
+        };
+        // 7 is curl's "could not connect"; 28 is "connected, then waited for a
+        // response that never came"; 0 is "connected and got one".
+        assert!(verdict_loopback(&output_of("exit=7\n", "", 0), &none).is_ok());
+        assert!(verdict_loopback(&output_of("exit=28\n", "", 0), &net).is_ok());
+        assert!(verdict_loopback(&output_of("exit=0\n", "", 0), &net).is_ok());
+
+        let e = verdict_loopback(&output_of("exit=28\n", "", 0), &none)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unreachable without a grant"), "got {e:?}");
+        let e = verdict_loopback(&output_of("exit=7\n", "", 0), &net)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("reachable under a grant"), "got {e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_with_no_bwrap_reports_not_installed() {
+        // The same outcome the version probe reports, so `probe()` called on its
+        // own does not describe a missing binary as a smoke-test failure — which
+        // would send the operator looking at namespaces and kernels for a
+        // package that is not installed.
+        let scratch = tempfile::tempdir().unwrap();
+        let missing = scratch.path().join("no-such-bwrap");
+        match probe_at(&missing, &Grants::default(), scratch.path()).await {
+            Err(IsolationUnavailable::NotInstalled) => {}
+            other => panic!("expected NotInstalled, got {other:?}"),
+        }
+    }
+
+    /// A curl step with no timeout of its own turns a blackholed network into a
+    /// sandbox failure at the probe's own 10s bound — the wrong diagnosis, and
+    /// the one the HTTPS step shipped with. Both curl invocations must bound
+    /// themselves.
+    #[test]
+    fn every_curl_step_bounds_itself() {
+        let steps = [
+            ("HTTPS", HTTPS_SCRIPT.to_string()),
+            ("loopback", loopback_script(1)),
+        ];
+        for (name, script) in steps {
+            assert!(
+                script.contains("--connect-timeout 2") && script.contains("--max-time 3"),
+                "the {name} step must bound its own connection, got {script:?}"
+            );
+        }
+    }
+
+    /// A sandbox that never ran the check is not the same failure as a sandbox
+    /// that allowed a nested namespace, and the operator acts differently on
+    /// each.
+    #[test]
+    fn the_nested_verdict_names_the_right_cause() {
+        assert!(verdict_nested(&output_of("nested=blocked\n", "", 0)).is_ok());
+
+        let e = verdict_nested(&output_of("nested=allowed\n", "", 0))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("succeeded inside the sandbox"), "got {e:?}");
+
+        let e = verdict_nested(&output_of(
+            "",
+            "bwrap: No permissions to creating new namespace\n",
+            1,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("did not run"), "got {e:?}");
+        assert!(
+            e.contains("No permissions"),
+            "the cause on stderr must survive, got {e:?}"
+        );
+    }
+
+    /// A missing curl and a missing CA bundle are different problems with
+    /// different fixes, so the HTTPS verdict must not conflate them.
+    #[test]
+    fn the_https_verdict_separates_a_missing_curl_from_a_missing_bundle() {
+        assert!(verdict_https(&output_of("http=200", "", 0)).is_ok());
+
+        let e = verdict_https(&output_of(
+            "http=000",
+            "curl: (77) error adding trust anchors from file: \
+             /etc/ssl/certs/ca-certificates.crt\n",
+            77,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("trust anchors"), "got {e:?}");
+
+        let e = verdict_https(&output_of("", "sh: curl: not found\n", 127))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("curl did not run"), "got {e:?}");
+        assert!(e.contains("curl: not found"), "got {e:?}");
     }
 }
