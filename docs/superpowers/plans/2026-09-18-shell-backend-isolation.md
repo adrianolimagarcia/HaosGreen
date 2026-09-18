@@ -170,13 +170,24 @@ impl std::fmt::Display for IsolationUnavailable {
 
 impl std::error::Error for IsolationUnavailable {}
 
-/// Locate `bwrap` and confirm it is a version we may rely on.
+/// Locate `bwrap` on `PATH` and confirm it is a version we may rely on.
+pub fn check_bwrap_version() -> Result<(), IsolationUnavailable> {
+    check_bwrap_version_at(Path::new("bwrap"))
+}
+
+/// The real check, against an explicit binary.
+///
+/// Taking the path as a parameter rather than reading `PATH` is what makes the
+/// version floor testable without mutating the environment: this repo has no
+/// `std::env::set_var` anywhere in `src/`, and `tests/a2a_e2e_live.rs` records
+/// why — it is process-global and races with every other test in the same
+/// binary. A stub binary on a private path is injected instead.
 ///
 /// An older version is reported as [`IsolationUnavailable::VersionTooOld`] —
 /// the same *kind* of outcome as "not installed", so there is no "present but
 /// insecure, carry on" state anywhere in the code.
-pub fn check_bwrap_version() -> Result<(), IsolationUnavailable> {
-    let out = std::process::Command::new("bwrap")
+pub fn check_bwrap_version_at(bin: &Path) -> Result<(), IsolationUnavailable> {
+    let out = std::process::Command::new(bin)
         .arg("--version")
         .output()
         .map_err(|_| IsolationUnavailable::NotInstalled)?;
@@ -195,31 +206,24 @@ pub fn check_bwrap_version() -> Result<(), IsolationUnavailable> {
 Add to the `tests` module in `src/supervisor/backend/sandbox.rs`:
 
 ```rust
-    /// A fake `bwrap` on `PATH` that reports a version we choose. This is what
-    /// makes the version floor testable without a vulnerable bubblewrap.
-    fn stub_bwrap_reporting(version_line: &str) -> tempfile::TempDir {
+    /// A fake `bwrap` that reports a version we choose, on its own private
+    /// path. No `PATH` mutation, so these tests are safe to run in parallel.
+    fn stub_bwrap_reporting(version_line: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bwrap");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho '{version_line}'\nexit 0\n"),
-        )
-        .unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version_line}'\nexit 0\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        dir
+        (dir, path)
     }
 
     #[test]
     fn a_vulnerable_version_is_refused_as_unavailable() {
-        let dir = stub_bwrap_reporting("bubblewrap 0.11.9");
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
-        let r = check_bwrap_version();
-        std::env::set_var("PATH", old_path);
+        let (_dir, bin) = stub_bwrap_reporting("bubblewrap 0.11.9");
+        let r = check_bwrap_version_at(&bin);
         assert!(
             matches!(r, Err(IsolationUnavailable::VersionTooOld(_))),
             "0.11.9 must be refused as VersionTooOld, got {r:?}"
@@ -228,19 +232,17 @@ Add to the `tests` module in `src/supervisor/backend/sandbox.rs`:
 
     #[test]
     fn the_supported_version_passes_the_check() {
-        let dir = stub_bwrap_reporting("bubblewrap 0.12.0");
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
-        let r = check_bwrap_version();
-        std::env::set_var("PATH", old_path);
+        let (_dir, bin) = stub_bwrap_reporting("bubblewrap 0.12.0");
+        let r = check_bwrap_version_at(&bin);
         assert!(r.is_ok(), "0.12.0 must pass, got {r:?}");
     }
-```
 
-> `std::env::set_var` is process-global. These two tests must not run
-> concurrently with anything else reading `PATH`. Put them behind a shared
-> `static ENV_LOCK: std::sync::Mutex<()>` guard, as the rest of this repo does
-> for env-mutating tests — take the lock at the top of both.
+    #[test]
+    fn a_missing_binary_is_reported_as_not_installed() {
+        let r = check_bwrap_version_at(Path::new("/nonexistent/bwrap"));
+        assert!(matches!(r, Err(IsolationUnavailable::NotInstalled)), "got {r:?}");
+    }
+```
 
 - [ ] **Step 5: Run the tests**
 
