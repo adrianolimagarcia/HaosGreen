@@ -489,24 +489,65 @@ asserts the properties the boundary claims:
   probe's own environment, removing `--clearenv` leaks it
   (`canary vazou=[SEGREDO]`) and the probe fails. The probe is therefore spawned
   with the canary present;
-- the sandbox directory is writable, and `--chdir` took effect **when the probe
-  spawns `bwrap` with its own cwd outside the job directory**. Measured: bwrap
-  inherits the invoking process's cwd when `--chdir` is absent — with the parent
-  at `/` the sandbox sees `/` (caught), with the parent already inside the job
-  directory it sees the job directory (silently passes). The probe pins its own
-  cwd so the check cannot pass by coincidence;
+- the sandbox directory is writable, and `--chdir` took effect. The probe pins
+  its cwd to **`/`** — a path that is present inside the sandbox and is not the
+  job directory. **Pinning a cwd *outside* the sandbox is wrong and disables the
+  check**: `bwrap(1)` uses `HOME` as the cwd when `--chdir` is absent *and the
+  current cwd is not present inside the sandbox*, and this argv sets `HOME` to
+  the job directory and binds it — so an unbound pinned cwd makes bwrap fall back
+  to the job directory, with or without `--chdir`. Measured against the real
+  binary: with an unbound pinned cwd, removing `--chdir` left `probe()` returning
+  `Ok(())`; with the cwd pinned to `/`, the same mutation fails with
+  `expected pwd=<job>, got Some("/")`. Isolated rule, measured: cwd `/` →
+  preserved; cwd unbound + `HOME` bound → job directory; cwd unbound + `HOME`
+  unbound → `/`. Because this rests on a documented fallback that a future
+  bubblewrap could change, a **static** argv assertion backs it up: `--chdir
+  <job_dir>` must sit immediately before `/bin/sh`;
 - `hostname` is `haos-sandbox`;
 - `/etc/passwd` is not readable, and `/etc/shadow` does not exist;
-- **HTTPS works**: a request to an HTTPS endpoint succeeds, proving the two
-  certificate binds are present and resolvable. Measured as the difference
-  between `curl: (77)` and `HTTP 200`, and `openssl s_client` reporting
-  `Verify return code: 0 (ok)`;
+- **the CA bundle is readable inside the sandbox**, network-free:
+  `[ -r /etc/ssl/certs/ca-certificates.crt ]`, guarded by the same
+  `exists()` rule the argv binds with, so a host without the path skips the check
+  rather than demanding it. This is the check that has teeth and it needs no
+  network: with both binds the bundle resolves to
+  `/etc/ca-certificates/extracted/tls-ca-bundle.pem`; with **only**
+  `/etc/ssl/certs` bound it is unreadable — the dangling-symlink state that
+  produces `curl: (77)`;
+- **HTTPS works end-to-end, but only when the network grant is held.** A request
+  to an HTTPS endpoint succeeds under a grant (measured `http=200`, and
+  `openssl s_client` reporting `Verify return code: 0 (ok)`) and, with only
+  `/etc/ssl/certs` bound, fails with `curl: (77) error adding trust anchors`.
+  **The check must not run unconditionally.** Revision 3 gates `--share-net` on
+  the network grant, so with the shipped empty grant set the sandbox has `lo` and
+  nothing else, and an unconditional HTTPS check reports
+  `SmokeTestFailed("curl: (6) Could not resolve host")` for every operator who has
+  not typed `/allow-net` — failing the probe, and refusing shell jobs, on a
+  sandbox that is working correctly. Revision 2 could assert it unconditionally
+  only because `host_network = true` made `--share-net` always present; revision
+  3 removed that assumption, so the check is conditioned on the grant and the
+  network-free bundle check above carries the certificate guarantee;
 - a TCP connect to the host's loopback **fails** unless the network grant is
   held, and **succeeds** when it is — the probe asserts the behaviour of the
   grant set actually in force, so both states are covered rather than assuming
   the default;
-- creating a nested user namespace fails (proves `--disable-userns` and
-  `--assert-userns-disabled` actually took effect on this kernel).
+- creating a nested user namespace fails (proves `--disable-userns` actually took
+  effect on this kernel).
+
+> **What the probe cannot detect, stated rather than implied.** Removing
+> `--assert-userns-disabled` while `--disable-userns` remains is **not**
+> observable at runtime: with `--disable-userns` present the behaviour is
+> identical, because the flag verifies rather than acts. The probe therefore does
+> not guard it, and a mutation removing only that flag will survive. It is kept
+> for the failure mode where `--disable-userns` silently does *not* take effect,
+> which is what it exists to catch.
+>
+> **The three resolver files are bound but inert without the network grant.**
+> `getent hosts example.com` fails with `resolv.conf`, `hosts` and
+> `nsswitch.conf` all bound and no `--share-net`, because there is no route to a
+> resolver. They are bound unconditionally because a network grant can be issued
+> at any time and re-building the argv per grant is not worth it — but the
+> binding alone does not make name resolution work, and no check should assume
+> it does.
 
 A failure at any step is `IsolationUnavailable`, with the failing step named in
 the error. The probe runs once at startup and its result is cached.
@@ -547,15 +588,27 @@ Added, one per correction in this revision:
 - remove `--share-net` while the network grant is held → the loopback check must
   fail, proving the flag is what carries reachability
 - hold the network grant → loopback reachable; revoke it → loopback unreachable
-- remove the two certificate binds → the HTTPS check must fail with `(77)`
-- bind `/etc/ssl/certs` **without** `/etc/ca-certificates` → HTTPS must still
-  fail, proving the second bind is load-bearing rather than redundant
+- remove the two certificate binds → the network-free bundle check must fail
+  (`bundle_readable=no`), and the end-to-end HTTPS check under a network grant
+  must fail with `(77)`
+- bind `/etc/ssl/certs` **without** `/etc/ca-certificates` → both must still
+  fail, which is what proves the second bind is load-bearing rather than
+  redundant. This is the mutation that matters, because a check that only ever
+  sees the working configuration cannot tell the two binds apart
+- remove `--chdir` with the probe's cwd pinned to `/` → the cwd check must catch
+  it. **This mutation only has teeth with the cwd pinned inside the sandbox**:
+  with an unbound pinned cwd it survives, because bwrap falls back to `HOME`,
+  which is the job directory
+- run the end-to-end HTTPS check with **no** network grant → it must be skipped,
+  not failed. A probe that demands HTTPS without a grant refuses shell jobs on a
+  correct sandbox
 - grant a path read-write, then `/deny` it → the write must be refused again
 - grant `/var/lib` and attempt to write `/var/lib/docker/x` → refused, proving a
   grant covers exactly the named path and not its children
 - spawn `bwrap` with its cwd already inside the job directory and remove
-  `--chdir` → the cwd check must still catch it, proving the probe pins its own
-  cwd rather than passing by coincidence
+  `--chdir` → this mutation **survives by design** and is recorded as a known
+  limit rather than a passing check; see the `--chdir` bullet above for why an
+  unbound pinned cwd cannot detect it
 - **the loopback escape path must be demonstrated, not assumed**: with the
   dashboard enabled, the default password unchanged, and the network grant held,
   a sandboxed job must be shown to reach `/api/auth/login` and obtain a session.
