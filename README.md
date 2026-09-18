@@ -4,10 +4,7 @@
 
 # HaosGreen — Telegram AI Assistant
 
-[![CI](https://github.com/chinkan/RustFox/actions/workflows/ci.yml/badge.svg)](https://github.com/chinkan/RustFox/actions)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Buy Me a Coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-%E2%98%95-yellow)](https://buymeacoffee.com/chinkan.ai)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/chinkan)
 
 **What is HaosGreen?**
 
@@ -80,7 +77,7 @@ See [docs/roadmap/multi-session.md](docs/roadmap/multi-session.md) for detailed 
 
 **Option A — Download a release (recommended)**
 
-Download from the [Releases page](https://github.com/chinkan/RustFox/releases):
+Download from the [Releases page](../../releases):
 
 ```bash
 tar xzf haos-green-*.tar.gz
@@ -229,8 +226,3 @@ HaosGreen runs an agentic loop: user message → LLM (OpenRouter) → tool calls
 ## Contributing
 
 MIT License. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to open issues and submit PRs.
-
-## Support
-
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-yellow?style=for-the-badge&logo=buy-me-a-coffee)](https://buymeacoffee.com/chinkan.ai)
-[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-%E2%9D%A4-pink?style=for-the-badge&logo=github)](https://github.com/sponsors/chinkan)
