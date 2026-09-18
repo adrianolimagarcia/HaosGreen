@@ -1,14 +1,19 @@
 # Shell Backend Isolation Design
 
-> **Revision 2.** Revision 1 was reviewed and rejected as ready-to-implement on
-> eight points. Every correction below is backed by a measurement taken on this
-> host (bubblewrap 0.12.0, CachyOS, kernel 7.2.4-3-cachyos, running as uid 0),
-> not by assumption. Where a proposed correction turned out to be unnecessary,
-> or insufficient, that is recorded too.
+> **Revision 3.** Revision 1 was reviewed and rejected as ready-to-implement on
+> eight points; revision 2 corrected those. Every correction below is backed by a
+> measurement taken on this host (bubblewrap 0.12.0, CachyOS, kernel
+> 7.2.4-3-cachyos, running as uid 0), not by assumption. Where a proposed
+> correction turned out to be unnecessary, or insufficient, that is recorded too.
 >
-> One review point was **decided against the review's own recommendation**: the
-> network default stays `host_network = true` at the operator's explicit
-> direction. §4 records what that opens.
+> **Revision 3 changes the consent model.** Revision 2 asked one binary question
+> — "may this job run outside the sandbox?" — and answered the network question
+> in `config.toml`, defaulting `host_network` to `true` at the operator's
+> explicit direction. Revision 3 replaces both with a boundary drawn at
+> **capability**: reads are free, **writes and the host network require a named,
+> revocable grant**. §3 records the model and §4 records why the config key is
+> gone. The network default is therefore no longer `true`; it is "not granted
+> until the operator says `/allow-net`".
 
 ## Objective
 
@@ -19,12 +24,23 @@ runs inside a bubblewrap sandbox that cannot see the host's home directory,
 `/etc`, or the supervisor's environment — and when that sandbox is unavailable
 the operator is **asked**, not silently obeyed.
 
-**What this does *not* promise: network isolation.** The shipped default is
-`host_network = true`, so a sandboxed job keeps the host's network namespace and
-can reach loopback services, the LAN and Tailscale. That is a deliberate
-operator decision, and §4 records the concrete sandbox-escape route it opens.
-The isolation this design delivers is a **filesystem and environment**
-boundary; the network is shared unless the operator opts out.
+**What this promises, and what it does not.** A shell job runs inside a
+bubblewrap sandbox that cannot see the host's home directory or `/etc` beyond a
+small read-only base, and cannot modify the host at all: every host path it can
+reach is bound `--ro-bind`, and the only writable location is its own job
+directory.
+
+The host's **network namespace is not shared by default** (revision 3; revision
+2 defaulted it on). A job that needs the network asks, and the operator grants
+it with `/allow-net` — see §3. The same is true of any host path the job needs
+to **write**: it is refused until the operator names it with `/allow <path>`.
+Reads of the base set are never gated, because a read-only bind cannot damage
+the host.
+
+So the isolation this design delivers is a **filesystem boundary that is
+read-only by construction, plus a network and write boundary that is
+grant-gated**. It does not promise that a granted job is harmless: once
+`/allow-net` is granted, the dashboard escape route in §3 is live again.
 
 ## The problem, with the evidence
 
@@ -183,13 +199,40 @@ bwrap
   --symlink usr/lib64 /lib64
   --proc /proc
   --dev  /dev
-  --ro-bind /etc/resolv.conf /etc/resolv.conf    # only if host_network
+  --ro-bind /etc/resolv.conf   /etc/resolv.conf
   --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
-  --ro-bind /etc/hosts /etc/hosts
+  --ro-bind /etc/hosts         /etc/hosts
+  --ro-bind /etc/ssl/certs     /etc/ssl/certs        # if it exists
+  --ro-bind /etc/ca-certificates /etc/ca-certificates # if it exists
   --bind <job-sandbox> <job-sandbox>
   --chdir <job-sandbox>
   /bin/sh -c <command>
 ```
+
+and, **only when the operator has granted the network**, one more flag after the
+`/etc` binds:
+
+```
+  --share-net
+```
+
+- **The certificate binds are what keep HTTPS working**, and they are not
+  optional garnish. Measured from inside this argv: without them `curl
+  https://example.com` fails with `curl: (77) error adding trust anchors from
+  file: /etc/ssl/certs/ca-certificates.crt`; adding `/etc/ssl/certs` **alone**
+  still fails, because on Arch/CachyOS the bundle is a symlink to
+  `../../ca-certificates/extracted/tls-ca-bundle.pem` and binding the directory
+  that holds the symlink without its target leaves it dangling; adding both
+  returns **HTTP 200**, and `openssl s_client` reports `Verify return code: 0
+  (ok)`. On Debian/Ubuntu the second path does not exist and is skipped. They are
+  public CA certificates — read-only, and no secrets.
+- **`--share-net` is not in the base argv.** It is appended only under a network
+  grant, because it hands the job the host's namespace — measured as `lo enp2s0
+  wlan0 tailscale0 virbr0 dnsstub`, with the operator's own LLM gateway on
+  `127.0.0.1:8790` reachable from inside.
+- **The three `/etc` files for name resolution are always bound.** Without them
+  a job cannot resolve a hostname at all, and DNS resolution is a read; measured,
+  `getent hosts example.com` resolves correctly with them and fails without.
 
 - **`--new-session`** (P0). Without it the sandboxed process keeps the
   controlling terminal, and `TIOCSTI` lets it inject input into the operator's
@@ -252,95 +295,162 @@ only path we hand out.
   affordance; Layer 2 is the boundary, because a task can move between the two
   (approval, resume, a config reload, a revoked grant).
 
-### 3. Consent: two different decisions, two different commands (P0/P1)
+### 3. The sandbox is the authorization boundary (P0/P1)
 
-Revision 1 let a single `/approve <id>` grant unconfined shell **for the rest of
-the process**. That is a UX trap: the operator believes they are approving one
-job, and has in fact authorised every future shell job until restart. The two
-decisions are separated:
+Revision 2 treated consent as a single binary decision — "may this job run
+outside the sandbox at all?" — with a job-scoped `/approve` and a process-wide
+`/unsafe-shell on`. That conflates two very different questions and gives the
+operator only an all-or-nothing lever: a job that needs one extra read-only
+path and a job that needs to write to `/etc` are answered identically.
 
-| Command | Scope |
-|---|---|
-| `/approve <task-id>` | **this task only.** Does not authorise any other job. |
-| `/unsafe-shell on` | standing consent for the process, granted explicitly and named for what it is |
-| `/unsafe-shell off` | revokes standing consent immediately |
+Revision 3 replaces that with a boundary drawn at **capability**, not at the
+binary:
+
+| Capability | Default | Requires authorization |
+|---|---|---|
+| Read a host path that the base set already binds | **allowed** | no |
+| Read any other host path | not bound — the sandbox simply has no such path | n/a |
+| **Write** to a host path | **refused** | **yes** |
+| **Host network namespace** (`--share-net`) | **refused** | **yes** |
+| Write inside its own job directory | allowed | no |
+
+Reads are free by construction: the base set is bound `--ro-bind`, so a job
+cannot modify the host through it, and a path outside the base set does not
+exist inside the sandbox at all. The two capabilities that can actually damage
+the host are a **read-write bind** and **the host's network namespace**, and
+those are the two that ask.
+
+This is the operator's decision, stated plainly: reading is not dangerous,
+writing and reaching the host's network are.
+
+#### The base set, bound read-only and never gated
+
+```
+/usr  /bin  /lib  /lib64  /proc  /dev
+/etc/resolv.conf  /etc/hosts  /etc/nsswitch.conf
+/etc/ssl/certs  /etc/ca-certificates
+```
+
+The two certificate paths are not optional. Measured on this host: without them
+`curl https://example.com` from inside the sandbox fails with
+`curl: (77) error adding trust anchors from file:
+/etc/ssl/certs/ca-certificates.crt`, and binding `/etc/ssl/certs` **alone** does
+not fix it, because on Arch/CachyOS the bundle is a symlink to
+`../../ca-certificates/extracted/tls-ca-bundle.pem`. Both are needed; on
+Debian/Ubuntu the second is absent and is skipped. They are public CA
+certificates — read-only, no secrets.
+
+Binding them keeps a property that would otherwise silently regress: today
+`ShellBackend` runs `sh -c` on the host with a complete `/etc`, so a job that
+fetches a URL works. A sandbox that broke HTTPS would be a functional
+regression, not a security win.
+
+#### Authorization is declared before the run, not discovered during it
+
+`bubblewrap` builds its argv before the process starts; a bind cannot be added
+to a running sandbox. So authorization cannot be reactive — the supervisor
+cannot watch a job fail and then widen its own sandbox. It is resolved **before**
+the job runs:
+
+1. The task declares the grants it needs (`Grants { write: Vec<PathBuf>, network:
+   bool }`). In practice the planner derives this from the job's command; a
+   declaration that is missing a grant fails closed and the job is refused, it
+   does not fall back to a wider sandbox.
+2. The supervisor subtracts the grants already held. If nothing is missing, the
+   job runs.
+3. Otherwise the task is parked and the operator is asked, by name, for each
+   missing grant — the path, and why the task wants it.
 
 ```rust
-enum UnsafeShellGrant {
-    None,
-    Job(TaskId),   // one-shot, consumed when that job runs
-    Process,       // standing, until revoked or restart
+struct Grants {
+    /// Host paths the job may mount read-write. Absolute, canonicalised.
+    write: BTreeSet<PathBuf>,
+    /// Share the host network namespace.
+    network: bool,
 }
 ```
 
-- The grant is in-memory (`Arc<AtomicBool>` for `Process`, a set of task ids for
-  `Job`) and **never persists across a restart**, matching the dashboard's
-  session model.
-- `Job` is consumed on use, so an approval cannot be replayed by a later run of
-  the same task id.
-- Every grant and every revocation writes a `sup_transitions` row naming the
-  actor and the scope, so the audit log distinguishes "approved this job" from
-  "enabled unsafe shell process-wide" — which revision 1's single row could not.
+#### Grants are per path, standing until revoked
+
+| Command | Effect |
+|---|---|
+| `/allow <path>` | grants read-write access to that host path, for every future job until revoked |
+| `/deny <path>` | revokes it immediately |
+| `/allow-net` | grants the host network namespace until revoked |
+| `/deny-net` | revokes it immediately |
+| `/approve <task-id>` | releases one task parked at Layer 1 (see §2) — job-scoped, consumed on use |
+
+Standing rather than one-shot is deliberate: a job that fetches a URL needs the
+network on every run, and asking again each time trains the operator to approve
+without reading. `/deny` is the revocation, and it is immediate.
+
+`write` grants are matched on the **canonicalised** path, so `/etc/../etc` and a
+symlink pointing at `/etc` resolve to the same entry. A grant covers exactly the
+path named and not its children: `/allow /var/lib/docker` does not grant
+`/var/lib`. Widening is an explicit, separate decision.
+
+The grant set is in-memory and **never persists across a restart**, matching the
+dashboard's session model: a restart is a cheap, complete revocation. Every
+grant and revocation writes a `sup_transitions` row naming the actor, the path
+and whether it was granted or revoked, so the audit log answers "who allowed
+writes to /etc, and when?" — which revision 2's single boolean could not.
+
+#### What this closes
+
+Revision 2 documented an escape path and accepted it: with `host_network = true`
+by default, a sandboxed job could reach the dashboard on `127.0.0.1:8787`, log
+in with the default `admin`/`admin`, and run `execute_command` on the host
+outside the sandbox. Under revision 3 the host network namespace is **not
+granted by default**, so that path requires the operator to type `/allow-net`
+first — turning an implicit default into an explicit decision. The escape is
+still possible once granted, and it is still worth knowing that the dashboard is
+the weakest link; the difference is that it is now a decision rather than a
+default.
+
+#### `sandbox = "none"`
+
+Unchanged in spirit: that mode **is** the operator's standing consent to run
+shell jobs outside any sandbox, and nothing is gated. It is named for what it
+is, it is refused unless set explicitly, and the operator is warned at startup.
 
 ### 4. Configuration
 
 ```toml
 [supervisor.shell]
-sandbox      = "bwrap"   # "bwrap" | "none"
-host_network = true      # default: share the HOST network namespace
+sandbox = "bwrap"   # "bwrap" | "none"
 ```
 
-**`host_network` defaults to `true`** — the operator's decision, taken with the
-exposure below on the table, against the recommendation of the review that
-produced this revision (whose priority table and §3 both argued for `false`).
+**There is no `host_network` config key in revision 3.** The host network
+namespace became a *runtime grant* (`/allow-net`), not a startup setting, for one
+reason: a config key is decided once, at rest, by whoever edits `config.toml`,
+while the escape path it opens is exercised per job. Making it a grant means it
+is named at the moment it is used, by the operator, and revocable without a
+restart.
 
-The name is deliberate, because `network = true` reads as "allow internet
-access" and that is not what it does. `--share-net` keeps the **host's** network
-namespace. Measured exposure: `lo enp2s0 wlan0 tailscale0 virbr0 dnsstub`, with
-`127.0.0.1:8790` (the operator's own LLM gateway) reachable from inside the
-sandbox. That reaches loopback services, the LAN, Tailscale peers, VM bridges
-and any cloud metadata endpoint the host can reach.
+Revision 2 defaulted `host_network` to `true` at the operator's explicit
+request, and documented the exposure it created: `--share-net` keeps the
+**host's** namespace, so the sandbox saw `lo enp2s0 wlan0 tailscale0 virbr0
+dnsstub`, with `127.0.0.1:8790` — the operator's own LLM gateway — reachable from
+inside. That reached loopback services, the LAN, Tailscale peers and VM bridges.
+Under revision 3 the default is the empty grant set: **no host network, no
+writable host path**, and the operator grants each explicitly.
 
-> **Accepted risk, with the escape path written down.** Because loopback is
-> reachable by default, and the dashboard binds `127.0.0.1:8787` by default with
-> the credentials `admin`/`admin` and no forced password change (an accepted
-> decision documented in `CLAUDE.md`), and the web chat's tool policy includes
-> `execute_command` (`src/web/routes/chat.rs:661`), a sandboxed shell job has a
-> concrete route out of the sandbox:
->
-> ```
-> job inside bwrap
->   → POST http://127.0.0.1:8787/api/auth/login   (x-haos-green-csrf: 1, admin/admin)
->   → POST /api/chat/sessions, then a message
->   → execute_command on the HOST, outside bwrap
-> ```
->
-> Every step is a documented, intended feature of the dashboard. No code is
-> broken; the sandbox is simply bypassed through a service the host itself
-> exposes. It requires the dashboard to be enabled **and** the default password
-> to be unchanged, and the operator is already warned about the latter by a
-> startup warning and a non-dismissible banner.
->
-> Mitigations, in increasing order of strength — none of them is implemented by
-> this change, and this is recorded so the choice is visible rather than
-> implicit:
->
-> 1. `host_network = false` (the reviewed recommendation): closes the path
->    entirely, at the cost of the sandbox having no network.
-> 2. Refuse to start the listener when `host_network = true` and the dashboard
->    password is still the default — turns the two accepted risks into one.
-> 3. Bind the dashboard to a non-loopback address behind a reverse proxy, so
->    loopback inside the sandbox reaches nothing.
->
-> Consequence for the probe: **the default configuration does not verify network
-> isolation**, because there is none to verify. The probe's loopback check runs
-> only under `host_network = false`, and the smoke test asserts the *documented*
-> behaviour of the configured mode rather than always asserting isolation.
+> The accepted-risk block from revision 2 is retained in §3, re-framed: the
+> dashboard escape path still exists once `/allow-net` is granted, and the
+> dashboard remains the weakest link in the chain. What changed is that reaching
+> it is now a decision the operator takes by name rather than a default they
+> inherit by omission.
 
 With `sandbox = "none"` nothing is gated: that mode **is** the operator's
-consent, and Layer 1 does not apply. `host_network` is ignored under `"none"`.
+consent, and Layer 1 does not apply.
 
 An unknown value for `sandbox` is refused at load rather than defaulted.
+
+A grant of a path that does not exist, is not absolute, or is `/` is refused
+when it is issued, not when a job later fails to start: `/allow /` would hand
+back everything the sandbox exists to withhold, and a relative path has no
+meaning once the sandbox has its own root. `--` handling matters here, because a
+path is operator input: `/allow -- /etc` must not be read as a flag.
 
 ### 5. Resource containment (P1)
 
@@ -371,15 +481,30 @@ row or the artifact, so a runaway producer cannot inflate the database.
 asserts the properties the boundary claims:
 
 - the shell starts (proves `/usr`, `/bin`, `/lib`, `/lib64` and the loader);
-- `$HOME` is the job sandbox and `$PATH` is the set value (proves the
-  `--clearenv`/`--setenv` **ordering**);
-- the sandbox directory is writable and `--chdir` took effect;
+- `$HOME` is the job sandbox and `$PATH` is the set value;
+- an **inherited canary variable is absent** inside — this is what proves
+  `--clearenv` ran, and `$HOME`/`$PATH` do **not**. Measured: removing
+  `--clearenv` leaves a probe that asserts only `$HOME`/`$PATH` passing 7/7,
+  because `--setenv` sets exactly those two variables; with a canary set in the
+  probe's own environment, removing `--clearenv` leaks it
+  (`canary vazou=[SEGREDO]`) and the probe fails. The probe is therefore spawned
+  with the canary present;
+- the sandbox directory is writable, and `--chdir` took effect **when the probe
+  spawns `bwrap` with its own cwd outside the job directory**. Measured: bwrap
+  inherits the invoking process's cwd when `--chdir` is absent — with the parent
+  at `/` the sandbox sees `/` (caught), with the parent already inside the job
+  directory it sees the job directory (silently passes). The probe pins its own
+  cwd so the check cannot pass by coincidence;
 - `hostname` is `haos-sandbox`;
-- `/etc/passwd` is not readable;
-- a TCP connect to the host's loopback **succeeds** under the default
-  `host_network = true`, and **fails** under `host_network = false` — the smoke
-  test asserts the behaviour of the mode actually configured, because the
-  default mode has no network isolation to assert;
+- `/etc/passwd` is not readable, and `/etc/shadow` does not exist;
+- **HTTPS works**: a request to an HTTPS endpoint succeeds, proving the two
+  certificate binds are present and resolvable. Measured as the difference
+  between `curl: (77)` and `HTTP 200`, and `openssl s_client` reporting
+  `Verify return code: 0 (ok)`;
+- a TCP connect to the host's loopback **fails** unless the network grant is
+  held, and **succeeds** when it is — the probe asserts the behaviour of the
+  grant set actually in force, so both states are covered rather than assuming
+  the default;
 - creating a nested user namespace fails (proves `--disable-userns` and
   `--assert-userns-disabled` actually took effect on this kernel).
 
@@ -416,16 +541,26 @@ Added, one per correction in this revision:
   must detect it
 - remove `--unshare-user` while keeping `--disable-userns` → the run must fail,
   not silently downgrade
-- move `--clearenv` after `--setenv` → `HOME` must come back empty
-- remove `--share-net` under `host_network = true` → the loopback check must
-  fail, proving the flag is actually what carries the reachability
-- `host_network = false` → loopback and LAN unreachable
+- move `--clearenv` after `--setenv` → the **canary** must leak. Not `$HOME`:
+  measured, a probe asserting only `$HOME`/`$PATH` passes 7/7 with `--clearenv`
+  removed, so that assertion has no teeth here
+- remove `--share-net` while the network grant is held → the loopback check must
+  fail, proving the flag is what carries reachability
+- hold the network grant → loopback reachable; revoke it → loopback unreachable
+- remove the two certificate binds → the HTTPS check must fail with `(77)`
+- bind `/etc/ssl/certs` **without** `/etc/ca-certificates` → HTTPS must still
+  fail, proving the second bind is load-bearing rather than redundant
+- grant a path read-write, then `/deny` it → the write must be refused again
+- grant `/var/lib` and attempt to write `/var/lib/docker/x` → refused, proving a
+  grant covers exactly the named path and not its children
+- spawn `bwrap` with its cwd already inside the job directory and remove
+  `--chdir` → the cwd check must still catch it, proving the probe pins its own
+  cwd rather than passing by coincidence
 - **the loopback escape path must be demonstrated, not assumed**: with the
-  dashboard enabled, the default password unchanged, and `host_network = true`,
+  dashboard enabled, the default password unchanged, and the network grant held,
   a sandboxed job must be shown to reach `/api/auth/login` and obtain a session.
-  This test asserts the *accepted risk*, so that removing the risk (by any of the
-  three mitigations) fails the test and forces the spec to be updated rather than
-  silently drifting.
+  This test asserts the *accepted risk*, so that removing the risk fails the test
+  and forces the spec to be updated rather than silently drifting.
 - remove `--hostname` → the host's hostname must be visible
 - set the sandbox root to `/` → config load must refuse
 - revoke the grant between Layer 1 and Layer 2 → Layer 2 must still refuse
@@ -441,7 +576,8 @@ plain `cargo test` stays green on a host without bubblewrap:
 - the original attack (`run x; cat /etc/hostname`) fails inside the sandbox;
 - `~/.haos-green/config.toml` is unreachable;
 - the environment leak is closed;
-- the two-layer gate parks a task in `Route` and `/unsafe-shell on` releases it;
+- the two-layer gate parks a task in `Route`, and granting what it declared
+  releases it;
 - `/approve <id>` does **not** release a *different* task.
 
 Every await on spawned work goes through `supervisor::bounded("what", handle)`,
@@ -472,12 +608,14 @@ per the hang rule in `CLAUDE.md`.
 
 ## Delivery sequence
 
-1. `sandbox.rs`: version probe, argv builder, sandbox-directory invariants, plus
-   unit tests for the argument construction and its **ordering**.
+1. `sandbox.rs`: version probe, argv builder (including the certificate binds and
+   the conditional `--share-net`), sandbox-directory invariants, the startup
+   smoke probe, plus unit tests for the argument construction and its
+   **ordering**.
 2. Wire into `ShellBackend`; real-bwrap tests; first mutation round.
-3. Config keys (`sandbox`, `host_network`), startup probe and warning.
+3. Config key (`sandbox`) and the startup warning.
 4. Output caps and `RLIMIT_NPROC`; runaway-producer tests.
 5. Layer-1 gate and Layer-2 refusal.
-6. Consent (`UnsafeShellGrant`), audit rows, `/approve` scoping,
-   `/unsafe-shell on|off` and the dashboard equivalent.
+6. Grants: the `Grants` set, `/allow`, `/deny`, `/allow-net`, `/deny-net`, their
+   audit rows, `/approve` scoping, and the dashboard equivalents.
 7. Documentation corrections, then the full gates.
