@@ -21,6 +21,7 @@ pub mod workspace;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 use crate::supervisor::artifact::ArtifactManager;
 use crate::supervisor::backend::{reasoning::ReasoningBackend, Registry};
@@ -62,6 +63,38 @@ pub enum SupervisorError {
     StateRefusal { from: TaskStatus, to: TaskStatus },
     /// An `execute_now` for this task is already running in this process.
     AlreadyRunning { task_id: String },
+    /// This run's execution lease is gone: another owner took the task over, or
+    /// the lease could not be renewed at all.
+    ///
+    /// The two causes are deliberately **not** distinguished by this type (only
+    /// by the `LeaseLossReason` log line in the heartbeat), so nothing that
+    /// renders this error may assert a takeover: `Display` says the lease "is
+    /// no longer held by this run", which is true of both a takeover and a
+    /// `LeaseLossReason::StoreUnavailable` outage.
+    ///
+    /// # What the abort does and does not guarantee
+    ///
+    /// The lease is a **TTL lease**, not a lock with a waiter list, so a
+    /// takeover is only *detected* — never prevented — at the next heartbeat
+    /// tick. Concretely, once another owner has taken the task over, this run
+    /// keeps working until its heartbeat notices:
+    ///
+    /// * up to one `LEASE_HEARTBEAT_INTERVAL` (60 s) before the next renewal
+    ///   attempt, plus
+    /// * the bounded renew retries, whose worst case is ~20.7 s when SQLite's
+    ///   busy handler blocks every attempt (see `LEASE_RENEW_BACKOFFS`),
+    ///
+    /// so **up to roughly 60–80 s of overlap** with the new owner is possible,
+    /// and the abort is best-effort: it drops the pipeline and kills the
+    /// backends' subprocesses, but nothing is rolled back. A job row, an
+    /// artifact, a state transition or a shell command's effect on the
+    /// workspace that was already committed before the abort **stays
+    /// committed**.
+    ///
+    /// What the lease does guarantee is narrower and still worth having: only
+    /// one owner at a time holds the row, and the displaced run stops as soon
+    /// as it notices. It is not a distributed transaction.
+    LeaseLost { task_id: String },
 }
 
 impl SupervisorError {
@@ -83,6 +116,13 @@ impl SupervisorError {
             task_id: task_id.to_string(),
         })
     }
+
+    /// This run lost the execution lease while the pipeline was running.
+    pub fn lease_lost(task_id: &str) -> anyhow::Error {
+        anyhow::Error::new(Self::LeaseLost {
+            task_id: task_id.to_string(),
+        })
+    }
 }
 
 impl std::fmt::Display for SupervisorError {
@@ -95,6 +135,11 @@ impl std::fmt::Display for SupervisorError {
             Self::AlreadyRunning { task_id } => write!(
                 f,
                 "task {task_id} is already running; refusing to start a second run"
+            ),
+            Self::LeaseLost { task_id } => write!(
+                f,
+                "the execution lease for task {task_id} is no longer held by this run; \
+                 the run was aborted"
             ),
         }
     }
@@ -144,6 +189,387 @@ impl Drop for InFlightGuard {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.task_id);
     }
+}
+
+/// How often the heartbeat renews the execution lease.
+const LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Execution-lease TTL in seconds: five heartbeat intervals, so a missed
+/// renewal — or a bounded burst of retries — still leaves the lease live.
+///
+/// The TTL is measured against **wall clock**, not a monotonic clock:
+/// [`TaskStore::acquire_lease`] and [`TaskStore::renew_lease`] compare
+/// `expires_at` with `chrono::Utc::now().timestamp()`, and the row has to mean
+/// the same thing to another process, so there is no monotonic clock to share.
+/// Consequences of a clock step:
+///
+/// * **forward** (an NTP correction, resuming from suspend) makes the lease
+///   look expired before this run has really spent `LEASE_TTL_SECS` working, so
+///   another owner can take the task over while this run is still going. This
+///   run notices at its next heartbeat tick and aborts — see
+///   [`SupervisorError::LeaseLost`] for how long that overlap can last.
+/// * **backward** keeps the row alive past the TTL, so a task abandoned by a
+///   crashed process can stay refused for longer than `LEASE_TTL_SECS`.
+///
+/// Neither can make two owners hold the row at once: the row is one SQLite
+/// value and every takeover is a conditional `UPDATE` on it.
+///
+/// A third way the lease can lapse, and the one nothing here can detect: the
+/// heartbeat is an ordinary tokio task, so **starvation** — a blocking call
+/// that stalls every runtime worker it is scheduled on (a synchronous SQLite
+/// call, a long CPU-bound stretch in a backend) — stops the renewals too. The
+/// row then expires with no signal at all, and this run neither aborts nor
+/// notices unless a worker frees up and the heartbeat ticks again.
+const LEASE_TTL_SECS: i64 = 300;
+
+/// Backoff between renew attempts after a transient store error: one initial
+/// attempt plus three retries, so a brief SQLite write-lock is not read as a
+/// lost lease.
+///
+/// The sleeps total 700 ms, but that is **not** the worst case: each of the
+/// four attempts can block for up to ~5 s inside SQLite's busy handler
+/// (rusqlite installs a 5 s `busy_timeout` on every connection it opens — see
+/// [`crate::memory::MemoryStore::open`]), so a fully saturated write lock costs
+/// ~**20.7 s** before loss is declared. That is still more than an order of
+/// magnitude below the 300 s TTL, so retrying cannot itself cost the lease.
+const LEASE_RENEW_BACKOFFS: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(400),
+];
+
+/// Why the heartbeat stopped renewing the lease.
+///
+/// Kept apart so the log line says which of the two happened: the store
+/// answering `false` (another owner) is a normal takeover, while a store that
+/// could not be asked at all is an operational fault. The distinction is *not*
+/// carried in the error type — both abort the run as
+/// [`SupervisorError::LeaseLost`], because from this run's point of view the
+/// lease is equally unproven either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseLossReason {
+    /// The store answered `false`: the row is gone or belongs to another owner.
+    TakenOver,
+    /// The store could not be reached again after every retry, so the lease's
+    /// state is unknown and must be assumed lost.
+    StoreUnavailable,
+}
+
+impl LeaseLossReason {
+    /// A short, log-safe description. Deliberately mentions neither the owner
+    /// id nor the underlying store error.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TakenOver => "another owner holds the lease",
+            Self::StoreUnavailable => "the lease store could not be reached after every retry",
+        }
+    }
+}
+
+/// Resolve when the lease is lost: either the heartbeat signalled it, or the
+/// heartbeat is gone and can no longer prove the lease is ours.
+async fn wait_for_lease_loss(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Whether loss has been signalled, reading the value **and** the channel's
+/// state: a heartbeat that is gone — returned, aborted or panicked — can no
+/// longer prove the lease is ours, so its disappearance is itself a loss.
+///
+/// Reading the channel state is the whole point. The heartbeat owns the only
+/// [`watch::Sender`]; if anything else held one, a panicked heartbeat would
+/// leave the channel open and this would answer `false` forever.
+fn loss_signalled(rx: &watch::Receiver<bool>) -> bool {
+    *rx.borrow() || rx.has_changed().is_err()
+}
+
+/// Renew the lease once, retrying a transient store error with bounded backoff.
+///
+/// `Ok(())` means the lease is renewed. A `false` from the store is an *answer*
+/// — another owner holds the lease — and becomes
+/// [`LeaseLossReason::TakenOver`] without retrying; only a *persistent* `Err`,
+/// where the store could not be asked again after every backoff, becomes
+/// [`LeaseLossReason::StoreUnavailable`]. The distinction survives into the log
+/// line, so an operator can tell a normal takeover from a store outage.
+async fn renew_with_retry<R, F>(mut renew: R) -> std::result::Result<(), LeaseLossReason>
+where
+    R: FnMut() -> F,
+    F: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut backoffs = LEASE_RENEW_BACKOFFS.iter();
+    loop {
+        match renew().await {
+            Ok(true) => return Ok(()),
+            Ok(false) => return Err(LeaseLossReason::TakenOver),
+            Err(_) => match backoffs.next() {
+                Some(backoff) => tokio::time::sleep(*backoff).await,
+                None => return Err(LeaseLossReason::StoreUnavailable),
+            },
+        }
+    }
+}
+
+/// Renew the lease until it is lost, then signal the loss on `tx`.
+///
+/// This loop never exits silently. It either signals loss or is aborted by
+/// [`LeaseGuard::release`]; a loop that gave up without signalling would leave
+/// `execute_now` running a plan for a task another owner now holds. Returning
+/// also drops `tx`, the **only** sender, which [`loss_signalled`] reads as a
+/// loss — so even a panic in here is not silent.
+///
+/// Only the task id is logged: never the owner id, which is a capability for
+/// this task's lease.
+async fn heartbeat_loop<R, F>(
+    task_id: &str,
+    mut renew: R,
+    interval: std::time::Duration,
+    tx: watch::Sender<bool>,
+) where
+    R: FnMut() -> F,
+    F: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await; // the first tick completes immediately
+    loop {
+        tick.tick().await;
+        if let Err(reason) = renew_with_retry(&mut renew).await {
+            tracing::warn!(
+                task_id,
+                reason = reason.as_str(),
+                "execution lease lost; signalling the run to abort"
+            );
+            let _ = tx.send(true);
+            return;
+        }
+    }
+}
+
+/// Run `pipeline` to completion, or abandon it the moment the lease is lost.
+///
+/// Taking the pipeline **by value** is the point: the select stops polling it
+/// and the future is then dropped, which is the abort. The process-spawning
+/// backends hold their in-flight subprocess with `kill_on_drop(true)` (see
+/// [`crate::supervisor::backend::run_cli_process`] and
+/// [`crate::supervisor::backend::shell::ShellBackend`]), so dropping the
+/// pipeline kills those children.
+///
+/// That reach is narrower than "the run stops", and the difference matters:
+/// `kill_on_drop` sends `SIGKILL` to the **direct** child only, so a backgrounded
+/// grandchild of a compound `sh -c` command can survive as an orphan, and
+/// [`crate::supervisor::backend::mcp::McpBackend`] has neither a timeout nor
+/// cancellation — an in-flight MCP tool call is **abandoned**, not stopped,
+/// and may still complete on the server after this run has been aborted. The
+/// reasoning backends are bounded by the pipeline future itself.
+///
+/// This is a **best-effort, bounded** abort, not an instant one, and it rolls
+/// nothing back: see [`SupervisorError::LeaseLost`] for the overlap window and
+/// for what a lost lease does *not* undo.
+///
+/// The caller must not write any further state on the lease-lost path — another
+/// owner may hold the task by then.
+async fn run_until_lease_loss<T>(
+    pipeline: impl std::future::Future<Output = anyhow::Result<T>>,
+    lost: &mut watch::Receiver<bool>,
+    task_id: &str,
+) -> anyhow::Result<T> {
+    tokio::pin!(pipeline);
+    tokio::select! {
+        biased;
+        _ = wait_for_lease_loss(lost) => {
+            tracing::warn!(
+                task_id,
+                "aborting the run: the execution lease is no longer ours"
+            );
+            Err(SupervisorError::lease_lost(task_id))
+        }
+        res = &mut pipeline => res,
+    }
+}
+
+/// The execution lease for one `execute_now`, held for the whole run.
+///
+/// [`Self::release`] is the release path and `execute_now` awaits it on every
+/// path; `Drop` is the fallback, and it covers two different situations — see
+/// [`Self::release_attempted`].
+struct LeaseGuard {
+    store: TaskStore,
+    task_id: String,
+    owner_id: String,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// [`Self::release`] reached a decision: the lease was removed, or was
+    /// already gone. `Drop` then has nothing left to do.
+    released: bool,
+    /// [`Self::release`] ran at all. `released == false` has two causes — the
+    /// `execute_now` future was dropped mid-run (cancelled), or `release` ran
+    /// and its store call failed — and `Drop` has to tell them apart to log
+    /// honestly: it is only a *cancelled* run that gets the cancelled-run
+    /// wording. Both cases still get the best-effort second release below.
+    release_attempted: bool,
+    /// The **receiving** half of the heartbeat's channel.
+    ///
+    /// The guard deliberately holds no [`watch::Sender`]: the heartbeat task
+    /// owns the only one, so a heartbeat that returns, is aborted or panics
+    /// closes the channel, and [`loss_signalled`] reads that as a lost lease. A
+    /// second sender here would keep the channel open and turn a panicked
+    /// heartbeat into a run that continues unrenewed until the lease silently
+    /// expires — the hole this shape closes.
+    lost: watch::Receiver<bool>,
+}
+
+impl LeaseGuard {
+    /// Stop the heartbeat, then remove the lease, and report whether this run
+    /// still owned it.
+    ///
+    /// The loss state is read **before** the heartbeat is aborted, and the
+    /// order matters: aborting drops the heartbeat's sender, which closes the
+    /// channel, and a closed channel is indistinguishable from a signalled
+    /// loss. Reading afterwards would report every release as a loss.
+    ///
+    /// The heartbeat is aborted and awaited *first*: a renewal in flight could
+    /// otherwise write after the release, and a renewal that answers `false`
+    /// after this run decided it had succeeded would be lost.
+    async fn release(mut self) -> anyhow::Result<()> {
+        self.release_attempted = true;
+        let was_lost = loss_signalled(&self.lost);
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+            if let Err(error) = handle.await {
+                // A cancelled join is this `abort()` doing its job. Anything
+                // else is the heartbeat dying on its own — a panic — which the
+                // run has to know about rather than swallow with `let _ =`.
+                if !error.is_cancelled() {
+                    let panic = error.into_panic();
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    tracing::warn!(
+                        task_id = %self.task_id,
+                        panic = message,
+                        "execution-lease heartbeat task died; its lease state is unknown"
+                    );
+                }
+            }
+        }
+        match self
+            .store
+            .release_lease(&self.task_id, &self.owner_id)
+            .await
+        {
+            Ok(removed) => {
+                self.released = true;
+                if removed || was_lost {
+                    // `Ok(false)` after a signalled loss is the takeover this
+                    // run already reported as `SupervisorError::LeaseLost`;
+                    // a second error here would only bury that one.
+                    tracing::debug!(
+                        task_id = %self.task_id,
+                        removed,
+                        lost = was_lost,
+                        "execution lease released"
+                    );
+                    Ok(())
+                } else {
+                    // Nothing was signalled, yet the lease was not ours to
+                    // remove: another owner took it over while we ran. This is
+                    // typed so the dashboard answers 409 rather than 500.
+                    tracing::warn!(
+                        task_id = %self.task_id,
+                        "execution lease was already gone at release; another owner holds the task"
+                    );
+                    Err(SupervisorError::lease_lost(&self.task_id))
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %self.task_id,
+                    "failed to release the execution lease: {error}"
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+        if self.released {
+            return;
+        }
+        // Two ways to arrive here, and the log line has to say which:
+        //
+        // * `release_attempted == false` — the `execute_now` future was dropped
+        //   mid-run (a cancelled request), so cleanup cannot be awaited;
+        // * `release_attempted == true` — `release` ran and its store call
+        //   failed, leaving `released` false.
+        //
+        // The second attempt below is **intentional** in both cases, not an
+        // oversight: a transient store error on the first release must not
+        // leave the row behind, because a stale row refuses the task until its
+        // TTL elapses. It is safe to retry precisely because the release is
+        // owner-checked *and* the owner id is minted per run (see
+        // [`new_lease_owner_id`]) — a late detached release can only ever match
+        // the run it came from, never a later run's live lease.
+        //
+        // Best effort: one detached release, and nothing at all when there is
+        // no runtime to run it on — `Handle::try_current` rather than
+        // `Handle::current`, which would panic in `Drop`.
+        let cancelled = !self.release_attempted;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.store.clone();
+        let task = self.task_id.clone();
+        let owner = self.owner_id.clone();
+        handle.spawn(async move {
+            let run = if cancelled { "cancelled" } else { "finished" };
+            match store.release_lease(&task, &owner).await {
+                Ok(true) => tracing::debug!(
+                    task_id = %task,
+                    run,
+                    "execution lease released on the fallback path"
+                ),
+                Ok(false) => tracing::warn!(
+                    task_id = %task,
+                    run,
+                    "the execution lease was already gone at the fallback release"
+                ),
+                Err(error) => tracing::warn!(
+                    task_id = %task,
+                    run,
+                    "failed to release the execution lease on the fallback path: {error}"
+                ),
+            }
+        });
+    }
+}
+
+/// A fresh execution-lease owner id, for one `execute_now` run.
+///
+/// Minted per **run**, not per [`Supervisor`]. The lease operations are
+/// owner-checked and nothing else: if two runs of the same task in one process
+/// shared an owner id, a detached release left behind by a cancelled run could
+/// delete a *later* run's live lease for the same task — the later run would
+/// keep working while another process was free to take the task over. A
+/// per-run id makes that impossible: the stale release can only ever match the
+/// run it belongs to, which is by then gone.
+///
+/// The `pid-` prefix is for an operator reading the row by hand; the uuid is
+/// what makes it unique. Never logged — it is a capability for that task's
+/// lease.
+fn new_lease_owner_id() -> String {
+    format!("pid-{}-{}", std::process::id(), uuid::Uuid::new_v4())
 }
 
 pub enum SubmitOutcome {
@@ -236,22 +662,62 @@ impl Supervisor {
     /// method's first transition is `task.status -> Plan`. `Intake` and
     /// `Classify` are **not** among them (`Intake -> Plan` is not an edge), and
     /// neither is `PrepareWorkspace`; a task in one of those states is refused
-    /// with [`SupervisorError::StateRefusal`] before anything is written. An
-    /// earlier version had no such guard, so `execute_now` on an `Intake` task
-    /// panicked through `record_transition`'s `debug_assert!` in debug builds
-    /// and wrote an illegal `state` in release. The four dashboard routes
-    /// cannot reach it (they pre-check), but this is a public method and an
-    /// unstated precondition is a bug waiting for its second caller.
+    /// with [`SupervisorError::StateRefusal`]. That refusal is raised inside the
+    /// pipeline, so by the time it is returned the execution lease below has
+    /// already been taken and given back; what it still guarantees is that no
+    /// plan, job, artifact or audit row is written. An earlier version had no
+    /// such guard, so `execute_now` on an `Intake` task panicked through
+    /// `record_transition`'s `debug_assert!` in debug builds and wrote an
+    /// illegal `state` in release. The four dashboard routes cannot reach it
+    /// (they pre-check), but this is a public method and an unstated
+    /// precondition is a bug waiting for its second caller.
     ///
-    /// # One run per task at a time
+    /// # One run per task at a time — in this process and across processes
     ///
-    /// A second `execute_now` for a task that is already running is refused
-    /// with [`SupervisorError::AlreadyRunning`]. The compare-and-swap in
-    /// [`TaskStore::record_transition`] is not enough on its own: two calls on
-    /// a task that is already in `Execute` both ask for `Execute -> Plan`,
-    /// which *is* a legal edge, so both would be accepted and both would run
-    /// the plan — duplicate jobs, duplicate artifact writes and a duplicated
-    /// audit trail.
+    /// Two guards, in this order, and both refuse with
+    /// [`SupervisorError::AlreadyRunning`]:
+    ///
+    /// 1. a process-local in-flight set ([`InFlight`]), which catches a second
+    ///    `execute_now` for the same task on this `Supervisor`;
+    /// 2. a **persistent execution lease** — one row in `sup_execution_leases`,
+    ///    claimed through [`TaskStore::acquire_lease`] with a
+    ///    [`LEASE_TTL_SECS`] TTL and renewed by a background heartbeat every
+    ///    [`LEASE_HEARTBEAT_INTERVAL`] until the run ends. The row lives in the
+    ///    shared database, so this is what makes "one run per task" hold across
+    ///    **processes** (a second bot, a second dashboard, a CLI run against the
+    ///    same `haos-green.db`), not just across calls in this one. A refused
+    ///    claim is logged at `warn!`.
+    ///
+    /// The compare-and-swap in [`TaskStore::record_transition`] is not enough
+    /// on its own: two calls on a task that is already in `Execute` both ask
+    /// for `Execute -> Plan`, which *is* a legal edge, so both would be
+    /// accepted and both would run the plan — duplicate jobs, duplicate
+    /// artifact writes and a duplicated audit trail.
+    ///
+    /// Because the lease is persistent, `AlreadyRunning` has a third meaning
+    /// beyond "a run is live in this process" and "another process is running
+    /// it": a **stale row left by a crashed process** refuses the task until
+    /// its TTL elapses, i.e. for up to [`LEASE_TTL_SECS`] (300 s) after the
+    /// crash. There is no liveness probe, no resumption and no operator
+    /// override — waiting out the TTL is the recovery path.
+    ///
+    /// # Lease loss
+    ///
+    /// The lease is a TTL lease, so it can be taken over underneath this run.
+    /// When the heartbeat notices — the row is gone, or the store cannot be
+    /// reached even after its retries — the run is aborted with
+    /// [`SupervisorError::LeaseLost`] and the in-flight pipeline is dropped.
+    /// That kills the direct subprocess of each process-spawning backend
+    /// (`kill_on_drop`), but it is not a general stop: see
+    /// [`run_until_lease_loss`] for what survives it. Read
+    /// [`SupervisorError::LeaseLost`] before treating that as a clean stop: the
+    /// abort is detected at the next heartbeat tick, so a bounded overlap with
+    /// the new owner is possible and committed side effects are not rolled
+    /// back.
+    ///
+    /// The lease row is released on every path: normally, on error, and — best
+    /// effort, through [`LeaseGuard`]'s `Drop` — when this future is dropped
+    /// mid-run by a cancelled request.
     pub async fn execute_now(&self, task_id: &str) -> anyhow::Result<String> {
         // Held for the whole run and released on drop, including when this
         // future is cancelled.
@@ -259,195 +725,280 @@ impl Supervisor {
             .in_flight
             .enter(task_id)
             .ok_or_else(|| SupervisorError::already_running(task_id))?;
-
-        let task = self
+        // One owner id for this run only — its acquire, its heartbeat's
+        // renewals and its release all use this value. See
+        // [`new_lease_owner_id`].
+        let lease_owner = new_lease_owner_id();
+        if !self
             .store
-            .get(task_id)
+            .acquire_lease(task_id, &lease_owner, LEASE_TTL_SECS)
             .await?
-            .ok_or_else(|| SupervisorError::not_found(task_id))?;
-
-        // PLAN — transition from the task's actual persisted status so that
-        // resumed/mid-pipeline tasks produce a correct audit trail.
-        if !crate::supervisor::state::transition_allowed(task.status.clone(), TaskStatus::Plan) {
-            return Err(SupervisorError::state_refusal(
-                task.status,
-                TaskStatus::Plan,
-            ));
+        {
+            // Two meanings, and the log line deliberately cannot tell them
+            // apart: another process holds a live lease, or a crashed process
+            // left a row that has not expired yet. Either way the task is
+            // refused until `LEASE_TTL_SECS` past the last renewal. The owner
+            // id is never logged.
+            tracing::warn!(
+                task_id,
+                ttl_secs = LEASE_TTL_SECS,
+                "refusing to run: an execution lease is already held for this task"
+            );
+            return Err(SupervisorError::already_running(task_id));
         }
-        self.store
-            .record_transition(
-                task_id,
-                task.status.clone(),
-                TaskStatus::Plan,
-                "supervisor",
-                None,
-            )
-            .await?;
-        let plan = Planner::new().plan(&task);
-        // Track the IDs of jobs planned for this execution so that, on resume,
-        // orphan rows from a previous aborted run are excluded from verification.
-        let current_job_ids: std::collections::HashSet<String> =
-            plan.jobs.iter().map(|j| j.id.clone()).collect();
-        self.artifacts
-            .write_text(
-                task_id,
-                None,
-                "plan",
-                "plan.json",
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "jobs": plan.jobs.iter().map(|j| serde_json::json!({
-                        "type": j.job_type, "backend": j.backend, "goal": j.goal,
-                    })).collect::<Vec<_>>()
-                }))?,
-            )
-            .await?;
-
-        // PREPARE_WORKSPACE (only for code-modifying tasks when configured)
-        let needs_ws = matches!(
-            task.task_type,
-            crate::supervisor::task::TaskType::CodeChange
-                | crate::supervisor::task::TaskType::BugFix
-                | crate::supervisor::task::TaskType::Refactor
+        tracing::debug!(
+            task_id,
+            ttl_secs = LEASE_TTL_SECS,
+            "execution lease acquired"
         );
-        let workspace_active = needs_ws && self.workspace_mgr.is_some();
-        if workspace_active {
-            if let Some(wm) = &self.workspace_mgr {
+        let heartbeat_store = self.store.clone();
+        let heartbeat_task = task_id.to_string();
+        let heartbeat_label = heartbeat_task.clone();
+        let heartbeat_owner = lease_owner.clone();
+        // The heartbeat task owns the **only** sender. The guard keeps the
+        // receiver, so the heartbeat's death — return, abort or panic — closes
+        // the channel and reads as a lost lease.
+        let (lost_tx, lost_rx) = watch::channel(false);
+        let heartbeat = tokio::spawn(async move {
+            heartbeat_loop(
+                &heartbeat_label,
+                move || {
+                    let store = heartbeat_store.clone();
+                    let task = heartbeat_task.clone();
+                    let owner = heartbeat_owner.clone();
+                    async move { store.renew_lease(&task, &owner, LEASE_TTL_SECS).await }
+                },
+                LEASE_HEARTBEAT_INTERVAL,
+                lost_tx,
+            )
+            .await;
+        });
+        let mut lease_guard = LeaseGuard {
+            store: self.store.clone(),
+            task_id: task_id.to_string(),
+            owner_id: lease_owner,
+            heartbeat: Some(heartbeat),
+            released: false,
+            release_attempted: false,
+            lost: lost_rx,
+        };
+
+        let result = run_until_lease_loss(
+            async {
+                let task = self
+                    .store
+                    .get(task_id)
+                    .await?
+                    .ok_or_else(|| SupervisorError::not_found(task_id))?;
+
+                // PLAN — transition from the task's actual persisted status so that
+                // resumed/mid-pipeline tasks produce a correct audit trail.
+                if !crate::supervisor::state::transition_allowed(
+                    task.status.clone(),
+                    TaskStatus::Plan,
+                ) {
+                    return Err(SupervisorError::state_refusal(
+                        task.status,
+                        TaskStatus::Plan,
+                    ));
+                }
                 self.store
                     .record_transition(
                         task_id,
+                        task.status.clone(),
                         TaskStatus::Plan,
-                        TaskStatus::PrepareWorkspace,
                         "supervisor",
                         None,
                     )
                     .await?;
-                let ws = wm.prepare(task_id, &task.title).await?;
+                let plan = Planner::new().plan(&task);
+                // Track the IDs of jobs planned for this execution so that, on resume,
+                // orphan rows from a previous aborted run are excluded from verification.
+                let current_job_ids: std::collections::HashSet<String> =
+                    plan.jobs.iter().map(|j| j.id.clone()).collect();
                 self.artifacts
                     .write_text(
                         task_id,
                         None,
-                        "workspace",
-                        "workspace.json",
+                        "plan",
+                        "plan.json",
                         &serde_json::to_string_pretty(&serde_json::json!({
-                            "branch": ws.branch,
-                            "path": ws.path.display().to_string(),
+                            "jobs": plan.jobs.iter().map(|j| serde_json::json!({
+                                "type": j.job_type, "backend": j.backend, "goal": j.goal,
+                            })).collect::<Vec<_>>()
                         }))?,
                     )
                     .await?;
-            }
-        }
 
-        // EXECUTE
-        let pre_execute_state = if workspace_active {
-            TaskStatus::PrepareWorkspace
-        } else {
-            TaskStatus::Plan
-        };
-        self.store
-            .record_transition(
-                task_id,
-                pre_execute_state,
-                TaskStatus::Execute,
-                "supervisor",
-                None,
-            )
-            .await?;
-        let orch = Orchestrator::new(self.registry.clone(), self.store.clone());
-        let res = orch.execute_plan(&task, plan).await?;
-        // Only verify jobs from the current execution cycle (not orphans from prior runs).
-        let all_jobs = self.store.jobs_for_task(task_id).await?;
-        let jobs: Vec<_> = all_jobs
-            .into_iter()
-            .filter(|j| current_job_ids.contains(&j.id))
-            .collect();
+                // PREPARE_WORKSPACE (only for code-modifying tasks when configured)
+                let needs_ws = matches!(
+                    task.task_type,
+                    crate::supervisor::task::TaskType::CodeChange
+                        | crate::supervisor::task::TaskType::BugFix
+                        | crate::supervisor::task::TaskType::Refactor
+                );
+                let workspace_active = needs_ws && self.workspace_mgr.is_some();
+                if workspace_active {
+                    if let Some(wm) = &self.workspace_mgr {
+                        self.store
+                            .record_transition(
+                                task_id,
+                                TaskStatus::Plan,
+                                TaskStatus::PrepareWorkspace,
+                                "supervisor",
+                                None,
+                            )
+                            .await?;
+                        let ws = wm.prepare(task_id, &task.title).await?;
+                        self.artifacts
+                            .write_text(
+                                task_id,
+                                None,
+                                "workspace",
+                                "workspace.json",
+                                &serde_json::to_string_pretty(&serde_json::json!({
+                                    "branch": ws.branch,
+                                    "path": ws.path.display().to_string(),
+                                }))?,
+                            )
+                            .await?;
+                    }
+                }
 
-        // VERIFY
-        // M3: regardless of orchestrator outcome we transition Execute->Verify
-        // and let VerificationEngine produce the final pass/fail.
-        let _ = res;
-        if matches!(
-            task.execution_mode,
-            crate::supervisor::task::ExecutionMode::Rigorous
-        ) {
-            self.store
-                .record_transition(
-                    task_id,
-                    TaskStatus::Execute,
-                    TaskStatus::Review,
-                    "supervisor",
-                    None,
-                )
-                .await?;
-            self.store
-                .record_transition(
-                    task_id,
-                    TaskStatus::Review,
-                    TaskStatus::Verify,
-                    "supervisor",
-                    None,
-                )
-                .await?;
-        } else {
-            self.store
-                .record_transition(
-                    task_id,
-                    TaskStatus::Execute,
-                    TaskStatus::Verify,
-                    "supervisor",
-                    None,
-                )
-                .await?;
-        }
-        let v = VerificationEngine.verify(&jobs);
-
-        // REPORT + ARCHIVE
-        let report = Reporter::render(&jobs);
-        self.artifacts
-            .write_text(task_id, None, "result", "report.md", &report)
-            .await?;
-        match v {
-            VerificationOutcome::Passed => {
+                // EXECUTE
+                let pre_execute_state = if workspace_active {
+                    TaskStatus::PrepareWorkspace
+                } else {
+                    TaskStatus::Plan
+                };
                 self.store
                     .record_transition(
                         task_id,
-                        TaskStatus::Verify,
-                        TaskStatus::Report,
+                        pre_execute_state,
+                        TaskStatus::Execute,
                         "supervisor",
                         None,
                     )
                     .await?;
-                self.store
-                    .record_transition(
-                        task_id,
-                        TaskStatus::Report,
-                        TaskStatus::Archive,
-                        "supervisor",
-                        None,
-                    )
+                let orch = Orchestrator::new(self.registry.clone(), self.store.clone());
+                let res = orch.execute_plan(&task, plan).await?;
+                // Only verify jobs from the current execution cycle (not orphans from prior runs).
+                let all_jobs = self.store.jobs_for_task(task_id).await?;
+                let jobs: Vec<_> = all_jobs
+                    .into_iter()
+                    .filter(|j| current_job_ids.contains(&j.id))
+                    .collect();
+
+                // VERIFY
+                // M3: regardless of orchestrator outcome we transition Execute->Verify
+                // and let VerificationEngine produce the final pass/fail.
+                let _ = res;
+                if matches!(
+                    task.execution_mode,
+                    crate::supervisor::task::ExecutionMode::Rigorous
+                ) {
+                    self.store
+                        .record_transition(
+                            task_id,
+                            TaskStatus::Execute,
+                            TaskStatus::Review,
+                            "supervisor",
+                            None,
+                        )
+                        .await?;
+                    self.store
+                        .record_transition(
+                            task_id,
+                            TaskStatus::Review,
+                            TaskStatus::Verify,
+                            "supervisor",
+                            None,
+                        )
+                        .await?;
+                } else {
+                    self.store
+                        .record_transition(
+                            task_id,
+                            TaskStatus::Execute,
+                            TaskStatus::Verify,
+                            "supervisor",
+                            None,
+                        )
+                        .await?;
+                }
+                let v = VerificationEngine.verify(&jobs);
+
+                // REPORT + ARCHIVE
+                let report = Reporter::render(&jobs);
+                self.artifacts
+                    .write_text(task_id, None, "result", "report.md", &report)
                     .await?;
-                self.store
-                    .record_transition(
-                        task_id,
-                        TaskStatus::Archive,
-                        TaskStatus::Done,
-                        "supervisor",
-                        None,
-                    )
-                    .await?;
-                Ok(report)
-            }
-            VerificationOutcome::Failed(reason) => {
-                self.store
-                    .record_transition(
-                        task_id,
-                        TaskStatus::Verify,
-                        TaskStatus::Failed,
-                        "verifier",
-                        Some(&reason),
-                    )
-                    .await?;
-                Ok(format!("VERIFICATION FAILED: {reason}\n\n{report}"))
-            }
+                match v {
+                    VerificationOutcome::Passed => {
+                        self.store
+                            .record_transition(
+                                task_id,
+                                TaskStatus::Verify,
+                                TaskStatus::Report,
+                                "supervisor",
+                                None,
+                            )
+                            .await?;
+                        self.store
+                            .record_transition(
+                                task_id,
+                                TaskStatus::Report,
+                                TaskStatus::Archive,
+                                "supervisor",
+                                None,
+                            )
+                            .await?;
+                        self.store
+                            .record_transition(
+                                task_id,
+                                TaskStatus::Archive,
+                                TaskStatus::Done,
+                                "supervisor",
+                                None,
+                            )
+                            .await?;
+                        Ok(report)
+                    }
+                    VerificationOutcome::Failed(reason) => {
+                        self.store
+                            .record_transition(
+                                task_id,
+                                TaskStatus::Verify,
+                                TaskStatus::Failed,
+                                "verifier",
+                                Some(&reason),
+                            )
+                            .await?;
+                        Ok(format!("VERIFICATION FAILED: {reason}\n\n{report}"))
+                    }
+                }
+            },
+            &mut lease_guard.lost,
+            task_id,
+        )
+        .await;
+        let release_result = lease_guard.release().await;
+        match (result, release_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            // The pipeline succeeded but the lease could not be given back.
+            // Deliberately still an error, and not a `warn!` over a success
+            // return: a run that cannot prove it released its lease may still
+            // hold the task's only claim on it, and reporting a clean success
+            // would invite a caller to re-run a task that is not free. The
+            // pipeline's own work is not undone — the artifacts, job rows and
+            // audit transitions it committed stay committed, exactly as on the
+            // lease-lost path (see [`SupervisorError::LeaseLost`]); what the
+            // caller loses is the success *report*, not the side effects.
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(release_error)) => Err(error.context(format!(
+                "failed to release execution lease: {release_error}"
+            ))),
         }
     }
 
@@ -744,6 +1295,8 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::supervisor::task::{Task, TaskStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// Supervisor whose policy escalates a Medium-risk task to `RequireApproval`,
     /// so `submit` really parks the task in `Route` (the only way to get there
@@ -769,6 +1322,21 @@ mod tests {
         let mut sup = Supervisor::new_for_test(dir.to_path_buf(), memory.connection());
         sup.register_test_reasoning_backend(|p| async move { Ok(format!("ran:{p}")) });
         sup
+    }
+
+    /// The `owner_id` of the live execution-lease row for `task_id`, or `None`
+    /// when there is no row. Read straight from the connection: the owner id is
+    /// never logged and never returned by the lease API, so the row is the only
+    /// place it can be observed.
+    async fn lease_owner(memory: &crate::memory::MemoryStore, task_id: &str) -> Option<String> {
+        let conn = memory.connection();
+        let conn = conn.lock().await;
+        conn.query_row(
+            "SELECT owner_id FROM sup_execution_leases WHERE task_id=?1",
+            [task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
     }
 
     #[tokio::test]
@@ -1323,5 +1891,604 @@ mod tests {
             ),
             "the guard must have been released: {error:?}"
         );
+    }
+
+    /// Lease loss must win against a pipeline that never finishes, and the
+    /// abandoned pipeline must be **dropped** — that drop is the abort, because
+    /// every backend holds its in-flight subprocess with `kill_on_drop(true)`.
+    #[tokio::test]
+    async fn lease_loss_aborts_a_hanging_pipeline_and_drops_it() {
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        // The pipeline owns one reference; the test holds the other. The count
+        // is 2 while the pipeline is alive and 1 once it has been dropped.
+        let owned = Arc::new(());
+        let pipeline_owns = Arc::clone(&owned);
+        let pipeline = async move {
+            let _keep = pipeline_owns;
+            std::future::pending::<()>().await;
+            Ok::<String, anyhow::Error>(String::new())
+        };
+
+        lost_tx.send(true).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_until_lease_loss(pipeline, &mut lost_rx, "task-1"),
+        )
+        .await
+        .expect("lease loss must abort the pipeline, not wait for it to finish");
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::LeaseLost { task_id }) if task_id == "task-1"
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            Arc::strong_count(&owned),
+            1,
+            "the abandoned pipeline must be dropped, not left running"
+        );
+    }
+
+    /// A heartbeat that died — dropped, aborted or panicked — can no longer
+    /// prove the lease is ours, so the wait must end rather than hang forever.
+    #[tokio::test]
+    async fn a_dropped_heartbeat_is_treated_as_lease_loss() {
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        drop(lost_tx);
+
+        tokio::time::timeout(Duration::from_secs(2), wait_for_lease_loss(&mut lost_rx))
+            .await
+            .expect("a dropped sender must end the wait");
+        assert!(loss_signalled(&lost_rx));
+    }
+
+    /// The heartbeat-panic hole, pinned end to end through the guard.
+    ///
+    /// The guard holds only a `watch::Receiver`, so the heartbeat task owning
+    /// the only sender means a panic closes the channel and both loss readers
+    /// see it. Had the guard kept a second `Sender` — which is what the first
+    /// version did — the channel would stay open, `wait_for_lease_loss` would
+    /// never fire, and `execute_now` would keep running a plan for a task it no
+    /// longer holds until the lease silently expired.
+    #[tokio::test]
+    async fn a_panicking_heartbeat_is_treated_as_lease_loss() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task-1", "owner-a", 60).await.unwrap());
+
+        let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let heartbeat = tokio::spawn(async move {
+            // The heartbeat owns the only sender; panicking drops it.
+            let _only_sender = lost_tx;
+            panic!("the heartbeat task died");
+        });
+        let mut guard = LeaseGuard {
+            store: store.clone(),
+            task_id: "task-1".to_string(),
+            owner_id: "owner-a".to_string(),
+            heartbeat: Some(heartbeat),
+            released: false,
+            release_attempted: false,
+            lost: lost_rx,
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), wait_for_lease_loss(&mut guard.lost))
+            .await
+            .expect("a panicked heartbeat must be read as a lost lease, not as a live one");
+        assert!(loss_signalled(&guard.lost));
+
+        // What this test asserts: `release` still succeeds — a dead heartbeat
+        // must not be turned into a release error — and the (still ours) row is
+        // handed back. The panic itself is *logged* by `release` at `warn!`
+        // (`execution-lease heartbeat task died`), not asserted here: catching a
+        // tracing event would need a subscriber of its own, and the claim that
+        // mattered — a panicked heartbeat reads as a loss — is asserted above.
+        guard.release().await.unwrap();
+        assert!(
+            store.acquire_lease("task-1", "owner-b", 60).await.unwrap(),
+            "the lease must be free after a release that survived a dead heartbeat"
+        );
+    }
+
+    /// `release` reads the loss state *before* aborting the heartbeat. Reading
+    /// it afterwards would see the channel the abort just closed and call every
+    /// ordinary release a loss — so the takeover below must still be reported.
+    #[tokio::test]
+    async fn release_after_a_takeover_reports_the_loss_and_leaves_the_new_lease() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task-1", "owner-a", 60).await.unwrap());
+
+        // Owner A's lease expires, and owner B takes the task over.
+        {
+            let conn = memory.connection();
+            let conn = conn.lock().await;
+            conn.execute("UPDATE sup_execution_leases SET expires_at=0", [])
+                .unwrap();
+        }
+        assert!(store.acquire_lease("task-1", "owner-b", 60).await.unwrap());
+
+        // A real heartbeat, so `release` really does abort something: aborting
+        // closes the channel, which is exactly the reading this test pins.
+        let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let heartbeat = tokio::spawn(async move {
+            let _only_sender = lost_tx;
+            std::future::pending::<()>().await;
+        });
+        let guard = LeaseGuard {
+            store: store.clone(),
+            task_id: "task-1".to_string(),
+            owner_id: "owner-a".to_string(),
+            heartbeat: Some(heartbeat),
+            released: false,
+            release_attempted: false,
+            lost: lost_rx,
+        };
+
+        let error = guard.release().await.unwrap_err();
+        // Typed, not a bare `anyhow::bail!`: the dashboard turns this into a
+        // 409 by downcasting, and an untyped error would be answered as a 500.
+        assert!(
+            matches!(
+                error.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::LeaseLost { task_id }) if task_id == "task-1"
+            ),
+            "the loss must carry the typed error: {error:?}"
+        );
+        assert!(error.to_string().contains("task-1"), "{error}");
+        assert!(
+            store.renew_lease("task-1", "owner-b", 60).await.unwrap(),
+            "the new owner's lease must survive the old owner's release"
+        );
+    }
+
+    /// The ordinary path: the lease is still ours, so release removes it and
+    /// says nothing.
+    #[tokio::test]
+    async fn release_removes_a_lease_this_run_still_owns() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task-1", "owner-a", 60).await.unwrap());
+
+        // The sender stays alive: nothing has been signalled, so `release` has
+        // to decide from the row alone.
+        let (_lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        let guard = LeaseGuard {
+            store: store.clone(),
+            task_id: "task-1".to_string(),
+            owner_id: "owner-a".to_string(),
+            heartbeat: None,
+            released: false,
+            release_attempted: false,
+            lost: lost_rx,
+        };
+        guard.release().await.unwrap();
+
+        assert!(
+            store.acquire_lease("task-1", "owner-b", 60).await.unwrap(),
+            "the lease must be free after a successful release"
+        );
+    }
+
+    /// Once loss has been signalled the pipeline's own error reports it, so
+    /// `release` must stay quiet — but it must still try to remove the row.
+    #[tokio::test]
+    async fn release_after_a_signalled_loss_is_quiet() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task-1", "owner-a", 60).await.unwrap());
+
+        let (lost_tx, lost_rx) = tokio::sync::watch::channel(false);
+        lost_tx.send(true).unwrap();
+        let guard = LeaseGuard {
+            store: store.clone(),
+            task_id: "task-1".to_string(),
+            owner_id: "owner-a".to_string(),
+            heartbeat: None,
+            released: false,
+            release_attempted: false,
+            lost: lost_rx,
+        };
+
+        guard
+            .release()
+            .await
+            .expect("a signalled loss must not be reported twice");
+        assert!(
+            store.acquire_lease("task-1", "owner-b", 60).await.unwrap(),
+            "release must still have removed the row"
+        );
+    }
+
+    /// A transient renewal fault must not be read as a lost lease; a persistent
+    /// one must be, after a bounded number of retries.
+    #[tokio::test]
+    async fn a_transient_renew_fault_is_retried_but_a_persistent_one_declares_loss() {
+        // Transient: the first attempt faults, the next one answers.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let heartbeat = tokio::spawn(heartbeat_loop(
+            "task-1",
+            move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("database is locked")
+                    }
+                    Ok(true)
+                }
+            },
+            Duration::from_millis(10),
+            tx,
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !heartbeat.is_finished(),
+            "a transient fault must not end the heartbeat"
+        );
+        assert!(
+            !*rx.borrow(),
+            "a transient fault must not declare the lease lost"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "the faulted renewal must have been retried"
+        );
+        heartbeat.abort();
+        let _ = heartbeat.await;
+
+        // Persistent: every attempt faults.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            heartbeat_loop(
+                "task-1",
+                move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("database is locked")
+                    }
+                },
+                Duration::from_millis(10),
+                tx,
+            ),
+        )
+        .await
+        .expect("a persistent fault must end the heartbeat by declaring loss");
+        let elapsed = started.elapsed();
+
+        assert!(
+            *rx.borrow(),
+            "a persistent fault must declare the lease lost"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1 + LEASE_RENEW_BACKOFFS.len(),
+            "one attempt, one per backoff, and no more"
+        );
+        assert!(
+            elapsed >= LEASE_RENEW_BACKOFFS.iter().sum::<Duration>(),
+            "the retries must be spaced by the backoff, took only {elapsed:?}"
+        );
+    }
+
+    /// A run that fails must still give the lease back, or no other process
+    /// could ever pick the task up again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_run_releases_the_execution_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().to_path_buf(), memory.connection());
+        sup.register_test_reasoning_backend(|_prompt| async move {
+            anyhow::bail!("the backend refused to run")
+        });
+        let sup = Arc::new(sup);
+
+        let id = sup
+            .submit("web", "u1", None, "summarize the readme")
+            .await
+            .unwrap()
+            .task_id();
+        sup.execute_now(&id).await.unwrap();
+
+        assert!(
+            sup.store()
+                .acquire_lease(&id, "another-process", 60)
+                .await
+                .unwrap(),
+            "the execution lease must be free after the run"
+        );
+    }
+
+    /// `execute_now` must *claim* the persistent lease, not merely consult it.
+    /// The row is pre-held by a foreign owner — which is all this process can
+    /// see of another process — and the run must refuse rather than start.
+    ///
+    /// This is the test the process-local in-flight guard cannot cover: nothing
+    /// is in flight here, so only the lease claim can produce the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn execute_now_refuses_a_task_whose_execution_lease_is_held_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().to_path_buf(), memory.connection());
+        sup.register_test_reasoning_backend(|p| async move { Ok(format!("ran:{p}")) });
+        let sup = Arc::new(sup);
+        let id = sup
+            .submit("web", "u1", None, "summarize the readme")
+            .await
+            .unwrap()
+            .task_id();
+
+        // A live lease owned by somebody else — a second process, from this
+        // one's point of view.
+        assert!(sup
+            .store()
+            .acquire_lease(&id, "another-process", LEASE_TTL_SECS)
+            .await
+            .unwrap());
+
+        let error = sup.execute_now(&id).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::AlreadyRunning { task_id }) if task_id == &id
+            ),
+            "a lease held elsewhere must refuse the run as AlreadyRunning: {error:?}"
+        );
+
+        // The refused run wrote nothing: no plan transition, no jobs.
+        let task = sup.store().get(&id).await.unwrap().unwrap();
+        assert!(
+            !matches!(task.status, TaskStatus::Plan | TaskStatus::Execute),
+            "a refused run must not have planned the task, status is {:?}",
+            task.status
+        );
+        assert!(
+            sup.store().jobs_for_task(&id).await.unwrap().is_empty(),
+            "a refused run must not have dispatched jobs"
+        );
+        // And it did not steal or release the foreign lease.
+        assert!(
+            sup.store()
+                .renew_lease(&id, "another-process", LEASE_TTL_SECS)
+                .await
+                .unwrap(),
+            "the foreign lease must be untouched by the refused run"
+        );
+    }
+
+    /// While a run is in flight, its lease must be visible to a **second store
+    /// over the same database** — that is the whole point of the row existing
+    /// on disk instead of in this process's memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_store_cannot_acquire_the_lease_while_a_run_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().to_path_buf(), memory.connection());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let backend_entered = Arc::clone(&entered);
+        let backend_resume = Arc::clone(&resume);
+        sup.register_test_reasoning_backend(move |_prompt| {
+            let entered = Arc::clone(&backend_entered);
+            let resume = Arc::clone(&backend_resume);
+            async move {
+                entered.notify_one();
+                resume.notified().await;
+                Ok("done".to_string())
+            }
+        });
+        let sup = Arc::new(sup);
+        let id = sup
+            .submit("web", "u1", None, "summarize the readme")
+            .await
+            .unwrap()
+            .task_id();
+
+        let running = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let id = id.clone();
+            async move { sup.execute_now(&id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the run never reached the backend");
+
+        let other = TaskStore::new(memory.connection());
+        assert!(
+            !other
+                .acquire_lease(&id, "another-process", LEASE_TTL_SECS)
+                .await
+                .unwrap(),
+            "an in-flight run's lease must be visible to a second store"
+        );
+        assert!(
+            !other
+                .acquire_lease(&id, "another-process", LEASE_TTL_SECS)
+                .await
+                .unwrap(),
+            "the refusal must be repeatable, not a one-off"
+        );
+
+        resume.notify_one();
+        running.await.unwrap().unwrap();
+
+        assert!(
+            other
+                .acquire_lease(&id, "another-process", LEASE_TTL_SECS)
+                .await
+                .unwrap(),
+            "the lease must be free again once the run has finished"
+        );
+    }
+
+    /// Two runs of the **same task in one process** must not share a lease
+    /// owner id. The lease operations are owner-checked and nothing else, so a
+    /// shared id would let the detached release left behind by a cancelled run
+    /// delete a later run's live lease for that task: the later run would keep
+    /// working while another process was free to take the task over — the
+    /// double execution the lease exists to prevent.
+    ///
+    /// The two owner ids are read from the lease row while each run is in
+    /// flight, which is the only place they are observable — they are never
+    /// logged, and the row is gone once the run releases it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_runs_of_one_task_in_one_process_use_different_lease_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().to_path_buf(), memory.connection());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let backend_entered = Arc::clone(&entered);
+        let backend_resume = Arc::clone(&resume);
+        sup.register_test_reasoning_backend(move |_prompt| {
+            let entered = Arc::clone(&backend_entered);
+            let resume = Arc::clone(&backend_resume);
+            async move {
+                entered.notify_one();
+                resume.notified().await;
+                Ok("done".to_string())
+            }
+        });
+        let sup = Arc::new(sup);
+        let id = sup
+            .submit("web", "u1", None, "summarize the readme")
+            .await
+            .unwrap()
+            .task_id();
+
+        // Run 1, cancelled mid-flight. It leaves the task in `Execute`, so a
+        // second `execute_now` on the same task is legal (`Execute -> Plan`).
+        let first = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let id = id.clone();
+            async move { sup.execute_now(&id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the first run never reached the backend");
+        let first_owner = lease_owner(&memory, &id)
+            .await
+            .expect("the in-flight run must hold a lease row");
+
+        first.abort();
+        assert!(
+            first.await.unwrap_err().is_cancelled(),
+            "the first run was supposed to be cancelled, not to finish"
+        );
+        // Wait for the detached release, so run 2 below claims a free row
+        // rather than the cancelled run's leftovers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lease_owner(&memory, &id).await.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled run never released its lease"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Run 2, same task, same `Supervisor`, same process.
+        let second = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let id = id.clone();
+            async move { sup.execute_now(&id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the second run never reached the backend");
+        let second_owner = lease_owner(&memory, &id)
+            .await
+            .expect("the second run must hold a lease row");
+
+        assert_ne!(
+            first_owner, second_owner,
+            "two runs of one task in one process must not share a lease owner id, \
+             or the cancelled run's detached release can free the later run's lease"
+        );
+
+        resume.notify_one();
+        second.await.unwrap().unwrap();
+        assert!(
+            lease_owner(&memory, &id).await.is_none(),
+            "the finished run must have released its lease"
+        );
+    }
+
+    /// The cancellation path: a dropped `execute_now` future cannot await its
+    /// cleanup, so `LeaseGuard::drop` releases the row with a detached task.
+    /// Without that, a cancelled request would wedge the task for every process
+    /// until the TTL ran out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_run_eventually_releases_the_execution_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().to_path_buf(), memory.connection());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let backend_entered = Arc::clone(&entered);
+        sup.register_test_reasoning_backend(move |_prompt| {
+            let entered = Arc::clone(&backend_entered);
+            async move {
+                entered.notify_one();
+                std::future::pending::<()>().await;
+                Ok(String::new())
+            }
+        });
+        let sup = Arc::new(sup);
+        let id = sup
+            .submit("web", "u1", None, "summarize the readme")
+            .await
+            .unwrap()
+            .task_id();
+
+        let running = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let id = id.clone();
+            async move { sup.execute_now(&id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the run never reached the backend");
+        // The run holds the lease right now, or the rest of this proves nothing.
+        let other = TaskStore::new(memory.connection());
+        assert!(
+            !other
+                .acquire_lease(&id, "another-process", LEASE_TTL_SECS)
+                .await
+                .unwrap(),
+            "the in-flight run must hold the lease before it is cancelled"
+        );
+
+        // Cancelling the request drops the `execute_now` future mid-run.
+        running.abort();
+        assert!(
+            running.await.unwrap_err().is_cancelled(),
+            "the run was supposed to be cancelled, not to finish"
+        );
+
+        // `Drop` cannot await, so the release is detached: poll for it with a
+        // bound instead of assuming it already happened.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if other
+                .acquire_lease(&id, "another-process", LEASE_TTL_SECS)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cancelled run never released its execution lease"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

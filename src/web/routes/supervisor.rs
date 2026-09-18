@@ -102,6 +102,66 @@ fn internal_error(what: &str, error: &anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR).into_response()
 }
 
+/// The status code a failed supervisor lifecycle call answers with.
+///
+/// Pure and total over `anyhow::Error`, so the mapping can be tested without a
+/// running server, a store or a request: every arm is a statement about the
+/// error's **type**, read with [`anyhow::Error::downcast_ref`], never about its
+/// text. It searches the whole chain, so a `SupervisorError` wrapped in
+/// `.context(...)` by `execute_now` still classifies correctly — which is not a
+/// detail, because `execute_now` wraps the release failure in context and the
+/// dashboard must not answer 500 for it.
+///
+/// `StateRefusal`, `AlreadyRunning` and `LeaseLost` all answer **409**: in every
+/// case the caller's request conflicts with the task's real state, and the
+/// difference between them is only which sentence is sent back (see
+/// [`lifecycle_conflict_message`], and the re-read in [`lifecycle`] that
+/// `StateRefusal` needs).
+fn lifecycle_failure_status(error: &anyhow::Error) -> StatusCode {
+    match error.downcast_ref::<SupervisorError>() {
+        // The task was deleted between the pre-check and the call. A vanished
+        // task is not a server fault.
+        Some(SupervisorError::NotFound { .. }) => StatusCode::NOT_FOUND,
+        // Another owner holds the task, this process already runs it, or the
+        // state moved under us. All three are conflicts, not faults.
+        Some(SupervisorError::StateRefusal { .. })
+        | Some(SupervisorError::AlreadyRunning { .. })
+        | Some(SupervisorError::LeaseLost { .. }) => StatusCode::CONFLICT,
+        // A plain `anyhow` error, or a `SupervisorError` this route does not
+        // know about: a genuine fault.
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The 409 body for a typed conflict.
+///
+/// `StateRefusal` is deliberately absent: [`lifecycle`] rebuilds its message
+/// from a fresh read of the task, so it never asks for this one. The fallback
+/// is the message for a conflict whose type was not recognised as one, which
+/// cannot happen through [`lifecycle_failure_status`] but keeps this function
+/// total rather than panicking on a future variant.
+fn lifecycle_conflict_message(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<SupervisorError>() {
+        Some(SupervisorError::AlreadyRunning { .. }) => "that task is already running",
+        // The run was aborted because its execution lease was gone. Like
+        // `AlreadyRunning`, that is a conflict with another owner, not a fault
+        // in this request.
+        //
+        // The wording is deliberately **cause-neutral**: `LeaseLost` is raised
+        // both when another owner really took the task over and when the lease
+        // store could not be reached after every retry, and this route cannot
+        // tell the two apart — the type does not carry the distinction. Saying
+        // "another owner took it over" would assert a takeover that never
+        // happened during a store outage. The task id is not echoed here, for
+        // the same reason [`UNKNOWN_TASK`] does not echo one; `Display` on the
+        // error carries it for logs.
+        Some(SupervisorError::LeaseLost { .. }) => {
+            "the execution lease for that task is no longer held by this run"
+        }
+        _ => "the task is no longer in a state that allows that action",
+    }
+}
+
 // ── Wire types ──────────────────────────────────────────────────────────────
 
 /// The per-task projection the list view renders.
@@ -533,7 +593,9 @@ impl Action {
 /// than by matching error text; a re-read then supplies the current state for
 /// the message. Matching text is the trap this replaced: rewording a `bail!`
 /// anywhere in `supervisor/mod.rs` silently turned every raced refusal into a
-/// 500, with nothing but a string-matching test to notice.
+/// 500, with nothing but a string-matching test to notice. The type-to-status
+/// part of that decision lives in [`lifecycle_failure_status`], a pure function
+/// with its own tests, so it can be checked without a server.
 ///
 /// The classification is deliberately *not* "the state no longer permits the
 /// action": `resume` and `approve` also fail **after** a legal transition,
@@ -556,30 +618,28 @@ async fn lifecycle(state: WebState, id: String, action: Action) -> Response {
     }
 
     if let Err(e) = action.apply(&supervisor, &id).await {
-        match e.downcast_ref::<SupervisorError>() {
-            // The task was deleted between the read above and the call. A
-            // vanished task is not a server fault, so it is the same 404 the
-            // pre-check gives.
-            Some(SupervisorError::NotFound { .. }) => return unknown_task(),
-            // A second `execute_now` for a task that is already running. The
-            // plan it would start is a duplicate of one in flight, so this is a
-            // conflict rather than a fault.
-            Some(SupervisorError::AlreadyRunning { .. }) => {
-                return conflict("that task is already running")
-            }
-            Some(SupervisorError::StateRefusal { .. }) => {
-                // Lost a race with another request. The state is re-read rather
-                // than echoed from the error, so the message carries this task's
-                // current state and nothing from the error chain.
-                return match supervisor.store().get(&id).await {
-                    Ok(Some(task)) => conflict(&action.refusal(&task.status)),
-                    Ok(None) => unknown_task(),
-                    Err(_) => conflict("the task is no longer in a state that allows that action"),
-                };
-            }
-            None => {}
+        let status = lifecycle_failure_status(&e);
+        if status == StatusCode::NOT_FOUND {
+            return unknown_task();
         }
-        return internal_error("apply a supervisor lifecycle action", &e);
+        if status != StatusCode::CONFLICT {
+            return internal_error("apply a supervisor lifecycle action", &e);
+        }
+        // A conflict. Which one decides only the message.
+        if matches!(
+            e.downcast_ref::<SupervisorError>(),
+            Some(SupervisorError::StateRefusal { .. })
+        ) {
+            // Lost a race with another request. The state is re-read rather
+            // than echoed from the error, so the message carries this task's
+            // current state and nothing from the error chain.
+            return match supervisor.store().get(&id).await {
+                Ok(Some(task)) => conflict(&action.refusal(&task.status)),
+                Ok(None) => unknown_task(),
+                Err(_) => conflict("the task is no longer in a state that allows that action"),
+            };
+        }
+        return conflict(lifecycle_conflict_message(&e));
     }
 
     match supervisor.state(&id).await {
@@ -753,32 +813,139 @@ mod tests {
 
     /// The other half of the distinction: a real fault must not be read as a
     /// refusal, or every database error would become a 409. A plain `anyhow`
-    /// error carries no `SupervisorError` in its chain, and the two other typed
-    /// variants are answered differently — a vanished task is a 404 and an
-    /// already-running task is a conflict of its own.
+    /// error carries no `SupervisorError` in its chain, so it stays a 500. The
+    /// per-variant statuses (404 for a vanished task, 409 for an
+    /// already-running one and for a lost lease) are pinned separately by
+    /// [`every_supervisor_error_variant_maps_to_its_status`].
+    ///
+    /// This goes through [`lifecycle_failure_status`], the function
+    /// [`lifecycle`] itself calls. An earlier version of this test defined its
+    /// own local `is_state_refusal` and asserted on that, so it would have kept
+    /// passing while the production mapping changed underneath it — a test that
+    /// guarded nothing. The context-wrapped refusal below is the case
+    /// [`every_supervisor_error_variant_maps_to_its_status`] does not cover:
+    /// the type is searched down the whole `anyhow` chain, not only at the top.
     #[test]
     fn a_genuine_fault_is_not_mistaken_for_a_refusal() {
-        fn is_state_refusal(error: &anyhow::Error) -> bool {
-            matches!(
-                error.downcast_ref::<SupervisorError>(),
-                Some(SupervisorError::StateRefusal { .. })
-            )
+        for fault in [
+            anyhow::anyhow!("no such table: sup_tasks"),
+            anyhow::anyhow!(
+                "write artifact /home/op/.haos-green/supervisor/x/plan.json: Permission denied"
+            ),
+        ] {
+            assert_eq!(
+                lifecycle_failure_status(&fault),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a genuine fault must not be answered as a conflict: {fault:#}"
+            );
         }
 
-        assert!(!is_state_refusal(&anyhow::anyhow!(
-            "no such table: sup_tasks"
-        )));
-        assert!(!is_state_refusal(&anyhow::anyhow!(
-            "write artifact /home/op/.haos-green/supervisor/x/plan.json: Permission denied"
-        )));
-        assert!(!is_state_refusal(&SupervisorError::not_found("6f1c")));
-        assert!(!is_state_refusal(&SupervisorError::already_running("6f1c")));
-        // A refusal wrapped in context is still a refusal: the type is searched
-        // for down the whole chain, not only at the top.
-        assert!(is_state_refusal(
-            &SupervisorError::state_refusal(TaskStatus::Done, TaskStatus::Plan)
-                .context("resume a finished task")
-        ));
+        let wrapped = SupervisorError::state_refusal(TaskStatus::Done, TaskStatus::Plan)
+            .context("resume a finished task");
+        assert_eq!(
+            lifecycle_failure_status(&wrapped),
+            StatusCode::CONFLICT,
+            "a refusal wrapped in context is still a conflict: {wrapped:#}"
+        );
+    }
+
+    /// A lost execution lease must be answered as a **409 conflict**, not as a
+    /// 404, not as "this process is already running it", and not as a 500.
+    ///
+    /// The status comes from [`lifecycle_failure_status`], the pure function
+    /// [`lifecycle`] itself calls, so this is the route's real decision and not
+    /// a restatement of it. [`a_lost_lease_is_its_own_refusal`] covers the
+    /// error's own shape.
+    #[test]
+    fn a_lost_lease_is_answered_as_a_conflict() {
+        let error = SupervisorError::lease_lost("6f1c");
+        assert_eq!(lifecycle_failure_status(&error), StatusCode::CONFLICT);
+        assert_eq!(
+            lifecycle_conflict_message(&error),
+            "the execution lease for that task is no longer held by this run"
+        );
+    }
+
+    /// The same decision through the shape the route actually receives: a
+    /// `LeaseLost` wrapped in context by `execute_now`'s release-failure arm.
+    /// A `downcast_ref` that only looked at the outermost error would answer
+    /// 500 here — which is exactly the bug that made `release` return an
+    /// untyped `anyhow::bail!`.
+    #[test]
+    fn a_context_wrapped_lost_lease_is_still_a_conflict() {
+        let error = SupervisorError::lease_lost("6f1c")
+            .context("failed to release execution lease: execution lease lost before release");
+        assert_eq!(lifecycle_failure_status(&error), StatusCode::CONFLICT);
+        assert_eq!(
+            lifecycle_conflict_message(&error),
+            "the execution lease for that task is no longer held by this run"
+        );
+    }
+
+    /// Every `SupervisorError` variant, mapped. The four arms are the route's
+    /// whole decision table, and the compiler will not tell us if one of them
+    /// silently changes status.
+    #[test]
+    fn every_supervisor_error_variant_maps_to_its_status() {
+        assert_eq!(
+            lifecycle_failure_status(&SupervisorError::not_found("6f1c")),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            lifecycle_failure_status(&SupervisorError::state_refusal(
+                TaskStatus::Done,
+                TaskStatus::Plan
+            )),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            lifecycle_failure_status(&SupervisorError::already_running("6f1c")),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            lifecycle_failure_status(&SupervisorError::lease_lost("6f1c")),
+            StatusCode::CONFLICT
+        );
+        // An error with no `SupervisorError` anywhere in its chain is a fault.
+        assert_eq!(
+            lifecycle_failure_status(&anyhow::anyhow!("no such table: sup_tasks")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // And the two 409 messages are distinct, so a lease loss is not
+        // reported as "already running" and vice versa.
+        assert_eq!(
+            lifecycle_conflict_message(&SupervisorError::already_running("6f1c")),
+            "that task is already running"
+        );
+        assert_ne!(
+            lifecycle_conflict_message(&SupervisorError::already_running("6f1c")),
+            lifecycle_conflict_message(&SupervisorError::lease_lost("6f1c"))
+        );
+    }
+
+    /// A lost execution lease is its own typed refusal: it carries
+    /// `SupervisorError::LeaseLost`, so [`lifecycle_failure_status`] — not a
+    /// substring of the message — can classify it. This pins the error's own
+    /// shape; the status it maps to is pinned above.
+    #[test]
+    fn a_lost_lease_is_its_own_refusal() {
+        let error = SupervisorError::lease_lost("6f1c");
+        let typed = error
+            .downcast_ref::<SupervisorError>()
+            .expect("lease_lost must carry the typed error");
+
+        assert!(
+            matches!(typed, SupervisorError::LeaseLost { task_id } if task_id == "6f1c"),
+            "unexpected error: {error:?}"
+        );
+        assert!(!matches!(typed, SupervisorError::NotFound { .. }));
+        assert!(!matches!(typed, SupervisorError::AlreadyRunning { .. }));
+        assert!(!matches!(typed, SupervisorError::StateRefusal { .. }));
+        // The message has to stand on its own: unlike `StateRefusal`, the route
+        // answers this arm without re-reading the task.
+        let message = error.to_string();
+        assert!(message.contains("6f1c"), "must name the task: {message}");
+        assert!(message.contains("lease"), "must name the loss: {message}");
     }
 
     /// `Job` is a store row; the detail view gets a projection. `workspace` and

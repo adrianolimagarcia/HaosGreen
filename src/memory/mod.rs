@@ -49,6 +49,13 @@ impl MemoryStore {
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open database: {}", path.display()))?;
 
+        // No `busy_timeout` call here: rusqlite already sets one. Every
+        // connection it opens calls `sqlite3_busy_timeout(db, 5000)` inside
+        // `InnerConnection::open_with_flags`, so the 5 s default is in force
+        // without this file asking for it — and calling `busy_timeout(5 s)`
+        // here would be a no-op that only looks like it does something. The
+        // 5 s value is what bounds a contended write in the lease paths; see
+        // `LEASE_RENEW_BACKOFFS` in `src/supervisor/mod.rs`.
         // Enable WAL mode for better concurrent read performance
         // journal_mode PRAGMA always returns the resulting mode, so use query_row
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -310,6 +317,45 @@ impl MemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_sup_artifacts_task ON sup_artifacts(task_id, kind);
 
+            -- Supervisor: cross-process execution leases. One row per task that
+            -- is currently being run, `expires_at`/`renewed_at` are integer
+            -- epoch seconds so a competing process reads the same meaning.
+            --
+            -- Deviation from the plan's Step 3 schema, which named the second
+            -- timestamp column `acquired_at`: this table stores `renewed_at`
+            -- instead. The column is written by both `acquire_lease` (as the
+            -- acquisition stamp) and `renew_lease` (as the last renewal), so
+            -- `acquired_at` would be a name that lies about half its writes.
+            -- No production code reads `renewed_at` today (`expires_at` is read
+            -- only by the takeover predicate inside `acquire_lease` and the
+            -- lapse guard inside `renew_lease`; tests do read both); the columns
+            -- are there so an operator can read the row by hand and see when it
+            -- was last touched.
+            CREATE TABLE IF NOT EXISTS sup_execution_leases (
+                task_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                renewed_at INTEGER NOT NULL
+            );
+            -- Forward-looking, and deliberately kept: nothing queries
+            -- `expires_at` on its own today. `renew_lease` and `release_lease`
+            -- both report `SEARCH sup_execution_leases USING INDEX
+            -- sqlite_autoindex_sup_execution_leases_1 (task_id=?)` under
+            -- `EXPLAIN QUERY PLAN` — they are key- and owner-addressed, so they
+            -- cannot use this index. The takeover is an upsert whose conflict
+            -- target is the PRIMARY KEY, so its `expires_at <= ?now` predicate is
+            -- applied to the one row that key lookup found; `EXPLAIN QUERY PLAN`
+            -- reports nothing at all for it, because an `INSERT ... VALUES` has
+            -- no query plan to show. Only a query filtered by `expires_at` alone
+            -- uses this index, and no such query exists. It is therefore
+            -- write-only amplification for now — its entry is rewritten on every
+            -- renewal — and is kept for the expiry-driven sweep/reclaim query
+            -- (find and free leases that lapsed) that would otherwise scan the
+            -- whole table. Do not cite a performance benefit the current paths do
+            -- not have.
+            CREATE INDEX IF NOT EXISTS idx_sup_execution_leases_expiry
+                ON sup_execution_leases(expires_at);
+
             -- A2A: one row per remote task. `state` is the A2A TaskState
             -- lowercased so it can be filtered; `data` holds the whole
             -- serialized `a2a::Task` so the SDK's TaskStore round-trips every
@@ -491,7 +537,13 @@ mod tests {
         let memory = MemoryStore::open_in_memory().unwrap();
         let conn = memory.connection();
         let conn = conn.blocking_lock();
-        for tbl in ["sup_tasks", "sup_jobs", "sup_transitions", "sup_artifacts"] {
+        for tbl in [
+            "sup_tasks",
+            "sup_jobs",
+            "sup_transitions",
+            "sup_artifacts",
+            "sup_execution_leases",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
@@ -501,6 +553,21 @@ mod tests {
                 .unwrap();
             assert!(exists, "table {tbl} missing");
         }
+        // The index is present, as the approved plan requires. This asserts its
+        // *existence*, not a performance property: no current path queries
+        // `expires_at` on its own, so nothing today is made cheaper by it (see
+        // the schema comment above).
+        let indexed: bool = conn
+            .query_row(
+                "SELECT count(*)>0 FROM sqlite_master WHERE type='index' AND name=?1",
+                ["idx_sup_execution_leases_expiry"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            indexed,
+            "index idx_sup_execution_leases_expiry missing on sup_execution_leases(expires_at)"
+        );
     }
 
     #[test]

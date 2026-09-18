@@ -79,6 +79,90 @@ impl TaskStore {
         Self { conn }
     }
 
+    /// Claim the execution lease for `task_id`, or answer `false` if a live one
+    /// is already held.
+    ///
+    /// One conditional statement, so the claim is atomic without an explicit
+    /// transaction: the `INSERT` either creates the row or, on conflict, the
+    /// `WHERE` guard decides whether the existing row may be replaced. A
+    /// `false` answer means the row is live and belongs to someone else.
+    ///
+    /// # Deliberate deviation from the plan's Step 4
+    ///
+    /// The plan specified the takeover condition as `expires_at <= ?now OR
+    /// owner_id = ?owner` — that is, an owner may also re-take a lease it
+    /// already holds. That `OR owner_id = ?owner` term is **omitted here**, on
+    /// purpose:
+    ///
+    /// * the invariant this table enforces is *one run per task*, and a second
+    ///   claim by the same owner is a second run of the same task — the very
+    ///   thing `acquire_lease` exists to refuse;
+    /// * an owner id is minted per `execute_now` **run**
+    ///   (`pid-<pid>-<uuid>`), so "the same owner" cannot mean "the same run
+    ///   re-claiming its own lease" — a live row with our owner id can only be
+    ///   a *previous* run in this process, which must not be silently resumed;
+    /// * with the term present, a repeated `execute_now` whose in-flight guard
+    ///   had already been released would take the lease over from a run that is
+    ///   still executing, which is exactly the double execution the lease is
+    ///   for.
+    ///
+    /// The cost is that an owner cannot refresh its own claim by re-acquiring;
+    /// it renews through [`Self::renew_lease`], which is owner-checked and
+    /// refuses an expired row (`expires_at > ?now`), so a stale lease is never
+    /// resurrected — it has to be taken over by a fresh claim.
+    pub async fn acquire_lease(
+        &self,
+        task_id: &str,
+        owner_id: &str,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        anyhow::ensure!(ttl_secs > 0, "lease TTL must be positive");
+        let conn = self.conn.lock().await;
+        let now = chrono::Utc::now().timestamp();
+        let expires = now.saturating_add(ttl_secs);
+        let changed = conn.execute(
+            "INSERT INTO sup_execution_leases(task_id, owner_id, expires_at, renewed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET owner_id=excluded.owner_id,
+               expires_at=excluded.expires_at, renewed_at=excluded.renewed_at
+                                         WHERE sup_execution_leases.expires_at <= ?4",
+            rusqlite::params![task_id, owner_id, expires, now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Extend a lease this owner still holds, or answer `false`.
+    ///
+    /// `false` is the heartbeat's loss signal, and it covers all three ways the
+    /// row can stop being ours: it was released, it expired and someone else
+    /// took it over, or it expired and nobody has. The `expires_at > ?now`
+    /// guard is what makes the third case a loss rather than a resurrection —
+    /// a run that let its lease lapse has lost the task, even if the row is
+    /// still there.
+    pub async fn renew_lease(&self, task_id: &str, owner_id: &str, ttl_secs: i64) -> Result<bool> {
+        anyhow::ensure!(ttl_secs > 0, "lease TTL must be positive");
+        let conn = self.conn.lock().await;
+        let now = chrono::Utc::now().timestamp();
+        let changed = conn.execute(
+            "UPDATE sup_execution_leases SET expires_at=?1, renewed_at=?2
+             WHERE task_id=?3 AND owner_id=?4 AND expires_at > ?2",
+            rusqlite::params![now.saturating_add(ttl_secs), now, task_id, owner_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Drop a lease, but only one this owner holds. Another process's lease is
+    /// never released by this call, so a failed run cannot free a task a
+    /// successful one is running.
+    pub async fn release_lease(&self, task_id: &str, owner_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "DELETE FROM sup_execution_leases WHERE task_id=?1 AND owner_id=?2",
+            rusqlite::params![task_id, owner_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub async fn create(
         &self,
         t: &Task,
@@ -482,6 +566,170 @@ impl TaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lease row for `task_id` as `(owner_id, expires_at, renewed_at)`, or
+    /// `None` when there is no row. Read straight from the connection so a
+    /// failing assertion can name what the row actually holds instead of only
+    /// the boolean the API returned.
+    async fn lease_row(
+        memory: &crate::memory::MemoryStore,
+        task_id: &str,
+    ) -> Option<(String, i64, i64)> {
+        let conn = memory.connection();
+        let conn = conn.lock().await;
+        conn.query_row(
+            "SELECT owner_id, expires_at, renewed_at FROM sup_execution_leases WHERE task_id=?1",
+            [task_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn lease_allows_one_owner_and_owner_checked_release() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task", "owner-a", 60).await.unwrap());
+        assert!(!store.acquire_lease("task", "owner-b", 60).await.unwrap());
+        assert!(!store.release_lease("task", "owner-b").await.unwrap());
+        assert!(store.release_lease("task", "owner-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_lease_can_be_taken_over() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task", "owner-a", 1).await.unwrap());
+        {
+            let conn = memory.connection();
+            let conn = conn.lock().await;
+            conn.execute("UPDATE sup_execution_leases SET expires_at=0", [])
+                .unwrap();
+        }
+        assert!(store.acquire_lease("task", "owner-b", 60).await.unwrap());
+    }
+
+    /// The TTL really is added to the current time. The tests above all force
+    /// `expires_at` with raw SQL, so they pass just as well if `acquire_lease`
+    /// writes a nonsense expiry (`now + 1_000_000`) — this one uses the real
+    /// clock and a one-second TTL and asserts the arithmetic **as stored**.
+    ///
+    /// The expiry is asserted as a value, never by racing the wall clock. An
+    /// earlier version asserted "a 1 s lease must not be takeable immediately"
+    /// and was a claim about the clock at a *later* instant than the
+    /// acquisition: `acquire_lease` stores integer epoch seconds, so an
+    /// acquisition at `t0 = x.999` writes `expires_at = x + 1`, and a second
+    /// `Utc::now()` at `x + 1.001` already satisfies the takeover's
+    /// `expires_at <= now`. The window is the gap between the two calls —
+    /// microseconds in a tight loop, but unbounded under scheduling jitter: a
+    /// test thread preempted across the boundary fails every time. Reading
+    /// `renewed_at` and `expires_at` back removes the boundary entirely: their
+    /// difference is the TTL exactly, and `renewed_at` is checked against the
+    /// real clock so a hard-coded constant cannot pass.
+    ///
+    /// The wait afterwards is safe in the other direction: with
+    /// `expires_at = floor(t0) + 1 <= t0 + 1` and any `now >= t0 + 1.1`, the
+    /// takeover condition holds no matter where in the second `t0` landed.
+    ///
+    /// Deliberately no `renew_lease` call in between: a renewal writes
+    /// `now + ttl_secs` into the row itself, so renewing with the same short
+    /// TTL here would repair a wrong `acquire_lease` expiry and hide the very
+    /// arithmetic this pins. (That is not hypothetical — an earlier draft of
+    /// this test renewed with `ttl_secs = 1` and survived the `now + 1_000_000`
+    /// mutant.)
+    #[tokio::test]
+    async fn a_short_ttl_really_expires_on_the_wall_clock() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        let before = chrono::Utc::now().timestamp();
+
+        assert!(store.acquire_lease("task", "owner-a", 1).await.unwrap());
+        let after = chrono::Utc::now().timestamp();
+
+        let (owner, expires_at, renewed_at) = lease_row(&memory, "task").await.expect("lease row");
+        assert_eq!(owner, "owner-a");
+        assert_eq!(
+            expires_at - renewed_at,
+            1,
+            "the stored expiry must be the TTL past the renewal stamp \
+             (expires_at={expires_at} renewed_at={renewed_at})"
+        );
+        assert!(
+            (before..=after).contains(&renewed_at),
+            "renewed_at must be the wall clock at acquisition \
+             (renewed_at={renewed_at} before={before} after={after})"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        assert!(
+            store.acquire_lease("task", "owner-b", 60).await.unwrap(),
+            "the 1 s lease must have expired ~1.1 s after it was acquired"
+        );
+    }
+
+    /// An expired row that is **still ours** is not renewable. This is the
+    /// third way a lease stops being ours — released, taken over, or lapsed —
+    /// and the only one that needs the `expires_at > ?now` guard in
+    /// `renew_lease`: without that guard a run whose lease had lapsed would
+    /// renew the row and carry on as if it still held the task, while another
+    /// process was free to take the task over at any moment.
+    ///
+    /// Real clock, real one-second TTL, and a wait past it, so the row is
+    /// genuinely expired rather than expired by SQL.
+    #[tokio::test]
+    async fn an_expired_lease_cannot_be_renewed_by_its_own_owner() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task", "owner-a", 1).await.unwrap());
+        let acquired = lease_row(&memory, "task").await.expect("lease row");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        assert!(
+            !store.renew_lease("task", "owner-a", 60).await.unwrap(),
+            "an expired lease must not be renewable by the owner that lapsed it"
+        );
+        // A refused renewal writes nothing: the lapsed row is left exactly as
+        // it was, so the takeover below still sees an expired row.
+        assert_eq!(
+            lease_row(&memory, "task").await,
+            Some(acquired.clone()),
+            "a refused renewal must not touch the row"
+        );
+        assert!(
+            store.acquire_lease("task", "owner-b", 60).await.unwrap(),
+            "the lapsed lease must still be takeable by a new owner"
+        );
+    }
+
+    /// A live lease is never re-acquired by the owner that already holds it —
+    /// the deliberate deviation from the plan's Step 4, which allowed
+    /// `owner_id = ?` in the takeover condition. Re-acquiring would be a second
+    /// run of the same task, which is exactly what the lease refuses.
+    #[tokio::test]
+    async fn a_live_lease_is_never_re_acquired_by_its_own_owner() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task", "owner-a", 60).await.unwrap());
+        assert!(
+            !store.acquire_lease("task", "owner-a", 60).await.unwrap(),
+            "the same owner must not be able to claim a live lease twice"
+        );
+        // The row is untouched by the refused claim: the original owner still
+        // holds it, and a foreign owner is still refused.
+        assert!(store.renew_lease("task", "owner-a", 60).await.unwrap());
+        assert!(!store.acquire_lease("task", "owner-b", 60).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn renew_keeps_live_lease_and_wrong_owner_cannot_renew() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let store = TaskStore::new(memory.connection());
+        assert!(store.acquire_lease("task", "owner-a", 60).await.unwrap());
+        assert!(!store.renew_lease("task", "owner-b", 60).await.unwrap());
+        assert!(store.renew_lease("task", "owner-a", 60).await.unwrap());
+    }
 
     #[tokio::test]
     async fn create_task_then_load_back() {
