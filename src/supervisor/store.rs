@@ -957,7 +957,13 @@ mod tests {
         let mut accepted = 0usize;
         let mut refused = 0usize;
         for handle in handles {
-            match handle.await.expect("no transition may panic") {
+            // Bounded: eight spawned writers contending for one connection is
+            // exactly the shape that would deadlock silently, and an un-bounded
+            // `handle.await` would wedge the whole test binary rather than fail.
+            let outcome = crate::supervisor::bounded("a duplicate transition", handle)
+                .await
+                .expect("no transition may panic");
+            match outcome {
                 Ok(()) => accepted += 1,
                 Err(e) => {
                     assert!(

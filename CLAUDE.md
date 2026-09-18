@@ -313,6 +313,28 @@ integration files in `tests/`). When adding tests:
 > stale artifact until proven otherwise; a failure that does **not** reproduce on
 > a freshly built binary is not a flake to be re-run away.
 
+> **A test that waits forever is worse than a failing test.** libtest has no
+> per-test timeout and prints nothing about a test still in flight, so a hang in
+> this suite is completely silent: one was killed after 15 minutes with every
+> worker idle and the captured output could not name the stuck test. So any
+> await on spawned work goes through `supervisor::bounded("what", handle)`, a
+> 60 s hang detector, and a lost wakeup then fails with the test's own name
+> instead of wedging the binary. (Proven: deleting the single `notify_one` that
+> releases a test backend makes that test fail at 60 s with
+> `did not finish within 60s, so it is being treated as a hang` — un-bounded, it
+> would have waited forever.) When a hang does happen anyway, identify it from
+> the process, not from guesswork:
+>
+> - `ls /proc/<pid>/task | wc -l` gives the shape. A `multi_thread` test costs
+>   `1 + worker_threads` threads, so **5 means one `worker_threads = 4` test
+>   running alone** — that narrows 900 tests to the handful with that flavour.
+>   A `#[tokio::test]` without a flavour costs one thread per running test.
+> - Capture the run to a file and diff it: `grep -oE "^test [a-z0-9_:]+ \.\.\."
+>   run.txt | sed 's/ \.\.\..*//;s/^test //' | sort` against
+>   `cargo test --lib -- --list` names every test that never reported.
+> - Idle workers with frozen CPU time and no established sockets mean a future
+>   that will never be woken — not a busy loop, and not a slow test.
+
 ## Common Tasks
 
 ### Adding a new built-in tool

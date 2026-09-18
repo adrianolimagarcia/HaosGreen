@@ -1365,6 +1365,32 @@ impl Supervisor {
     }
 }
 
+/// Await `fut` under a bound, so a run that never finishes fails **the calling
+/// test** with a named message instead of wedging the whole binary.
+///
+/// The supervisor's tests deliberately park spawned `execute_now` futures inside
+/// a test backend until the test releases them, so an un-bounded `handle.await`
+/// has exactly one failure mode: waiting forever. That is worse than a failing
+/// test, because libtest has no per-test timeout and prints nothing about a test
+/// still in flight — a hang here is completely silent. One run of this suite
+/// really did sit for 15 minutes with every worker idle before it was killed,
+/// and the stuck test could not be named from the captured output afterwards.
+///
+/// The bound is a hang detector, not a performance assertion, so it sits far
+/// above the work these tests do.
+#[cfg(test)]
+pub(crate) async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    match tokio::time::timeout(HANG_DETECTOR, fut).await {
+        Ok(value) => value,
+        Err(_) => panic!(
+            "{what} did not finish within {}s, so it is being treated as a hang. \
+             Without this bound the test would wait forever and name nothing.",
+            HANG_DETECTOR.as_secs()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2565,7 +2591,10 @@ mod tests {
         );
 
         resume.notify_one();
-        running.await.unwrap().unwrap();
+        bounded("the run after its backend was released", running)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(
             other
@@ -2627,7 +2656,10 @@ mod tests {
 
         first.abort();
         assert!(
-            first.await.unwrap_err().is_cancelled(),
+            bounded("the cancelled first run", first)
+                .await
+                .unwrap_err()
+                .is_cancelled(),
             "the first run was supposed to be cancelled, not to finish"
         );
         // Wait for the detached release, so run 2 below claims a free row
@@ -2661,7 +2693,10 @@ mod tests {
         );
 
         resume.notify_one();
-        second.await.unwrap().unwrap();
+        bounded("the second run after its backend was released", second)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             lease_owner(&memory, &id).await.is_none(),
             "the finished run must have released its lease"
@@ -2715,7 +2750,10 @@ mod tests {
         // Cancelling the request drops the `execute_now` future mid-run.
         running.abort();
         assert!(
-            running.await.unwrap_err().is_cancelled(),
+            bounded("the cancelled run", running)
+                .await
+                .unwrap_err()
+                .is_cancelled(),
             "the run was supposed to be cancelled, not to finish"
         );
 
