@@ -1333,6 +1333,35 @@ The startup cost is seven bubblewrap invocations once, cached for the process
 lifetime. That is the price of the spec's requirement, and it is paid at
 startup rather than per job.
 
+**Two of the probe's assertions do not discriminate as originally written —
+measured on this host, not reasoned about.** I mutation-tested the probe design
+against the real binary before writing it, and two checks passed with the
+property deliberately removed:
+
+| Probe check | Mutation applied | Result |
+|---|---|---|
+| `$HOME`/`$PATH` are set | remove `--clearenv` | **passes** — `--setenv` sets those same two variables |
+| `pwd` is the job directory | remove `--chdir` | **passes** when the parent's cwd is already the job dir |
+| `hostname` is `haos-sandbox` | remove `--hostname` | caught (`cachyos-x8664`) |
+| `/etc/passwd` unreadable | bind `/etc` read-only | caught |
+| nested `unshare --user` fails | drop `--disable-userns` | caught |
+| loopback unreachable | drop `--share-net` under `host_network = false` | caught |
+
+So Task 2's probe must:
+
+1. **Detect `--clearenv` with an inherited canary, not with `$HOME`/`$PATH`.** The
+   probe sets a marker variable in its own environment and asserts it is *absent*
+   inside. Verified: without `--clearenv` the canary leaks
+   (`canario vazou=[SEGREDO]`); with it, the probe passes.
+2. **Spawn `bwrap` with an explicit cwd that is not the job directory**, so a
+   missing `--chdir` cannot pass by inheritance. Measured: bwrap inherits the
+   invoking process's cwd when `--chdir` is absent — with the parent at `/` the
+   sandbox sees `/` (caught), with the parent already inside the job directory it
+   sees the job directory (silently passes).
+
+Both are the failure mode this repo's testing section calls out: a test that
+passes for the wrong reason. Neither was visible from reading the argv.
+
 **Type consistency:** `IsolationUnavailable` (Task 1) is used in Tasks 5 and 7;
 `build_argv(&Path, bool, &str)` and `resolve_job_dir(&Path, &str, &str)`
 (Tasks 2–3) are called with exactly those signatures in Task 5;
