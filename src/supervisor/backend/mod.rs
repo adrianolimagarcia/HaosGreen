@@ -11,6 +11,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod mcp;
 pub mod reasoning;
+pub mod sandbox;
 pub mod script;
 pub mod shell;
 
