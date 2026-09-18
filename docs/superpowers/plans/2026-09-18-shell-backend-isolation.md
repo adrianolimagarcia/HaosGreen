@@ -178,10 +178,15 @@ pub fn check_bwrap_version() -> Result<(), IsolationUnavailable> {
 /// The real check, against an explicit binary.
 ///
 /// Taking the path as a parameter rather than reading `PATH` is what makes the
-/// version floor testable without mutating the environment: this repo has no
-/// `std::env::set_var` anywhere in `src/`, and `tests/a2a_e2e_live.rs` records
-/// why — it is process-global and races with every other test in the same
-/// binary. A stub binary on a private path is injected instead.
+/// version floor testable without mutating the environment. **No test in this
+/// repo uses `std::env::set_var`**, and `tests/a2a_e2e_live.rs` records why: it
+/// is process-global and races with every other test in the same binary. A stub
+/// binary on a private path is injected instead.
+///
+/// (There is exactly one `set_var` in `src/` — `src/setup/mod.rs:56`, in
+/// production CLI argument parsing. It is not in a test and not a precedent for
+/// one. An earlier draft of this comment claimed the repo had none at all,
+/// which was false; corrected after the Task 1 reviewer checked it.)
 ///
 /// An older version is reported as [`IsolationUnavailable::VersionTooOld`] —
 /// the same *kind* of outcome as "not installed", so there is no "present but
