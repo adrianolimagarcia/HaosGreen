@@ -78,10 +78,12 @@ const SPAWN_RETRY_MAX_DELAY: Duration = Duration::from_millis(50);
 /// them out rather than reporting an isolation failure the operator cannot act
 /// on. A refusal that outlasts the retries is returned as an ordinary io error,
 /// which the caller turns into [`IsolationUnavailable::VersionUnreadable`] —
-/// never a pass.
+/// never a pass. That error says how long was spent waiting, so a persistent
+/// writer can be told apart from a one-off refusal.
 fn spawn_bwrap(bin: &Path) -> std::io::Result<std::process::Child> {
     let mut delay = SPAWN_RETRY_DELAY;
     let mut waits = 0;
+    let mut waited = Duration::ZERO;
     loop {
         let mut cmd = std::process::Command::new(bin);
         cmd.arg("--version")
@@ -94,10 +96,22 @@ fn spawn_bwrap(bin: &Path) -> std::io::Result<std::process::Child> {
                 if e.kind() == std::io::ErrorKind::ExecutableFileBusy && waits < SPAWN_RETRIES =>
             {
                 waits += 1;
+                waited += delay;
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(SPAWN_RETRY_MAX_DELAY);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // An exhausted retry must be separable from a refusal that was
+                // never retried, or a writer that never goes away reads exactly
+                // like the transient failure this retry exists to remove.
+                if waits == 0 {
+                    return Err(e);
+                }
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{e} (after {waits} retries over ~{waited:?})"),
+                ));
+            }
         }
     }
 }
@@ -596,6 +610,16 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let held = std::fs::OpenOptions::new().write(true).open(&bin).unwrap();
+
+        // The refusal is a precondition of this test, not a hope: establish it
+        // before relying on it. Without this, a spawn that simply never met
+        // ETXTBSY would let the test pass with the retry left untested.
+        let refused = std::process::Command::new(&bin).arg("--version").output();
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy),
+            "a held writer must make the exec fail with ETXTBSY, got {refused:?}"
+        );
+
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             drop(held);
@@ -609,12 +633,81 @@ mod tests {
             r.is_ok(),
             "a transient ETXTBSY must be waited out, not reported as unavailable, got {r:?}"
         );
-        // The writer is released only after 30ms, so success before that would
-        // mean the first spawn never met the refusal and the retry went
-        // untested.
+        // The writer is released only after 30ms, so a probe that had not
+        // retried could not have succeeded. The threshold clears both sides:
+        // a probe that never met the refusal costs one 20ms poll interval
+        // (~20-28ms measured), while the retry path measures ~58-67ms.
         assert!(
-            elapsed >= Duration::from_millis(25),
+            elapsed >= Duration::from_millis(45),
             "the probe must have retried the refused spawn, took {elapsed:?}"
+        );
+    }
+
+    /// The retry has to be bounded, and it has to cover `ETXTBSY` and nothing
+    /// else. A retry that ran for every failure would make a missing binary pay
+    /// the whole budget for no reason.
+    #[test]
+    fn the_retry_is_bounded_and_covers_only_etxtbsy() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bwrap");
+        std::fs::write(&bin, "#!/bin/sh\necho 'bubblewrap 0.12.0'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Never released, so the refusal cannot clear: the probe has to give up
+        // on its own budget rather than wait the writer out. Holding it for the
+        // whole test is stronger than holding it for a fixed second.
+        let _held = std::fs::OpenOptions::new().write(true).open(&bin).unwrap();
+
+        let started = Instant::now();
+        let r = check_bwrap_version_at(&bin);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(r, Err(IsolationUnavailable::VersionUnreadable(_))),
+            "an exhausted retry must fail closed, got {r:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "the retry must be bounded, not wait for the writer, took {elapsed:?}"
+        );
+        // An exhausted retry must be distinguishable from a refusal that was
+        // never retried, or a persistent writer reads like the transient
+        // failure the retry exists to remove.
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("after 8 retries"),
+            "the message must say the retry was exhausted, got {msg:?}"
+        );
+
+        // A missing binary is not a condition to wait on: it must fail at once
+        // instead of spending the ~275ms budget.
+        let started = Instant::now();
+        let missing = check_bwrap_version_at(Path::new("/nonexistent/bwrap"));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(missing, Err(IsolationUnavailable::NotInstalled)),
+            "a missing binary must be NotInstalled, got {missing:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "a missing binary must not pay the retry budget, took {elapsed:?}"
+        );
+    }
+
+    /// A child killed by a signal has no exit code, and the whole reason
+    /// `describe_status` exists is to report that case rather than printing
+    /// `exit status: None`.
+    #[test]
+    fn a_binary_killed_by_a_signal_is_reported_as_a_signal() {
+        let (_dir, bin) = stub_bwrap_running("kill -9 $$");
+        let msg = check_bwrap_version_at(&bin).unwrap_err().to_string();
+        assert!(
+            msg.contains("signal: 9 (SIGKILL)"),
+            "a signalled child must be reported as such, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("None"),
+            "the missing exit code must not leak into the message, got {msg:?}"
         );
     }
 
