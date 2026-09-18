@@ -783,8 +783,8 @@ pub async fn self_upgrade(
 
             let update_result = tokio::task::spawn_blocking(|| {
                 self_update::backends::github::Update::configure()
-                    .repo_owner("chinkan")
-                    .repo_name("haos-green")
+                    .repo_owner("adrianolimagarcia")
+                    .repo_name("HaosGreen")
                     .bin_name("haos-green")
                     .show_download_progress(false)
                     .current_version(self_update::cargo_crate_version!())
