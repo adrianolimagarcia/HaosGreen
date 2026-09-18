@@ -4,6 +4,7 @@
 //! invariants, so the sandbox is described in exactly one place and the tests
 //! exercise the same builder production uses.
 
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
@@ -332,6 +333,449 @@ fn check_bwrap_version_at_within(
         return Err(IsolationUnavailable::VersionTooOld(version));
     }
     Ok(())
+}
+
+/// What the sandbox is built from: the host paths a job may write, and whether
+/// it may see the host's network namespace.
+///
+/// **Authorization is declared before the run, not discovered during it.**
+/// bubblewrap builds its argv before the process starts, so a bind cannot be
+/// added to a running sandbox: a job whose declaration is not covered is
+/// refused, it is never run in a wider sandbox. One instance is shared behind
+/// `Arc<RwLock<_>>` — the supervisor mutates it when the operator types
+/// `/allow`, and every `ShellBackend` reads it when it builds an argv. The
+/// mutating operations, the canonicalised matching and the audit rows are added
+/// in Task 8; the fields are what the argv is built from, and the shipped
+/// default is the empty set (spec §4).
+///
+/// `Serialize`/`Deserialize` are here because `Task` and `Job` both carry a
+/// declaration and both are serde types (`src/supervisor/task.rs:56`,
+/// `src/supervisor/job.rs:52`); the field is `#[serde(default)]` so a stored
+/// task without one reads back as "declares nothing".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grants {
+    /// Host paths the job may mount read-write. Absolute, canonicalised.
+    pub write: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Share the host network namespace.
+    pub network: bool,
+}
+
+/// Append `--ro-bind <path> <path>` for `path`, if it exists under `root`.
+///
+/// `root` is `/` in production and a scratch tree in the tests, which is what
+/// makes the "absent" branch testable: Debian/Ubuntu have no
+/// `/etc/ca-certificates`, and an argv tuned to either layout must not break on
+/// the other.
+fn push_ro_bind_if_present(a: &mut Vec<String>, root: &Path, path: &str) {
+    let src = root.join(path.trim_start_matches('/'));
+    if src.exists() {
+        a.extend([
+            "--ro-bind".into(),
+            src.to_string_lossy().into_owned(),
+            path.into(),
+        ]);
+    }
+}
+
+/// Build the full bubblewrap argv. **Order is normative** — see the tests.
+///
+/// `job_dir` must already have passed [`resolve_job_dir`].
+///
+/// `grants` is what the operator holds **now**: each write grant adds a
+/// read-write `--bind`, and the network grant adds `--share-net`. This is where
+/// authorization becomes a bind — there is nowhere else it can happen.
+pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String> {
+    let dir = job_dir.to_string_lossy().to_string();
+    let mut a: Vec<String> = vec![
+        "--unshare-all".into(),
+        // Explicit: --unshare-all only does --unshare-user-try, which is
+        // silently skipped when the user namespace cannot be created.
+        "--unshare-user".into(),
+        // Requires --unshare-user. Stops the sandbox creating further user
+        // namespaces (sets user.max_user_namespaces=1).
+        "--disable-userns".into(),
+        // --disable-userns *asks*; this *verifies*, and fails the run if the
+        // restriction did not take effect on this kernel.
+        "--assert-userns-disabled".into(),
+        // Detach the controlling terminal, or TIOCSTI lets the job inject
+        // input into the operator's terminal.
+        "--new-session".into(),
+        // Kill the whole tree, not just the direct child, when we die.
+        "--die-with-parent".into(),
+        // We already have a UTS namespace; leaking the host's hostname is a
+        // free identity signal for no benefit.
+        "--hostname".into(),
+        "haos-sandbox".into(),
+        // MUST precede every --setenv: reversed, it wipes them and HOME comes
+        // back empty.
+        "--clearenv".into(),
+        "--setenv".into(),
+        "HOME".into(),
+        dir.clone(),
+        "--setenv".into(),
+        "PATH".into(),
+        "/usr/bin:/bin".into(),
+        "--ro-bind".into(),
+        "/usr".into(),
+        "/usr".into(),
+        // On Arch, /bin and /lib are symlinks into /usr; without these the
+        // loader is unreachable and execvp fails with ENOENT.
+        "--symlink".into(),
+        "usr/bin".into(),
+        "/bin".into(),
+        "--symlink".into(),
+        "usr/lib".into(),
+        "/lib".into(),
+        "--symlink".into(),
+        "usr/lib64".into(),
+        "/lib64".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+    ];
+    // The `/etc` files a job needs to resolve a name, and the two certificate
+    // paths that keep HTTPS working. All read-only, all bound whenever they
+    // exist: these are reads, and reads are never gated (spec §3).
+    for f in [
+        "/etc/resolv.conf",
+        "/etc/nsswitch.conf",
+        "/etc/hosts",
+        // Load-bearing, measured: without these two, `curl https://example.com`
+        // inside the sandbox fails with `curl: (77) error adding trust anchors
+        // from file: /etc/ssl/certs/ca-certificates.crt`. Binding
+        // `/etc/ssl/certs` ALONE still fails — on Arch/CachyOS the bundle is a
+        // symlink to `../../ca-certificates/extracted/tls-ca-bundle.pem`, so
+        // the directory holding the symlink is useless without its target. Both
+        // together give HTTP 200 and `openssl s_client` → `Verify return code:
+        // 0 (ok)`. Public CA certificates: read-only, no secrets.
+        "/etc/ssl/certs",
+        "/etc/ca-certificates",
+    ] {
+        push_ro_bind_if_present(&mut a, Path::new("/"), f);
+    }
+    // A write grant is the operator naming one host path. These come after the
+    // read-only base because a later bind wins: granting a path inside the base
+    // set is an explicit, separate decision (spec §3), never a side effect.
+    for p in &grants.write {
+        let p = p.to_string_lossy().to_string();
+        a.extend(["--bind".into(), p.clone(), p]);
+    }
+    // The HOST network namespace, and only under a grant. Measured, `--share-net`
+    // gives the sandbox `lo enp2s0 wlan0 tailscale0 virbr0 dnsstub`, with the
+    // operator's own LLM gateway on 127.0.0.1:8790 reachable from inside — which
+    // is why it is not a default and not a config key.
+    if grants.network {
+        a.push("--share-net".into());
+    }
+    a.extend([
+        "--bind".into(),
+        dir.clone(),
+        dir.clone(),
+        "--chdir".into(),
+        dir,
+        "/bin/sh".into(),
+        "-c".into(),
+        command.to_string(),
+    ]);
+    a
+}
+
+/// Bound on one probe invocation, in seconds.
+///
+/// A hang detector, not a performance assertion — the same reasoning as
+/// `supervisor::bounded`. The probe runs at startup, so one wedged step would
+/// hold the process before it ever serves a message; the longest legitimate
+/// step is the network check, which carries curl's own `--max-time 3`.
+pub const PROBE_STEP_TIMEOUT_SECS: u64 = 10;
+
+/// The canary the probe sets in its **own** environment. The sandbox must not
+/// see it.
+///
+/// `--clearenv` is what removes it, and `$HOME`/`$PATH` cannot prove that.
+/// Measured: removing `--clearenv` leaves a probe asserting only `$HOME`/`$PATH`
+/// passing 7/7, because `--setenv` sets exactly those two variables. With the
+/// canary present in the probe's environment, removing `--clearenv` leaks it
+/// (`canary=[SEGREDO]`) and the probe fails.
+pub const SMOKE_CANARY: &str = "HAOS_GREEN_SMOKE_CANARY";
+
+/// The CA bundle `curl` reads, and the reason the two certificate binds exist.
+///
+/// Checked from inside the sandbox because `-r` follows symlinks: measured on
+/// this host, binding `/etc/ssl/certs` **alone** leaves this path dangling
+/// (`/etc/ssl/certs/ca-certificates.crt` → `../../ca-certificates/extracted/
+/// tls-ca-bundle.pem`) and `[ -r ]` is false, which is exactly the state that
+/// makes `curl https://example.com` fail with `(77) error adding trust anchors`.
+pub const SMOKE_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+fn smoke(step: &str, detail: impl std::fmt::Display) -> IsolationUnavailable {
+    IsolationUnavailable::SmokeTestFailed(format!("{step}: {detail}"))
+}
+
+/// Run the production argv against a scratch job directory and assert the
+/// properties the boundary claims (spec §6). Any failure is
+/// [`IsolationUnavailable::SmokeTestFailed`], carrying the step that failed.
+///
+/// Called once at startup; the result is cached by being stored in the
+/// `ShellBackend` and the `Supervisor`.
+pub async fn probe(grants: &Grants) -> Result<(), IsolationUnavailable> {
+    // Not `tempfile`: it is a **dev**-dependency (`Cargo.toml:128`), so it is
+    // not available here. A private directory under the system temp root is
+    // enough, and it is removed on the way out.
+    let scratch = std::env::temp_dir().join(format!(
+        "haos-green-sandbox-probe-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = probe_at(Path::new("bwrap"), grants, &scratch).await;
+    // Best effort: a leftover scratch directory is a nuisance, not a fault.
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// The probe against an explicit binary and scratch root, so its own plumbing
+/// is testable without a real sandbox — the same seam as
+/// [`check_bwrap_version_at`].
+pub async fn probe_at(
+    bwrap: &Path,
+    grants: &Grants,
+    scratch: &Path,
+) -> Result<(), IsolationUnavailable> {
+    let job_dir = scratch.join("job");
+    std::fs::create_dir_all(&job_dir).map_err(|e| smoke("the scratch job directory", e))?;
+    let job_dir =
+        std::fs::canonicalize(&job_dir).map_err(|e| smoke("the scratch job directory", e))?;
+    // The probe's own cwd, deliberately OUTSIDE the job directory — and pinned
+    // to `/`, which is **present** inside the sandbox.
+    //
+    // This is not the plan's version, and the difference is measured. The plan
+    // pinned an unbound scratch directory, on the reasoning that "bwrap inherits
+    // the invoking process's cwd when `--chdir` is absent". That is only half the
+    // rule, and it is the half that removes the check's teeth: bwrap(1) says HOME
+    // "is used as the cwd in the sandbox if `--chdir` has not been explicitly
+    // specified and the current cwd is **not present inside the sandbox**". The
+    // argv sets HOME to the job directory and binds it, so pinning a directory
+    // the sandbox cannot see makes bwrap fall back to the job directory — and the
+    // `pwd` assertion below then passes with `--chdir` deleted. Verified by
+    // mutation on bubblewrap 0.12.0: with the unbound scratch directory,
+    // removing `--chdir` left the probe green.
+    //
+    // `/` is present inside the sandbox and is not the job directory, so bwrap
+    // preserves it when `--chdir` is absent and the assertion fails.
+    let probe_cwd = Path::new("/");
+
+    // One invocation, one tagged line per property, so a failure names the
+    // property rather than "the smoke test".
+    let script = format!(
+        "echo shell=ok; \
+         echo home=$HOME; \
+         echo path=$PATH; \
+         echo pwd=$(pwd -P); \
+         echo hostname=$(hostname); \
+         echo canary=${{{SMOKE_CANARY}-unset}}; \
+         if [ -r /etc/passwd ]; then echo passwd=readable; else echo passwd=unreadable; fi; \
+         if [ -e /etc/shadow ]; then echo shadow=present; else echo shadow=absent; fi; \
+         if [ -r {SMOKE_CA_BUNDLE} ]; then echo cabundle=readable; else echo cabundle=unreadable; fi; \
+         if touch .smoke-write 2>/dev/null; then echo writable=yes; else echo writable=no; fi"
+    );
+    let out = run_in_sandbox(
+        bwrap,
+        &job_dir,
+        grants,
+        &script,
+        probe_cwd,
+        "the base properties",
+    )
+    .await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let field = |k: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .map(str::to_string)
+    };
+    let expect = |k: &str, want: &str, what: &str| -> Result<(), IsolationUnavailable> {
+        match field(k).as_deref() {
+            Some(v) if v == want => Ok(()),
+            other => Err(smoke(what, format!("expected {k}={want}, got {other:?}"))),
+        }
+    };
+
+    let home = job_dir.to_string_lossy().to_string();
+    expect("shell", "ok", "the shell starts")?;
+    expect("home", &home, "$HOME is the job directory")?;
+    expect("path", "/usr/bin:/bin", "$PATH is the set value")?;
+    // NOT `$HOME`/`$PATH`: `--setenv` sets exactly those two, so measured, a
+    // probe asserting them passes with `--clearenv` removed. The canary is what
+    // has teeth.
+    expect(
+        "canary",
+        "unset",
+        "the inherited canary is absent (--clearenv ran)",
+    )?;
+    expect(
+        "pwd",
+        &home,
+        "the cwd is the job directory (--chdir took effect)",
+    )?;
+    expect("hostname", "haos-sandbox", "the hostname is haos-sandbox")?;
+    expect("passwd", "unreadable", "/etc/passwd is unreadable")?;
+    expect("shadow", "absent", "/etc/shadow is absent")?;
+    // Guarded by the same rule the argv uses to decide what to bind
+    // (`push_ro_bind_if_present`): a certificate path the host does not have is
+    // skipped, never demanded. On Debian/Ubuntu the second path is absent; on
+    // Fedora both are, and the base set as specified has no CA store at all.
+    if Path::new(SMOKE_CA_BUNDLE).exists() {
+        expect(
+            "cabundle",
+            "readable",
+            "the CA bundle is readable inside the sandbox",
+        )?;
+    }
+    expect("writable", "yes", "the job directory is writable")?;
+
+    // `--disable-userns` asks; with `--assert-userns-disabled` this is what
+    // proves the restriction took effect on this kernel.
+    let out = run_in_sandbox(
+        bwrap,
+        &job_dir,
+        grants,
+        "unshare --user true 2>/dev/null && echo nested=allowed || echo nested=blocked",
+        probe_cwd,
+        "nested user namespaces are blocked",
+    )
+    .await?;
+    if !String::from_utf8_lossy(&out.stdout).contains("nested=blocked") {
+        return Err(smoke(
+            "nested user namespaces are blocked",
+            "`unshare --user` succeeded inside the sandbox",
+        ));
+    }
+
+    // This is the check the two certificate binds exist for. curl is in `/usr`,
+    // which the base set binds; if it is not there the probe **fails**, naming
+    // that, rather than skipping the check — a silently skipped check is the
+    // failure mode this plan exists to avoid.
+    //
+    // It runs **only under a network grant**, and that is not a convenience.
+    // `--share-net` is what puts the sandbox in the host's network namespace;
+    // without it the sandbox has `lo` and nothing else, so DNS cannot leave and
+    // curl fails with `(6) Could not resolve host` before TLS is ever reached.
+    // Measured on this host: with the shipped default (empty) grant set, an
+    // unconditional HTTPS check fails with exactly that, which would make
+    // `probe()` refuse isolation for every operator who has not typed
+    // `/allow-net` — while the sandbox itself is fine. The certificate binds are
+    // therefore checked network-free by the `cabundle` field above, and
+    // end-to-end here only when there is a network to reach.
+    if grants.network {
+        let out = run_in_sandbox(
+            bwrap,
+            &job_dir,
+            grants,
+            "curl -fsS -o /dev/null -w 'http=%{http_code}' https://example.com",
+            probe_cwd,
+            "HTTPS works",
+        )
+        .await?;
+        let body = String::from_utf8_lossy(&out.stdout);
+        if !body.contains("http=2") {
+            return Err(smoke(
+                "HTTPS works",
+                format!(
+                    "curl exited {:?} with {body:?} / {:?}; a `(77) error adding trust anchors` \
+                     means the /etc/ssl/certs and /etc/ca-certificates binds are missing or \
+                     unresolvable",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ));
+        }
+    }
+
+    // The network, asserted against the grant set **actually in force**, so both
+    // states are covered rather than the default assumed. The probe holds a
+    // listener in its own namespace and never accepts from it: the kernel
+    // completes the handshake from the backlog, so "reachable" shows up as curl
+    // waiting for a response rather than as a refused connection (exit 7).
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| smoke("the loopback check", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| smoke("the loopback check", e))?
+        .port();
+    let out = run_in_sandbox(
+        bwrap,
+        &job_dir,
+        grants,
+        &format!(
+            "curl -sS --connect-timeout 2 --max-time 3 -o /dev/null \
+             http://127.0.0.1:{port}/ ; echo exit=$?"
+        ),
+        probe_cwd,
+        "the host network is reachable only under a grant",
+    )
+    .await?;
+    let reachable = !String::from_utf8_lossy(&out.stdout).contains("exit=7");
+    match (grants.network, reachable) {
+        (true, false) => {
+            return Err(smoke(
+                "the host network is reachable under a grant",
+                "the network grant is held but 127.0.0.1 is unreachable: --share-net did not \
+                 take effect",
+            ))
+        }
+        (false, true) => {
+            return Err(smoke(
+                "the host network is unreachable without a grant",
+                "no network grant is held but 127.0.0.1 is reachable",
+            ))
+        }
+        _ => {}
+    }
+    // The listener is still open here on purpose — dropping it would close the
+    // port and make the "reachable" case fail. The `drop` is explicit so the
+    // intent survives a later reordering of this function.
+    drop(listener);
+    Ok(())
+}
+
+/// Run the production argv in the sandbox, bounded. `step` names what the
+/// invocation was for, so a spawn failure or a timeout is reported the same way
+/// an assertion failure is.
+async fn run_in_sandbox(
+    bwrap: &Path,
+    job_dir: &Path,
+    grants: &Grants,
+    command: &str,
+    cwd: &Path,
+    step: &str,
+) -> Result<std::process::Output, IsolationUnavailable> {
+    let argv = build_argv(job_dir, grants, command);
+    let mut cmd = tokio::process::Command::new(bwrap);
+    cmd.args(&argv)
+        // The probe's own cwd: `--chdir` is what puts the sandbox in the job
+        // directory, and inheriting this one is exactly the silent pass the
+        // cwd check exists to catch.
+        .current_dir(cwd)
+        // The canary goes into the probe's own environment, which is what makes
+        // the "absent inside" assertion meaningful.
+        .env(SMOKE_CANARY, "SEGREDO")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd
+        .spawn()
+        .map_err(|e| smoke(step, format!("cannot run {}: {e}", bwrap.display())))?;
+    let bound = std::time::Duration::from_secs(PROBE_STEP_TIMEOUT_SECS);
+    match tokio::time::timeout(bound, child.wait_with_output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(smoke(step, e)),
+        Err(_) => Err(smoke(
+            step,
+            format!("did not finish within {PROBE_STEP_TIMEOUT_SECS}s"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +1190,267 @@ mod tests {
             msg.len() <= MAX_PROBE_TEXT + 128,
             "the probe's message must stay bounded, got {} bytes: {msg:?}",
             msg.len()
+        );
+    }
+
+    #[test]
+    fn argv_unshares_and_hardens_namespaces() {
+        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        assert!(a.contains(&"--unshare-all".to_string()));
+        // --unshare-all is only --unshare-user-try: it is silently skipped when
+        // the user namespace cannot be created, so it must be named explicitly.
+        assert!(a.contains(&"--unshare-user".to_string()));
+        assert!(a.contains(&"--disable-userns".to_string()));
+        assert!(a.contains(&"--assert-userns-disabled".to_string()));
+    }
+
+    #[test]
+    fn argv_detaches_the_terminal_and_dies_with_the_parent() {
+        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        assert!(a.contains(&"--new-session".to_string()), "TIOCSTI");
+        assert!(a.contains(&"--die-with-parent".to_string()));
+    }
+
+    #[test]
+    fn clearenv_comes_before_every_setenv() {
+        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let clear = a.iter().position(|x| x == "--clearenv").unwrap();
+        let setenvs: Vec<usize> = a
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| *x == "--setenv")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!setenvs.is_empty(), "HOME and PATH must be set");
+        for s in setenvs {
+            assert!(
+                s > clear,
+                "--setenv at {s} precedes --clearenv at {clear}, which would wipe it"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_links_the_dynamic_loader_paths() {
+        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        // Omitting /lib64 makes execvp fail with "No such file or directory".
+        for link in ["/bin", "/lib", "/lib64"] {
+            assert!(
+                a.windows(2).any(|w| w[0] == link),
+                "missing --symlink target {link}"
+            );
+        }
+        // ... and the *pairing* is what the loader actually needs. A link whose
+        // target is wrong is as broken as one that is absent, and the window
+        // check above cannot tell the two apart: `--symlink usr/lib64 /lib`
+        // satisfies it while leaving /lib64 with no loader.
+        for (target, link) in [
+            ("usr/bin", "/bin"),
+            ("usr/lib", "/lib"),
+            ("usr/lib64", "/lib64"),
+        ] {
+            assert!(
+                a.windows(3)
+                    .any(|w| w[0] == "--symlink" && w[1] == target && w[2] == link),
+                "expected --symlink {target} {link}, got {a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argv_isolates_the_hostname() {
+        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let i = a.iter().position(|x| x == "--hostname").unwrap();
+        assert_eq!(a[i + 1], "haos-sandbox");
+    }
+
+    /// `--chdir` is asserted statically as well as through the probe, because
+    /// the probe's runtime check rests on bwrap's documented cwd rule: without
+    /// `--chdir`, bwrap falls back to `$HOME` — which this same argv sets to the
+    /// job directory — whenever the invoking cwd is not present in the sandbox.
+    /// A future bubblewrap that changed that fallback would silently re-arm the
+    /// hole the probe's pinned cwd exists to close; the argv itself cannot drift
+    /// unnoticed.
+    #[test]
+    fn argv_pins_the_job_directory_as_the_working_directory() {
+        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let i = a.iter().position(|x| x == "--chdir").unwrap();
+        assert_eq!(a[i + 1], "/jobs/t/j");
+        // Immediately before the command, so a later flag cannot re-point it.
+        assert_eq!(a[i + 2], "/bin/sh");
+    }
+
+    #[test]
+    fn share_net_appears_only_when_the_network_grant_is_held() {
+        let none = Grants::default();
+        let net = Grants {
+            write: Default::default(),
+            network: true,
+        };
+        assert!(!build_argv(Path::new("/j"), &none, "x").contains(&"--share-net".to_string()));
+        assert!(build_argv(Path::new("/j"), &net, "x").contains(&"--share-net".to_string()));
+    }
+
+    #[test]
+    fn a_write_grant_becomes_a_read_write_bind() {
+        // A grant is the only way a host path becomes writable, and `--bind` is
+        // the only bubblewrap flag that makes one. Read-only would silently
+        // grant nothing.
+        let g = Grants {
+            write: [PathBuf::from("/var/lib")].into(),
+            network: false,
+        };
+        let a = build_argv(Path::new("/jobs/t/j"), &g, "x");
+        assert!(
+            a.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/var/lib" && w[2] == "/var/lib"),
+            "a granted path must be bound read-write, got {a:?}"
+        );
+        // And nothing is bound read-write without a grant.
+        let none = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
+        assert!(
+            !none
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/var/lib"),
+            "no grant, no writable host path: {none:?}"
+        );
+    }
+
+    #[test]
+    fn both_certificate_paths_are_bound_read_only_when_they_exist() {
+        // Load-bearing, not garnish: measured, without them `curl
+        // https://example.com` inside the sandbox fails with `curl: (77) error
+        // adding trust anchors from file: /etc/ssl/certs/ca-certificates.crt`.
+        let root = tempfile::tempdir().unwrap();
+        for p in ["etc/ssl/certs", "etc/ca-certificates"] {
+            std::fs::create_dir_all(root.path().join(p)).unwrap();
+        }
+        let mut a = Vec::new();
+        for p in ["/etc/ssl/certs", "/etc/ca-certificates"] {
+            push_ro_bind_if_present(&mut a, root.path(), p);
+        }
+        for p in ["/etc/ssl/certs", "/etc/ca-certificates"] {
+            assert!(
+                a.windows(3).any(|w| w[0] == "--ro-bind" && w[2] == p),
+                "{p} must be bound read-only, got {a:?}"
+            );
+        }
+        // And the production argv carries them on this host, where both exist.
+        let full = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
+        for p in ["/etc/ssl/certs", "/etc/ca-certificates"] {
+            if Path::new(p).exists() {
+                assert!(
+                    full.windows(3).any(|w| w[0] == "--ro-bind" && w[2] == p),
+                    "{p} exists on this host and must be bound: {full:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_certificate_path_is_skipped_rather_than_aborting_the_argv() {
+        // On Debian/Ubuntu `/etc/ca-certificates` does not exist. Pointed at a
+        // scratch root holding only one of the two, the other must simply not
+        // appear — the branch this host's own layout cannot exercise.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/ssl/certs")).unwrap();
+        let mut a = Vec::new();
+        for p in ["/etc/ssl/certs", "/etc/ca-certificates"] {
+            push_ro_bind_if_present(&mut a, root.path(), p);
+        }
+        assert!(a
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[2] == "/etc/ssl/certs"));
+        assert!(
+            !a.iter().any(|x| x == "/etc/ca-certificates"),
+            "a path that does not exist is skipped, never bound: {a:?}"
+        );
+        // And the argv it feeds is still complete.
+        let full = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
+        assert_eq!(full[full.len() - 3..], ["/bin/sh", "-c", "x"]);
+    }
+
+    #[test]
+    fn the_command_is_last_and_passed_verbatim() {
+        let a = build_argv(
+            Path::new("/jobs/t/j"),
+            &Grants::default(),
+            "run x; cat /etc/hostname",
+        );
+        assert_eq!(
+            a[a.len() - 3..],
+            ["/bin/sh", "-c", "run x; cat /etc/hostname"]
+        );
+    }
+
+    /// A fake `bwrap` that ignores its argv, records the physical cwd it
+    /// inherited, and exits 0. Used to drive the probe's own plumbing without a
+    /// real sandbox.
+    ///
+    /// `pwd -P`, not `pwd`: the child inherits `PWD` from this process, and the
+    /// shell builtin will echo that stale value if it looks valid.
+    fn stub_bwrap_recording_cwd(record: &Path) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bwrap");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\npwd -P > '{}'\nexit 0\n", record.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_cannot_start_a_shell_reports_smoke_test_failed() {
+        // The stub satisfies nothing the probe asks for, so the failure must
+        // come back as SmokeTestFailed — named, and through the variant spec §6
+        // requires rather than a panic.
+        let scratch = tempfile::tempdir().unwrap();
+        let (_dir, bin) = stub_bwrap_recording_cwd(&scratch.path().join("cwd.txt"));
+        match probe_at(&bin, &Grants::default(), scratch.path()).await {
+            Err(IsolationUnavailable::SmokeTestFailed(step)) => {
+                assert!(!step.is_empty(), "the failing step must be named");
+            }
+            other => panic!("expected SmokeTestFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_spawns_bwrap_from_a_cwd_of_its_own() {
+        // Measured, and documented in bwrap(1): HOME "is used as the cwd in the
+        // sandbox if `--chdir` has not been explicitly specified and the current
+        // cwd is not present inside the sandbox". The argv sets HOME to the job
+        // directory and binds it, so a probe spawned from a directory the
+        // sandbox cannot see would find the job directory as its cwd whether
+        // `--chdir` were present or not — and the probe's `pwd` assertion would
+        // then pass with `--chdir` deleted.
+        //
+        // The probe therefore pins `/`: present inside the sandbox, and not the
+        // job directory, so a missing `--chdir` leaves the cwd at `/` and is
+        // caught. This is the check that it does — the stub records the cwd it
+        // was spawned with.
+        //
+        // Asserting equality with the pinned directory (not merely "not the job
+        // directory") is what gives this teeth: the *test process's* cwd is
+        // already outside the job directory, so a probe that pinned nothing
+        // would satisfy the weaker assertion.
+        let scratch = tempfile::tempdir().unwrap();
+        let record = scratch.path().join("cwd.txt");
+        let (_dir, bin) = stub_bwrap_recording_cwd(&record);
+        let _ = probe_at(&bin, &Grants::default(), scratch.path()).await;
+        let seen = std::fs::read_to_string(&record).unwrap();
+        let job_dir = std::fs::canonicalize(scratch.path().join("job")).unwrap();
+        assert_eq!(
+            Path::new(seen.trim()),
+            Path::new("/"),
+            "the probe must pin its own cwd to a directory that exists inside the sandbox, \
+             or bwrap's HOME fallback masks a missing --chdir"
+        );
+        assert!(
+            !Path::new(seen.trim()).starts_with(&job_dir),
+            "the probe spawned bwrap from inside the job directory: {seen}"
         );
     }
 }
