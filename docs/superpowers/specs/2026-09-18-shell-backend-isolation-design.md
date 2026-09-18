@@ -5,6 +5,10 @@
 > host (bubblewrap 0.12.0, CachyOS, kernel 7.2.4-3-cachyos, running as uid 0),
 > not by assumption. Where a proposed correction turned out to be unnecessary,
 > or insufficient, that is recorded too.
+>
+> One review point was **decided against the review's own recommendation**: the
+> network default stays `host_network = true` at the operator's explicit
+> direction. §4 records what that opens.
 
 ## Objective
 
@@ -12,8 +16,15 @@ Make the supervisor's `ShellBackend` containment **real**. Today it runs the
 operator's task text as a shell command with no containment at all, behind a
 three-substring check that `sh` semantics defeat. After this work a shell job
 runs inside a bubblewrap sandbox that cannot see the host's home directory,
-`/etc`, the host's network, or the supervisor's environment — and when that
-sandbox is unavailable the operator is **asked**, not silently obeyed.
+`/etc`, or the supervisor's environment — and when that sandbox is unavailable
+the operator is **asked**, not silently obeyed.
+
+**What this does *not* promise: network isolation.** The shipped default is
+`host_network = true`, so a sandboxed job keeps the host's network namespace and
+can reach loopback services, the LAN and Tailscale. That is a deliberate
+operator decision, and §4 records the concrete sandbox-escape route it opens.
+The isolation this design delivers is a **filesystem and environment**
+boundary; the network is shared unless the operator opts out.
 
 ## The problem, with the evidence
 
@@ -270,25 +281,55 @@ enum UnsafeShellGrant {
 ```toml
 [supervisor.shell]
 sandbox      = "bwrap"   # "bwrap" | "none"
-host_network = false     # default: share the HOST network namespace
+host_network = true      # default: share the HOST network namespace
 ```
 
-**`host_network` defaults to `false`** (P0). The name is deliberate: `network =
-true` reads as "allow internet access", but what `--share-net` actually does is
-keep the **host's** network namespace. Measured exposure with it on: `lo enp2s0
-wlan0 tailscale0 virbr0 dnsstub`, with `127.0.0.1:8790` (the operator's own LLM
-gateway) reachable from inside the sandbox. That reaches loopback services, the
-LAN, Tailscale peers, VM bridges and any cloud metadata endpoint the host can
-reach. The config key now says so.
+**`host_network` defaults to `true`** — the operator's decision, taken with the
+exposure below on the table, against the recommendation of the review that
+produced this revision (whose priority table and §3 both argued for `false`).
 
-> **Open question, flagged rather than guessed.** The review that produced this
-> revision stated the network default twice and the two statements contradict:
-> the priority table and the section arguing the point both say change it to
-> `false`, while the concluding line of the duplicated message says
-> `network = TRUE padrao`. This revision implements **`false`**, on the weight of
-> the reviewer's own reasoning, and treats the lone `TRUE` as a typo. If it was
-> not a typo, this is a one-line change and the sandboxed job simply keeps the
-> host namespace by default.
+The name is deliberate, because `network = true` reads as "allow internet
+access" and that is not what it does. `--share-net` keeps the **host's** network
+namespace. Measured exposure: `lo enp2s0 wlan0 tailscale0 virbr0 dnsstub`, with
+`127.0.0.1:8790` (the operator's own LLM gateway) reachable from inside the
+sandbox. That reaches loopback services, the LAN, Tailscale peers, VM bridges
+and any cloud metadata endpoint the host can reach.
+
+> **Accepted risk, with the escape path written down.** Because loopback is
+> reachable by default, and the dashboard binds `127.0.0.1:8787` by default with
+> the credentials `admin`/`admin` and no forced password change (an accepted
+> decision documented in `CLAUDE.md`), and the web chat's tool policy includes
+> `execute_command` (`src/web/routes/chat.rs:661`), a sandboxed shell job has a
+> concrete route out of the sandbox:
+>
+> ```
+> job inside bwrap
+>   → POST http://127.0.0.1:8787/api/auth/login   (x-haos-green-csrf: 1, admin/admin)
+>   → POST /api/chat/sessions, then a message
+>   → execute_command on the HOST, outside bwrap
+> ```
+>
+> Every step is a documented, intended feature of the dashboard. No code is
+> broken; the sandbox is simply bypassed through a service the host itself
+> exposes. It requires the dashboard to be enabled **and** the default password
+> to be unchanged, and the operator is already warned about the latter by a
+> startup warning and a non-dismissible banner.
+>
+> Mitigations, in increasing order of strength — none of them is implemented by
+> this change, and this is recorded so the choice is visible rather than
+> implicit:
+>
+> 1. `host_network = false` (the reviewed recommendation): closes the path
+>    entirely, at the cost of the sandbox having no network.
+> 2. Refuse to start the listener when `host_network = true` and the dashboard
+>    password is still the default — turns the two accepted risks into one.
+> 3. Bind the dashboard to a non-loopback address behind a reverse proxy, so
+>    loopback inside the sandbox reaches nothing.
+>
+> Consequence for the probe: **the default configuration does not verify network
+> isolation**, because there is none to verify. The probe's loopback check runs
+> only under `host_network = false`, and the smoke test asserts the *documented*
+> behaviour of the configured mode rather than always asserting isolation.
 
 With `sandbox = "none"` nothing is gated: that mode **is** the operator's
 consent, and Layer 1 does not apply. `host_network` is ignored under `"none"`.
@@ -329,7 +370,10 @@ asserts the properties the boundary claims:
 - the sandbox directory is writable and `--chdir` took effect;
 - `hostname` is `haos-sandbox`;
 - `/etc/passwd` is not readable;
-- a TCP connect to the host's loopback fails (unless `host_network`);
+- a TCP connect to the host's loopback **succeeds** under the default
+  `host_network = true`, and **fails** under `host_network = false` — the smoke
+  test asserts the behaviour of the mode actually configured, because the
+  default mode has no network isolation to assert;
 - creating a nested user namespace fails (proves `--disable-userns` and
   `--assert-userns-disabled` actually took effect on this kernel).
 
@@ -367,7 +411,15 @@ Added, one per correction in this revision:
 - remove `--unshare-user` while keeping `--disable-userns` → the run must fail,
   not silently downgrade
 - move `--clearenv` after `--setenv` → `HOME` must come back empty
+- remove `--share-net` under `host_network = true` → the loopback check must
+  fail, proving the flag is actually what carries the reachability
 - `host_network = false` → loopback and LAN unreachable
+- **the loopback escape path must be demonstrated, not assumed**: with the
+  dashboard enabled, the default password unchanged, and `host_network = true`,
+  a sandboxed job must be shown to reach `/api/auth/login` and obtain a session.
+  This test asserts the *accepted risk*, so that removing the risk (by any of the
+  three mitigations) fails the test and forces the spec to be updated rather than
+  silently drifting.
 - remove `--hostname` → the host's hostname must be visible
 - set the sandbox root to `/` → config load must refuse
 - revoke the grant between Layer 1 and Layer 2 → Layer 2 must still refuse
