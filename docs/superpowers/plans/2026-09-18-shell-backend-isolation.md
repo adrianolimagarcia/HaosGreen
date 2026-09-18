@@ -1315,11 +1315,23 @@ Task 4; Layer 2 → Task 5; resource containment → Task 6; Layer 1 → Task 7;
 consent split → Task 8; smoke test with the production argv, mutation round,
 docs, gates → Task 9.
 
-**Known gap, deliberate:** the smoke test described in spec §6 is folded into
-Task 9's live tests rather than implemented as a startup probe in Task 1, so
-that startup does not pay for seven bubblewrap invocations. If the operator
-wants the full probe at startup, add it as a Task 1 step — the code is the same
-argv builder.
+**Where the smoke probe lands — decided after the Task 1 quality review.**
+Spec §6 requires `probe()` to run the production argv against a scratch job
+directory and assert the boundary's properties at startup. Task 1 could not
+build it (there was no argv builder yet), so `IsolationUnavailable::SmokeTestFailed`
+was declared with no producer. The quality reviewer correctly flagged that as
+speculative public API whose `Display` arm was also untested.
+
+The variant stays, and **the probe is added in Task 2**, immediately after
+`build_argv` exists — not deferred to Task 9. Task 9's live tests assert
+properties of a running sandbox; they do not return `IsolationUnavailable`, so
+folding the probe there would leave the variant dead and spec §6 unimplemented.
+Task 2 therefore also adds `probe()`, its `SmokeTestFailed` producer, and a test
+that a deliberately broken smoke step is reported through it.
+
+The startup cost is seven bubblewrap invocations once, cached for the process
+lifetime. That is the price of the spec's requirement, and it is paid at
+startup rather than per job.
 
 **Type consistency:** `IsolationUnavailable` (Task 1) is used in Tasks 5 and 7;
 `build_argv(&Path, bool, &str)` and `resolve_job_dir(&Path, &str, &str)`
