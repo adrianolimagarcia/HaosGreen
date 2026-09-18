@@ -1362,6 +1362,34 @@ So Task 2's probe must:
 Both are the failure mode this repo's testing section calls out: a test that
 passes for the wrong reason. Neither was visible from reading the argv.
 
+**The argv as written breaks HTTPS, which is a functional regression — measured.**
+
+`ShellBackend` today runs `sh -c` on the host with a complete `/etc`, so a job
+that fetches a URL works. The planned argv binds `/usr`, `/proc`, `/dev` and
+three `/etc` files, and nothing else from `/etc`. Measured from inside that
+sandbox with `host_network = true`:
+
+| Bound from `/etc` | `curl https://example.com` |
+|---|---|
+| `resolv.conf`, `nsswitch.conf`, `hosts` (the plan) | `curl: (77) error adding trust anchors from file: /etc/ssl/certs/ca-certificates.crt` |
+| `+ /etc/ssl/certs` | still `(77)` — the symlink dangles |
+| `+ /etc/ssl/certs` **and** `/etc/ca-certificates` | **HTTP 200** |
+| `/etc/ca-certificates` alone, without `/etc/ssl` | `(77)` — the symlink does not exist at all |
+
+The cause is the host's CA layout, not curl: on Arch/CachyOS
+`/etc/ssl/certs/ca-certificates.crt` is a symlink to
+`../../ca-certificates/extracted/tls-ca-bundle.pem`, so binding the directory
+that holds the *symlink* without binding its *target* leaves it dangling. On
+Debian/Ubuntu the bundle is a real file in `/etc/ssl/certs`, where binding that
+one directory is enough — so an argv tuned to either layout breaks on the other.
+
+Task 2 must therefore bind **both** `/etc/ssl/certs` and `/etc/ca-certificates`,
+each only if it exists, following the same bind-if-present pattern the plan
+already uses for `resolv.conf`. Read-only is correct and carries no secrets:
+these are public CA certificates. `getent hosts example.com` resolves correctly
+inside the sandbox with the plan's existing three `/etc` files, so DNS is not
+affected — only TLS was.
+
 **Type consistency:** `IsolationUnavailable` (Task 1) is used in Tasks 5 and 7;
 `build_argv(&Path, bool, &str)` and `resolve_job_dir(&Path, &str, &str)`
 (Tasks 2–3) are called with exactly those signatures in Task 5;
