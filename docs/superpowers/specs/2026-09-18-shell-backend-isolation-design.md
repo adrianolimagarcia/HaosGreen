@@ -222,9 +222,15 @@ with these invariants, each a hard failure rather than a warning:
 - the resolved path is absolute;
 - it is **not** `/`;
 - it is a strict descendant of `sandbox_root` (after canonicalisation, so
-  `..` and symlink tricks are already resolved);
-- `sandbox_root` is not `/`, not the home directory, and not inside
-  `~/.haos-green`;
+  `..` and symlink tricks are already resolved) — strictly below it, never
+  equal to it, so the job can never write at the root itself;
+- `sandbox_root` is not `/`, and `sandbox_root` is **not an ancestor of
+  `config.toml`**. The default root is `<home>/workspace` and the job directory
+  is `<home>/workspace/<task-id>/<job-id>`, so the job can write only below
+  `workspace/` and `config.toml` — a sibling, not a descendant — stays
+  unreachable. An operator who points the root at `<home>` itself is refused,
+  because then the job directory's parent *is* the directory holding the
+  secrets;
 - the directory is created if absent, and re-canonicalised **after** creation
   (a pre-existing symlink at that path is caught here, which is also the
   CVE-2026-87766 precondition).
