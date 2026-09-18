@@ -61,6 +61,47 @@ const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Longest capture kept, and longest text quoted back in an error message.
 const MAX_PROBE_TEXT: usize = 512;
 
+/// How many times a spawn the kernel refused with `ETXTBSY` is retried, and how
+/// long the first wait is. The wait doubles, so the whole retry budget stays
+/// well inside [`PROBE_TIMEOUT`].
+const SPAWN_RETRIES: u32 = 8;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(5);
+const SPAWN_RETRY_MAX_DELAY: Duration = Duration::from_millis(50);
+
+/// Spawn `<bin> --version`, waiting out a refusal the kernel reports as
+/// `ETXTBSY`.
+///
+/// `ExecutableFileBusy` is not a real failure: it means the binary is open for
+/// writing somewhere, which happens when a package manager replaces `bwrap` in
+/// place, and when one test thread's fork inherits another's still-open write
+/// descriptor. Both clear on their own within milliseconds, so the probe waits
+/// them out rather than reporting an isolation failure the operator cannot act
+/// on. A refusal that outlasts the retries is returned as an ordinary io error,
+/// which the caller turns into [`IsolationUnavailable::VersionUnreadable`] —
+/// never a pass.
+fn spawn_bwrap(bin: &Path) -> std::io::Result<std::process::Child> {
+    let mut delay = SPAWN_RETRY_DELAY;
+    let mut waits = 0;
+    loop {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy && waits < SPAWN_RETRIES =>
+            {
+                waits += 1;
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(SPAWN_RETRY_MAX_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Read a pipe to EOF, keeping only the first [`MAX_PROBE_TEXT`] bytes.
 ///
 /// The pipe is drained to the end even after the cap is reached: a child that
@@ -92,6 +133,11 @@ fn drain_capped(mut pipe: impl Read) -> Vec<u8> {
 /// grandchild lives — the very hang the deadline exists to survive. An
 /// abandoned capture comes back empty, which reads as `(no output)` and so
 /// fails closed.
+///
+/// Abandoning it leaks that reader thread and its two pipe descriptors until
+/// the grandchild exits and the pipe finally closes. That is deliberate: the
+/// probe runs once at startup, the caller is never pinned, and no zombie is
+/// left behind because the child itself is reaped before this is reached.
 fn join_within(handle: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) -> Vec<u8> {
     while !handle.is_finished() {
         if Instant::now() >= deadline {
@@ -122,6 +168,15 @@ fn describe_output(raw: &[u8]) -> String {
         end -= 1;
     }
     format!("{}… (truncated)", &trimmed[..end])
+}
+
+/// How the child ended, for an error message: `3` for an exit code, or the
+/// signal that killed it. `ExitStatus`'s own `Display` doubles the words up
+/// ("exit status: 3"), which would read as `exited with exit status: 3`.
+fn describe_status(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| status.to_string(), |code| code.to_string())
 }
 
 /// Why isolation is unavailable. One variant per distinct cause, so the
@@ -177,19 +232,13 @@ fn check_bwrap_version_at_within(
     bin: &Path,
     timeout: Duration,
 ) -> Result<(), IsolationUnavailable> {
-    let mut child = std::process::Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            // Genuinely not there to be found, on `PATH` or at the given path.
-            std::io::ErrorKind::NotFound => IsolationUnavailable::NotInstalled,
-            // Present but unrunnable (EACCES, ENOEXEC, ...). Saying "not
-            // installed" would send the operator after the wrong problem.
-            _ => IsolationUnavailable::VersionUnreadable(format!("{}: {e}", bin.display())),
-        })?;
+    let mut child = spawn_bwrap(bin).map_err(|e| match e.kind() {
+        // Genuinely not there to be found, on `PATH` or at the given path.
+        std::io::ErrorKind::NotFound => IsolationUnavailable::NotInstalled,
+        // Present but unrunnable (EACCES, ENOEXEC, ...). Saying "not
+        // installed" would send the operator after the wrong problem.
+        _ => IsolationUnavailable::VersionUnreadable(format!("{}: {e}", bin.display())),
+    })?;
 
     // Drain both pipes on their own threads. Reading them only once the child
     // has exited would deadlock the probe against any child that fills a pipe
@@ -255,7 +304,7 @@ fn check_bwrap_version_at_within(
         return Err(IsolationUnavailable::VersionUnreadable(format!(
             "{} --version exited with {}: {detail}",
             bin.display(),
-            status
+            describe_status(status)
         )));
     }
 
@@ -320,6 +369,8 @@ mod tests {
         // A truncated version is not a version: if `0.12` were padded to
         // `0.12.0`, an incomplete string would satisfy the floor.
         assert_eq!(parse_version("bubblewrap 0.12"), None);
+        // A non-numeric component must not be silently read as 0.
+        assert_eq!(parse_version("bubblewrap 0.12.xyz"), None);
     }
 
     #[test]
@@ -333,12 +384,21 @@ mod tests {
 
     #[test]
     fn a_vulnerable_version_is_refused_as_unavailable() {
-        let (_dir, bin) = stub_bwrap_reporting("bubblewrap 0.11.9");
-        let r = check_bwrap_version_at(&bin);
-        assert!(
-            matches!(r, Err(IsolationUnavailable::VersionTooOld(_))),
-            "0.11.9 must be refused as VersionTooOld, got {r:?}"
-        );
+        // Two different versions, so the variant has to carry the version it
+        // actually found: no single constant at the construction site can
+        // satisfy both.
+        for (line, expected) in [
+            ("bubblewrap 0.11.9", (0, 11, 9)),
+            ("bubblewrap 0.7.3", (0, 7, 3)),
+        ] {
+            let (_dir, bin) = stub_bwrap_reporting(line);
+            match check_bwrap_version_at(&bin) {
+                Err(IsolationUnavailable::VersionTooOld(v)) => {
+                    assert_eq!(v, expected, "wrong version carried for {line:?}");
+                }
+                other => panic!("{line} must be refused as VersionTooOld, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -366,6 +426,11 @@ mod tests {
         assert!(
             matches!(r, Err(IsolationUnavailable::VersionUnreadable(_))),
             "a non-zero exit must be refused as VersionUnreadable, got {r:?}"
+        );
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("exited with 1:"),
+            "the exit code must be reported as a bare number, got {msg:?}"
         );
     }
 
@@ -475,10 +540,35 @@ mod tests {
     /// as long as the grandchild lives, so the deadline has to cover it too.
     #[test]
     fn a_grandchild_holding_the_pipe_does_not_pin_the_probe() {
-        let (_dir, bin) = stub_bwrap_running("sleep 30 &\nexit 0");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bwrap");
+        let pidfile = dir.path().join("grandchild.pid");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > {}\nexit 0\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let started = Instant::now();
         let r = check_bwrap_version_at_within(&bin, Duration::from_millis(150));
         let elapsed = started.elapsed();
+
+        // Kill the sleeper this test deliberately left holding the pipe, so the
+        // suite does not leave an orphan behind on every run.
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: the pid was just reported by the shell this test started,
+            // and signalling an already-exited pid is a no-op.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+
         assert!(
             matches!(r, Err(IsolationUnavailable::VersionUnreadable(_))),
             "an unreadable capture must fail closed, got {r:?}"
@@ -486,6 +576,45 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "the probe must not wait on a grandchild's pipe, took {elapsed:?}"
+        );
+    }
+
+    /// A binary held open for writing makes the kernel refuse the exec with
+    /// `ETXTBSY`. The condition is transient — a package manager replacing
+    /// `bwrap` in place does the same — so the probe waits it out rather than
+    /// reporting an isolation failure the operator cannot act on.
+    ///
+    /// Holding the descriptor across the first spawn makes the refusal certain
+    /// rather than a race, so this is the deterministic form of the flake the
+    /// module suite saw about one run in ten.
+    #[test]
+    fn a_binary_open_for_writing_is_waited_out_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bwrap");
+        std::fs::write(&bin, "#!/bin/sh\necho 'bubblewrap 0.12.0'\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let held = std::fs::OpenOptions::new().write(true).open(&bin).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(held);
+        });
+        let started = Instant::now();
+        let r = check_bwrap_version_at(&bin);
+        let elapsed = started.elapsed();
+        releaser.join().unwrap();
+
+        assert!(
+            r.is_ok(),
+            "a transient ETXTBSY must be waited out, not reported as unavailable, got {r:?}"
+        );
+        // The writer is released only after 30ms, so success before that would
+        // mean the first spawn never met the refusal and the retry went
+        // untested.
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "the probe must have retried the refused spawn, took {elapsed:?}"
         );
     }
 
@@ -511,8 +640,15 @@ mod tests {
         );
 
         // ... and the same bound holds at the boundary, through a real probe.
-        let (_dir, bin) = stub_bwrap_running("printf '%5000s' '' | tr ' ' x");
+        // 1 MiB, far past the 64 KiB pipe buffer: the child cannot exit unless
+        // the reader keeps draining after the cap is reached, so a reader that
+        // stops at the cap shows up here as a child that never finished.
+        let (_dir, bin) = stub_bwrap_running("head -c 1048576 /dev/zero | tr '\\000' x");
         let msg = check_bwrap_version_at(&bin).unwrap_err().to_string();
+        assert!(
+            msg.contains("unrecognised output"),
+            "the child must run to completion with its output read, got {msg:?}"
+        );
         assert!(
             msg.len() <= MAX_PROBE_TEXT + 128,
             "the probe's message must stay bounded, got {} bytes: {msg:?}",
