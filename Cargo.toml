@@ -63,7 +63,7 @@ pulldown-cmark = "0.12"
 # SQLite vector search extension
 sqlite-vec = "0.1"
 
-# Setup wizard web server (used by rustfox --setup)
+# Setup wizard web server (used by haos-green --setup)
 axum = "0.8"
 
 # Embed bundled skills/agents into the binary for cargo install
@@ -89,7 +89,7 @@ argon2 = "0.5"
 # Secret-redaction filter
 regex = "1"
 
-# OS home-directory resolution for the persistent home dir (~/.rustfox)
+# OS home-directory resolution for the persistent home dir (~/.haos-green)
 dirs = "5"
 
 # Unix process group management (kill child process trees)

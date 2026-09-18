@@ -38,7 +38,7 @@ Copy `config.example.toml` to `config.toml` and fill in credentials.
 ### Home directory
 
 HaosGreen stores all state under a single home directory (default `~/.haos-green`),
-resolved as: `HAOS_GREEN_HOME` env (or `RUSTFOX_HOME`, absolute) → `[general].home` config → `~/.haos-green` (with fallback to `~/.rustfox`).
+resolved as: `HAOS_GREEN_HOME` env (absolute) → `[general].home` config → `~/.haos-green`.
 Layout: `config.toml`, `haos-green.db`, `skills/`, `agents/`, `workspace/` (the
 sandbox), `artifacts/`, `user_model.md`, and `web-auth.toml` (the dashboard
 credentials, mode 0600, created on the first dashboard start). Each path can be
@@ -280,7 +280,7 @@ integration files in `tests/`). When adding tests:
   supervisor lifecycle, the log routes and the A2A routes.
 - The live tests in `tests/web_endpoint.rs` and `tests/a2a_e2e_live.rs` are
   `#[ignore]`d **and** re-checked at runtime against `HAOS_GREEN_WEB_LIVE=1` and
-  `RUSTFOX_A2A_LIVE=1` respectively, so plain `cargo test` passes with both
+  `HAOS_GREEN_A2A_LIVE=1` respectively, so plain `cargo test` passes with both
   unset — which is how CI runs it.
 - Both live tests talk to an OpenAI-compatible endpoint on
   `127.0.0.1:8790` and ask for a specific model. Endpoint and model are

@@ -25,7 +25,7 @@ Relevant prior art, all committed:
   `SqliteTaskStore`, serves a listener on `127.0.0.1:0`, and drives
   `SendMessage` to `TASK_STATE_COMPLETED` against the live OpenAI-compatible
   endpoint `http://127.0.0.1:8790/v1` (model `a6api_DeepSeek-V4-Flash-0731`).
-  It is `#[ignore]`d and gated on `RUSTFOX_A2A_LIVE=1`. **Reuse this harness —
+  It is `#[ignore]`d and gated on `HAOS_GREEN_A2A_LIVE=1`. **Reuse this harness —
   do not rebuild the Agent construction.**
 
 ### SDK facts verified from source
@@ -347,7 +347,7 @@ the right wire error.
 
 - [ ] **Step 2: Run it**
 
-Run: `RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture`
+Run: `HAOS_GREEN_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture`
 Expected: both tests PASS.
 
 - [ ] **Step 3: Run the suite without the env var**
@@ -414,7 +414,7 @@ to use; if the SDK already handles the in-flight race, adapt. Do not assume.
 
 - [ ] **Step 3: Run it**
 
-Run: `RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture`
+Run: `HAOS_GREEN_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture`
 Expected: `canceled` path PASS.
 
 - [ ] **Step 4: Full gates**

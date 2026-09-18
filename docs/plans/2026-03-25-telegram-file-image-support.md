@@ -417,7 +417,7 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
 
     // Collect attachments
     let mut attachments = Vec::new();
-    let temp_dir = std::env::temp_dir().join(format!("rustfox_{}", uuid::Uuid::new_v4()));
+    let temp_dir = std::env::temp_dir().join(format!("haos-green_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).ok();
 
     // Handle photo

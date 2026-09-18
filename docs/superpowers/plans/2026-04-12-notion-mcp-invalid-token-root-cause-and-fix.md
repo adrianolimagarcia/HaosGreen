@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ensure RustFox connects to `https://mcp.notion.com/mcp` with a credential Notion accepts: an **OAuth 2.0 access token** obtained via Authorization Code + PKCE, sent as `Authorization: Bearer <access_token>`, per [Integrating your own MCP client](https://developers.notion.com/guides/mcp/build-mcp-client).
+**Goal:** Ensure HaosGreen connects to `https://mcp.notion.com/mcp` with a credential Notion accepts: an **OAuth 2.0 access token** obtained via Authorization Code + PKCE, sent as `Authorization: Bearer <access_token>`, per [Integrating your own MCP client](https://developers.notion.com/guides/mcp/build-mcp-client).
 
 **Architecture:** The bot already uses `rmcp` streamable HTTP with `StreamableHttpClientTransportConfig::auth_header` ([`src/mcp.rs`](../../../src/mcp.rs)). The setup wizard ([`setup/index.html`](../../../setup/index.html), [`src/bin/setup.rs`](../../../src/bin/setup.rs)) implements discovery (RFC 9470 → RFC 8414), dynamic registration, PKCE, and token exchange. The gap is not “missing OAuth code” in the abstract—it is **operational**: users (or stale config) can still persist the **wrong token type**, which produces exactly the log you see.
 
@@ -52,7 +52,7 @@ From [Integrating your own MCP client](https://developers.notion.com/guides/mcp/
 5. **MCP connect:** `Authorization: Bearer <access_token>` on streamable HTTP to `https://mcp.notion.com/mcp` (SSE fallback optional).
 6. **Refresh:** Access tokens expire (~1 hour per Notion); refresh token rotation must persist the latest refresh token.
 
-RustFox **implements 1–5 in setup**; the **runtime bot** only sends `auth_token` from config—it does not refresh (see Task 4).
+HaosGreen **implements 1–5 in setup**; the **runtime bot** only sends `auth_token` from config—it does not refresh (see Task 4).
 
 ---
 
@@ -75,7 +75,7 @@ RustFox **implements 1–5 in setup**; the **runtime bot** only sends `auth_toke
 **Files:** User’s `config.toml` (local).
 
 - [ ] **Step 1:** Open `config.toml` and inspect `[[mcp_servers]]` for `name = "notion"`.
-- [ ] **Step 2:** If `auth_token` starts with `ntn_` or looks like an integration secret, **delete that value** and obtain a token via the wizard only: `cargo run --bin setup` → enable Notion → **Connect Notion** → complete browser login → confirm the token field updates → **Save** → restart `cargo run --bin rustfox`.
+- [ ] **Step 2:** If `auth_token` starts with `ntn_` or looks like an integration secret, **delete that value** and obtain a token via the wizard only: `cargo run --bin setup` → enable Notion → **Connect Notion** → complete browser login → confirm the token field updates → **Save** → restart `cargo run --bin haos-green`.
 - [ ] **Step 3:** Expected log: connection succeeds (no `invalid_token`). If it still fails, capture **redacted** first 20 chars of `auth_token` and whether `expires_in` was shown in OAuth callback (for support).
 
 ---

@@ -94,7 +94,7 @@ const SAFE_KEYS: [&str; 14] = [
 
 - [ ] **Step 2: Run tests to verify no regressions**
 
-Run: `cargo test -p rustfox --lib platform::tool_notifier::tests 2>&1`
+Run: `cargo test -p haos-green --lib platform::tool_notifier::tests 2>&1`
 Expected: All existing tests pass. The test `test_format_args_preview_redacts_sensitive_single_arg` will now FAIL because it expects `{"command": "..."}` to be redacted, but it's no longer sensitive. We need to update that test.
 
 - [ ] **Step 3: Fix the failing test**
@@ -160,7 +160,7 @@ fn test_truncate_tail_chinese() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p rustfox -- utils::strings::tests --test test_truncate_tail 2>&1`
+Run: `cargo test -p haos-green -- utils::strings::tests --test test_truncate_tail 2>&1`
 Expected: FAIL — `truncate_tail` not defined
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -184,7 +184,7 @@ pub fn truncate_tail(s: &str, max_chars: usize) -> String {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p rustfox -- utils::strings::tests --test test_truncate_tail 2>&1`
+Run: `cargo test -p haos-green -- utils::strings::tests --test test_truncate_tail 2>&1`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1044,7 +1044,7 @@ fn test_table_renders_columns() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p rustfox -- utils::markdown_entities::tests --test test_blockquote 2>&1`
+Run: `cargo test -p haos-green -- utils::markdown_entities::tests --test test_blockquote 2>&1`
 Expected: FAIL — blockquote/table not handled
 
 - [ ] **Step 3: Add `StackTag` variants**

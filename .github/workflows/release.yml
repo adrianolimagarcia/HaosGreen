@@ -17,16 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            rustfox_bin: rustfox
-            archive_name: rustfox-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            bin: haos-green
+            archive_name: haos-green-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            rustfox_bin: rustfox
-            archive_name: rustfox-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            bin: haos-green
+            archive_name: haos-green-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            rustfox_bin: rustfox.exe
-            archive_name: rustfox-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+            bin: haos-green.exe
+            archive_name: haos-green-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           mkdir staging
-          cp target/release/${{ matrix.rustfox_bin }} staging/
+          cp target/release/${{ matrix.bin }} staging/
           cp config.example.toml staging/
           cp scripts/install.sh staging/
           cp -r scripts/services staging/services
@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/rustfox dist/
+          cp target/release/haos-green dist/
           TARGET=${{ matrix.target }} ./scripts/build-deb.sh
 
       - name: Upload artifact

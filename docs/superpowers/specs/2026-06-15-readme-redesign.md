@@ -46,7 +46,7 @@ Section                     Content
                              sandboxed, LLM, self-hosted)
 
 [Features]                  8 hero features selected to highlight
-                            RustFox's unique value (moved from current
+                            HaosGreen's unique value (moved from current
                             35-bullet list). The remaining features
                             (streaming, file/image OCR, RAG query
                             rewriting, long-term memory, nightly
@@ -67,10 +67,10 @@ Section                     Content
 
 [Quick Start]               4 steps with copy-paste code blocks:
                             1. Install (release download or cargo install)
-                            2. Configure (rustfox --setup)
-                            3. Run (rustfox)
+                            2. Configure (haos-green --setup)
+                            3. Run (haos-green)
                             4. (Optional) Install as background service
-                               (rustfox --service install)
+                               (haos-green --service install)
 
 [Configuration]             Key settings table (6 essentials):
                             bot_token, allowed_user_ids, api_key, model,
@@ -96,7 +96,7 @@ Section                     Content
 ```
 Section                     Content
 ────────────────────────────────────────────────────────────────────
-[H1 + TOC]                  RustFox Guide with collapsible TOC
+[H1 + TOC]                  HaosGreen Guide with collapsible TOC
 
 [Configuration]             All TOML settings in one table:
                             telegram, openrouter, sandbox, memory,
@@ -167,11 +167,11 @@ Section                     Content
 
 - **First 200 characters** contain: "Telegram AI assistant", "Rust",
   "agentic", "OpenRouter", "MCP", "sandboxed", "LLM"
-- **H1** contains: "RustFox — Telegram AI Assistant" (keyword-rich)
+- **H1** contains: "HaosGreen — Telegram AI Assistant" (keyword-rich)
 - **Feature section** uses natural language an AI answer engine would
   surface: "a self-hosted agentic Telegram AI assistant written in Rust"
-- **Quick Start** answers common queries: "how to install RustFox",
-  "how to configure Telegram bot", "how to run RustFox as a service"
+- **Quick Start** answers common queries: "how to install HaosGreen",
+  "how to configure Telegram bot", "how to run HaosGreen as a service"
 - **All external links** use descriptive anchor text (not "click here")
 
 ## Implementation Notes

@@ -8,7 +8,7 @@
 
 ## Overview
 
-Three features are being added to RustFox to address context loss and improve user experience:
+Three features are being added to HaosGreen to address context loss and improve user experience:
 
 1. **Chat History RAG** — Framework auto-injects semantically relevant past messages into every LLM turn (no LLM token cost to decide to search).
 2. **Nightly Summarization** — A cron job summarizes each active conversation nightly, keeping context bounded as history grows.
@@ -129,7 +129,7 @@ When loading messages for a conversation:
 New optional config field (with sensible default):
 ```toml
 [memory]
-database_path = "rustfox.db"
+database_path = "haos-green.db"
 summarize_cron = "0 0 2 * * *"   # Optional, default: 2am UTC daily
 max_raw_messages = 50             # Optional, default: 50
 summarize_threshold = 20          # Optional, default: min messages before summarizing

@@ -1,8 +1,8 @@
-# Context-Aware Compaction & Memory Management for RustFox
+# Context-Aware Compaction & Memory Management for HaosGreen
 
 ## Overview
 
-RustFox's compaction system (Tiers 1-4) currently drops the system prompt, sends all old messages verbatim to the summarizer LLM, produces free-form summaries, and relies on a static `context_window` from config. This spec addresses all four gaps with targeted changes (Approach C).
+HaosGreen's compaction system (Tiers 1-4) currently drops the system prompt, sends all old messages verbatim to the summarizer LLM, produces free-form summaries, and relies on a static `context_window` from config. This spec addresses all four gaps with targeted changes (Approach C).
 
 ## Files Touched
 

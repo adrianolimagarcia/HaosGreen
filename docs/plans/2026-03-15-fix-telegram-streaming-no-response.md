@@ -81,7 +81,7 @@ fn test_stream_handle_does_not_require_placeholder_send() {
 **Step 2: Run the test to see it fail**
 
 ```bash
-cargo test -p rustfox test_stream_handle_does_not_require_placeholder_send -- --nocapture 2>&1 | tail -20
+cargo test -p haos-green test_stream_handle_does_not_require_placeholder_send -- --nocapture 2>&1 | tail -20
 ```
 
 Expected output: `FAILED` — assertion fails because `\u{200B}` is still present.
@@ -180,7 +180,7 @@ Key changes vs old code:
 **Step 2: Run the failing test to verify it now passes**
 
 ```bash
-cargo test -p rustfox test_stream_handle_does_not_require_placeholder_send -- --nocapture 2>&1 | tail -10
+cargo test -p haos-green test_stream_handle_does_not_require_placeholder_send -- --nocapture 2>&1 | tail -10
 ```
 
 Expected: `PASSED`

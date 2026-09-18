@@ -5,12 +5,12 @@
 
 ## Problem
 
-RustFox runs as a foreground process. Users must manually keep it running (tmux, screen, nohup). There's no standard install path, build artifacts for other platforms, or `--setup` command in the main binary. Currently setup is a separate binary (`src/bin/setup.rs`) with no service integration.
+HaosGreen runs as a foreground process. Users must manually keep it running (tmux, screen, nohup). There's no standard install path, build artifacts for other platforms, or `--setup` command in the main binary. Currently setup is a separate binary (`src/bin/setup.rs`) with no service integration.
 
 ## Goals
 
-1. **`rustfox --setup` subcommand** — integrated into the main binary, launches web wizard (browser on `:8719`) or TUI (`--cli`)
-2. **`rustfox --service` subcommand** — manage background service: install, remove, status, start, stop
+1. **`haos-green --setup` subcommand** — integrated into the main binary, launches web wizard (browser on `:8719`) or TUI (`--cli`)
+2. **`haos-green --service` subcommand** — manage background service: install, remove, status, start, stop
 3. **Cross-platform background service** — systemd (Linux), launchd (macOS), Windows Service
 4. **Build scripts** — `.deb`, `.rpm`, `.tar.gz`, `.zip` packages
 5. **GitHub Actions release workflow** — builds all targets, attaches to GitHub Releases
@@ -34,21 +34,21 @@ src/
 │   ├── wizard.rs           # Web + CLI wizard (extracted from bin/setup.rs)
 │   └── service.rs          # Service install/remove/status/start/stop
 ├── bin/
-│   └── setup.rs            # Thin wrapper → rustfox::setup::run()
+│   └── setup.rs            # Thin wrapper → haos-green::setup::run()
 └── main.rs                 # Parse --setup / --service before normal bot start
 ```
 
 ### CLI interface
 
 ```
-rustfox                          # Normal bot start (existing)
-rustfox --setup                  # Opens web wizard on http://localhost:8719
-rustfox --setup --cli            # Terminal wizard
-rustfox --service install        # Install + enable + start background service
-rustfox --service remove         # Stop + disable + remove service
-rustfox --service status         # Show service status
-rustfox --service start          # Start service (no install)
-rustfox --service stop           # Stop service (no remove)
+haos-green                          # Normal bot start (existing)
+haos-green --setup                  # Opens web wizard on http://localhost:8719
+haos-green --setup --cli            # Terminal wizard
+haos-green --service install        # Install + enable + start background service
+haos-green --service remove         # Stop + disable + remove service
+haos-green --service status         # Show service status
+haos-green --service start          # Start service (no install)
+haos-green --service stop           # Stop service (no remove)
 ```
 
 ### Arg parsing migration
@@ -62,7 +62,7 @@ This conflicts with `--setup` and `--service` subcommands. The fix:
 
 1. Add a `--config <PATH>` flag to `main.rs` to explicitly set the config path
 2. The first positional arg is deprecated but still supported for backwards compat
-3. If no `--config` flag and no positional arg, fall back to existing discovery logic (CWD → `~/.rustfox/config.toml`)
+3. If no `--config` flag and no positional arg, fall back to existing discovery logic (CWD → `~/.haos-green/config.toml`)
 
 Dispatch logic:
 ```
@@ -80,24 +80,24 @@ After the wizard saves config, it asks "Install as background service? [Y/n]" an
 
 | Platform | Mechanism | Template location | Config | Run as |
 |----------|-----------|-------------------|--------|--------|
-| Linux | systemd --user | `~/.config/systemd/user/rustfox.service` | `~/.rustfox/config.toml` | Current user |
-| macOS | launchd agent | `~/Library/LaunchAgents/com.rustfox.bot.plist` | `~/.rustfox/config.toml` | Current user |
-| Windows | sc.exe or Win32 API | SCM database | `%USERPROFILE%\.rustfox\config.toml` | Current user |
+| Linux | systemd --user | `~/.config/systemd/user/haos-green.service` | `~/.haos-green/config.toml` | Current user |
+| macOS | launchd agent | `~/Library/LaunchAgents/com.haos-green.bot.plist` | `~/.haos-green/config.toml` | Current user |
+| Windows | sc.exe or Win32 API | SCM database | `%USERPROFILE%\.haos-green\config.toml` | Current user |
 
 Service templates are NOT embedded with hardcoded paths. At install time, `service::install()` calls `std::env::current_exe()`, renders the binary path and config path into the template, and writes the rendered file. This guarantees the service always runs the correct binary regardless of where it was installed (cargo, .deb, tarball, etc.).
 
 #### systemd user service (Linux)
 
-Template (`scripts/services/rustfox.service.template`):
+Template (`scripts/services/haos-green.service.template`):
 ```ini
 [Unit]
-Description=RustFox Telegram AI Assistant
+Description=HaosGreen Telegram AI Assistant
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={{RUSTFOX_BIN}} --config {{RUSTFOX_CONFIG}}
+ExecStart={{HAOS_GREEN_BIN}} --config {{HAOS_GREEN_CONFIG}}
 Restart=on-failure
 RestartSec=5
 
@@ -105,11 +105,11 @@ RestartSec=5
 WantedBy=default.target
 ```
 
-At install time, `{{RUSTFOX_BIN}}` is replaced with the actual binary path and `{{RUSTFOX_CONFIG}}` with `~/.rustfox/config.toml`. The rendered file is written to `~/.config/systemd/user/rustfox.service`, then `systemctl --user daemon-reload && systemctl --user enable --now rustfox.service` is executed.
+At install time, `{{HAOS_GREEN_BIN}}` is replaced with the actual binary path and `{{HAOS_GREEN_CONFIG}}` with `~/.haos-green/config.toml`. The rendered file is written to `~/.config/systemd/user/haos-green.service`, then `systemctl --user daemon-reload && systemctl --user enable --now haos-green.service` is executed.
 
 #### launchd agent (macOS)
 
-Template (`scripts/services/com.rustfox.bot.plist.template`):
+Template (`scripts/services/com.haos-green.bot.plist.template`):
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -117,36 +117,36 @@ Template (`scripts/services/com.rustfox.bot.plist.template`):
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.rustfox.bot</string>
+    <string>com.haos-green.bot</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{RUSTFOX_BIN}}</string>
+        <string>{{HAOS_GREEN_BIN}}</string>
         <string>--config</string>
-        <string>{{RUSTFOX_CONFIG}}</string>
+        <string>{{HAOS_GREEN_CONFIG}}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{{RUSTFOX_HOME}}/Library/Logs/rustfox.log</string>
+    <string>{{HAOS_GREEN_HOME}}/Library/Logs/haos-green.log</string>
     <key>StandardErrorPath</key>
-    <string>{{RUSTFOX_HOME}}/Library/Logs/rustfox.log</string>
+    <string>{{HAOS_GREEN_HOME}}/Library/Logs/haos-green.log</string>
 </dict>
 </plist>
 ```
 
-NOTE: launchd does NOT support `%h` or `~` expansion in `StandardOutPath`. The template uses `{{RUSTFOX_HOME}}` which is replaced with the absolute home directory path at render time.
+NOTE: launchd does NOT support `%h` or `~` expansion in `StandardOutPath`. The template uses `{{HAOS_GREEN_HOME}}` which is replaced with the absolute home directory path at render time.
 
 #### Windows Service
 
 Install script (`scripts/install-service.bat.template`):
 ```batch
 @echo off
-sc create RustFox binPath= "{{RUSTFOX_BIN}} --config {{RUSTFOX_CONFIG}}" start=auto
-sc description RustFox "RustFox Telegram AI Assistant"
-sc failure RustFox reset=86400 actions=restart/5000/restart/10000
-sc start RustFox
+sc create HaosGreen binPath= "{{HAOS_GREEN_BIN}} --config {{HAOS_GREEN_CONFIG}}" start=auto
+sc description HaosGreen "HaosGreen Telegram AI Assistant"
+sc failure HaosGreen reset=86400 actions=restart/5000/restart/10000
+sc start HaosGreen
 ```
 
 ## Rust implementation
@@ -211,14 +211,14 @@ pub fn install() -> Result<()> {
 Service templates use `{{MUSTACHE}}`-style placeholders. At install time, `service::install()` calls `std::env::current_exe()`, reads the template `.toml` file (or an embedded string if using `include_str!`), replaces placeholders, and writes the rendered file. The Rust `service.rs` module implements a simple string replacement function — no templating library dependency needed.
 
 Placeholder substitution:
-- `{{RUSTFOX_BIN}}` → `std::env::current_exe()` (the binary being run, as absolute path)
-- `{{RUSTFOX_CONFIG}}` → `{home_dir}/.rustfox/config.toml` (where `home_dir` = `dirs::home_dir()`)
-- `{{RUSTFOX_HOME}}` → `{home_dir}/.rustfox` (where `home_dir` = `dirs::home_dir()`)
+- `{{HAOS_GREEN_BIN}}` → `std::env::current_exe()` (the binary being run, as absolute path)
+- `{{HAOS_GREEN_CONFIG}}` → `{home_dir}/.haos-green/config.toml` (where `home_dir` = `dirs::home_dir()`)
+- `{{HAOS_GREEN_HOME}}` → `{home_dir}/.haos-green` (where `home_dir` = `dirs::home_dir()`)
 
 Implementation in `service.rs`:
 ```rust
 fn home() -> PathBuf {
-    dirs::home_dir().expect("HOME must be set").join(".rustfox")
+    dirs::home_dir().expect("HOME must be set").join(".haos-green")
 }
 ```
 
@@ -227,11 +227,11 @@ fn home() -> PathBuf {
 Rather than duplicating the wizard from `src/bin/setup.rs`, the plan is to:
 
 1. Move the shared wizard logic into `src/setup/wizard.rs`
-2. Keep `src/bin/setup.rs` as a thin CLI wrapper that calls `rustfox::setup::wizard::run()`
+2. Keep `src/bin/setup.rs` as a thin CLI wrapper that calls `haos-green::setup::wizard::run()`
 3. The main binary's `--setup` flag calls the same function
 4. This avoids any behavior change for existing users of `./setup.sh` or `cargo run --bin setup`
 
-**`src/lib.rs`** must add `pub mod setup;` to the module declarations so `main.rs` can import `rustfox::setup::*`.
+**`src/lib.rs`** must add `pub mod setup;` to the module declarations so `main.rs` can import `haos-green::setup::*`.
 
 ## Build and packaging
 
@@ -259,17 +259,17 @@ The `scripts/build-deb.sh` script receives the target triple as an argument and 
 ### Package layout (Linux .deb example)
 
 ```
-rustfox_1.0.0_amd64.deb
+haos-green_1.0.0_amd64.deb
 ├── DEBIAN/
 │   ├── control
-│   ├── postinst    # install service: systemctl --user enable --now rustfox
-│   └── prerm       # remove service: systemctl --user disable --now rustfox
+│   ├── postinst    # install service: systemctl --user enable --now haos-green
+│   └── prerm       # remove service: systemctl --user disable --now haos-green
 └── usr/
     └── bin/
-        └── rustfox
+        └── haos-green
 ```
 
-Service templates shipped in `/usr/share/rustfox/` for the postinst script to copy to `~/.config/systemd/user/`.
+Service templates shipped in `/usr/share/haos-green/` for the postinst script to copy to `~/.config/systemd/user/`.
 
 ### GitHub Actions release workflow
 
@@ -310,7 +310,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
-          path: target/release/rustfox${{ matrix.ext == 'zip' && '.exe' || '' }}
+          path: target/release/haos-green${{ matrix.ext == 'zip' && '.exe' || '' }}
           if-no-files-found: error
 
   package:
@@ -343,13 +343,13 @@ jobs:
 Artifact filenames use the Rust target triple (not shortened arch names):
 
 ```
-rustfox-v1.0.0-x86_64-unknown-linux-gnu.tar.gz   # ubuntu-latest runner
-rustfox-v1.0.0-aarch64-apple-darwin.tar.gz       # macos-latest runner (arm64)
-rustfox-v1.0.0-x86_64-pc-windows-msvc.zip        # windows-latest runner
+haos-green-v1.0.0-x86_64-unknown-linux-gnu.tar.gz   # ubuntu-latest runner
+haos-green-v1.0.0-aarch64-apple-darwin.tar.gz       # macos-latest runner (arm64)
+haos-green-v1.0.0-x86_64-pc-windows-msvc.zip        # windows-latest runner
 ```
 
 Each archive contains:
-- `rustfox` binary (or `rustfox.exe` on Windows)
+- `haos-green` binary (or `haos-green.exe` on Windows)
 - `config.example.toml`
 - `install.sh` or `install-service.bat`
 - Service template files for the platform
@@ -357,7 +357,7 @@ Each archive contains:
 ## Data flow
 
 ```
-User runs: rustfox --setup
+User runs: haos-green --setup
   ↓
 main.rs parses --setup flag
   ↓
@@ -371,17 +371,17 @@ Config saved. Ask: "Install as background service? [Y/n]"
   └── Yes → setup::service::install()
               ↓
               ┌─ Linux:   write systemd unit → systemctl --user daemon-reload
-              │           → systemctl --user enable --now rustfox
+              │           → systemctl --user enable --now haos-green
               ├─ macOS:   write launchd plist → launchctl load -w
               └─ Windows: sc create + sc failure + sc start
               ↓
-              Print: "RustFox installed as a background service."
+              Print: "HaosGreen installed as a background service."
 ```
 
 ## Error handling
 
 - Service install errors are **non-fatal** — config is already written to disk first
-- After a failed `service::install()`, the wizard prints the error and instructions, then exits. The user can retry with `rustfox --service install` later
+- After a failed `service::install()`, the wizard prints the error and instructions, then exits. The user can retry with `haos-green --service install` later
 - `--service` subcommand validates the platform is supported before doing anything (returns clear error on unsupported OS)
 - Each service action prints user-friendly error if a platform tool is missing (e.g., "systemctl not found — is systemd installed?")
 - The wizard's Axum server gracefully shuts down after config save (existing pattern) regardless of service install result
@@ -390,6 +390,6 @@ Config saved. Ask: "Install as background service? [Y/n]"
 
 - Docker image (separate work item)
 - Cross-compilation for all targets from a single CI runner
-- Auto-update mechanism (`rustfox --update`)
+- Auto-update mechanism (`haos-green --update`)
 - Integration tests for service scripts
 - Homebrew formula for macOS

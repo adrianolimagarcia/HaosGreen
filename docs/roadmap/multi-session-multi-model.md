@@ -4,7 +4,7 @@
 
 ## Motivation
 
-Today RustFox runs a **single chat session** with **one model at a time**. You `/models` to switch, and the whole bot changes personality.
+Today HaosGreen runs a **single chat session** with **one model at a time**. You `/models` to switch, and the whole bot changes personality.
 
 But power users want:
 

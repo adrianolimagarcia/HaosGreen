@@ -1,10 +1,10 @@
-# RustFox Autopilot Supervisor Implementation Plan
+# HaosGreen Autopilot Supervisor Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Spec:** `docs/plans/2026-04-30-autopilot-supervisor-design.md`
 
-**Goal:** Evolve RustFox from a single-loop AI assistant into a generic autonomous **task supervisor** with a task-first state machine, pluggable backends (Claude Code CLI, Codex CLI, shell, MCP, the existing in-process Agent, …), policy-driven autonomy, evidence-based verification, and resumable persisted state.
+**Goal:** Evolve HaosGreen from a single-loop AI assistant into a generic autonomous **task supervisor** with a task-first state machine, pluggable backends (Claude Code CLI, Codex CLI, shell, MCP, the existing in-process Agent, …), policy-driven autonomy, evidence-based verification, and resumable persisted state.
 
 **Architecture:** A new `src/supervisor/` module sits *above* the existing `Agent`. Telegram (and later CLI/HTTP) intake calls `Supervisor::submit(user_request)` instead of `Agent::process_message` directly. The supervisor classifies the request into a normalized `Task`, picks a `Workflow` (Fast / Standard / Rigorous), the policy engine decides autonomy/clarification/approval, the orchestrator dispatches `Job`s through capability-matched `Backend` adapters (the current `Agent` becomes the default reasoning backend), the verification engine confirms evidence, and every transition is persisted as an artifact. Existing modules (`memory`, `mcp`, `tools`, `scheduler`, `skills`, `langsmith`) are reused; nothing is greenfield.
 
@@ -218,7 +218,7 @@ Purpose: create the empty supervisor module wired into `main.rs` so later tasks 
 #[test]
 fn supervisor_module_compiles() {
     // Compiling = passing. The module must be `pub` from the crate root.
-    let _ = std::any::type_name::<rustfox::supervisor::Supervisor>();
+    let _ = std::any::type_name::<haos-green::supervisor::Supervisor>();
 }
 ```
 
@@ -227,7 +227,7 @@ fn supervisor_module_compiles() {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test exists`
-Expected: FAIL — `unresolved import 'rustfox::supervisor'` or `lib not found`.
+Expected: FAIL — `unresolved import 'haos-green::supervisor'` or `lib not found`.
 (If the project has no `lib.rs` yet, this task instead asserts via `cargo check` after step 3.)
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -1241,12 +1241,12 @@ git commit -m "supervisor(M1): ArtifactManager (filesystem + sup_artifacts index
 
 ```rust
 // tests/supervisor/intake_classifier.rs
-use rustfox::supervisor::{Supervisor, SubmitOutcome};
+use haos-green::supervisor::{Supervisor, SubmitOutcome};
 
 #[tokio::test]
 async fn submit_persists_task_and_writes_artifacts() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos-green::memory::MemoryStore::open_in_memory().unwrap();
     let sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
 
     let outcome = sup.submit("telegram", "u1", Some("c1"),
@@ -1396,7 +1396,7 @@ pub mod tools;
 pub mod utils;
 ```
 
-`src/main.rs` keeps `mod` lines but now they can be replaced with `use rustfox::*;` — instead, do the lighter touch: leave `main.rs` untouched and add `lib.rs` that re-exports. Verify `cargo build` still produces both `rustfox` (bin) and `rustfox` (lib).
+`src/main.rs` keeps `mod` lines but now they can be replaced with `use haos-green::*;` — instead, do the lighter touch: leave `main.rs` untouched and add `lib.rs` that re-exports. Verify `cargo build` still produces both `haos-green` (bin) and `haos-green` (lib).
 
 - [ ] **Step 4: Run** the integration test → PASS.
 
@@ -2460,12 +2460,12 @@ git commit -m "supervisor(M3): Reporter human-readable summary"
 
 ```rust
 // tests/supervisor/e2e_fast_mode.rs
-use rustfox::supervisor::{Supervisor, SubmitOutcome};
+use haos-green::supervisor::{Supervisor, SubmitOutcome};
 
 #[tokio::test]
 async fn fast_mode_runs_to_completion_and_reports() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos-green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("done:{p}")) });
 
@@ -2476,7 +2476,7 @@ async fn fast_mode_runs_to_completion_and_reports() {
     let report = sup.execute_now(&task_id).await.unwrap();
     assert!(report.contains("done:"));
     let final_state = sup.state(&task_id).await.unwrap();
-    assert_eq!(final_state, rustfox::supervisor::task::TaskStatus::Done);
+    assert_eq!(final_state, haos-green::supervisor::task::TaskStatus::Done);
 }
 ```
 
@@ -2623,7 +2623,7 @@ In the message handler, when text starts with `/supervise`, call `agent.supervis
 ```rust
 // main.rs additions (sketch)
 let artifacts_dir = config.supervisor.artifacts_dir.clone();
-let supervisor = Arc::new(rustfox::supervisor::Supervisor::new(
+let supervisor = Arc::new(haos-green::supervisor::Supervisor::new(
     artifacts_dir, memory.connection(),
     /* preconfigured Registry from BackendsConfig (built below) */));
 ```
@@ -2767,7 +2767,7 @@ async fn rigorous_code_task_creates_workspace_before_execute() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
 
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos-green::memory::MemoryStore::open_in_memory().unwrap();
     let mut sup = Supervisor::new_for_test_with_repo(
         dir.path().into(), dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(p) });
@@ -3266,7 +3266,7 @@ git commit -m "supervisor(M7): risk-threshold-driven autonomy gate"
 #[tokio::test]
 async fn supervisor_restores_paused_tasks_on_startup() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
+    let memory = haos-green::memory::MemoryStore::open_in_memory().unwrap();
     {
         let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
         sup.register_test_reasoning_backend(|p| async move { Ok(p) });
@@ -3389,8 +3389,8 @@ async fn dod_general_assistant_fast_mode() { /* Task 3.7 already covers this */ 
 #[tokio::test]
 async fn dod_research_workflow_artifacts_present() {
     let dir = tempfile::tempdir().unwrap();
-    let memory = rustfox::memory::MemoryStore::open_in_memory().unwrap();
-    let mut sup = rustfox::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection());
+    let memory = haos-green::memory::MemoryStore::open_in_memory().unwrap();
+    let mut sup = haos-green::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection());
     sup.register_test_reasoning_backend(|p| async move { Ok(format!("research:{p}")) });
     let id = sup.submit("telegram","u","c","research async runtimes").await.unwrap().task_id();
     sup.execute_now(&id).await.unwrap();

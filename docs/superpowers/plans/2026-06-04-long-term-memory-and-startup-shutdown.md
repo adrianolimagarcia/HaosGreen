@@ -41,11 +41,11 @@ conn.execute_batch(
 
 - [ ] **Step 2: Run existing tests to confirm nothing broke**
 
-Run: `cargo test -p rustfox --lib memory::tests`
+Run: `cargo test -p haos-green --lib memory::tests`
 Expected: All pass
 
 ```bash
-cargo test -p rustfox --lib memory::tests
+cargo test -p haos-green --lib memory::tests
 ```
 
 - [ ] **Step 3: Commit**
@@ -110,11 +110,11 @@ async fn test_get_or_create_skips_archived() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox --lib memory::conversations::tests::test_get_or_create_skips_archived -- --nocapture`
+Run: `cargo test -p haos-green --lib memory::conversations::tests::test_get_or_create_skips_archived -- --nocapture`
 Expected: FAIL — `assert_ne` fails because the old archived conversation is returned
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_get_or_create_skips_archived -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_get_or_create_skips_archived -- --nocapture
 ```
 
 - [ ] **Step 3: Modify `get_or_create_conversation` to filter archived**
@@ -140,7 +140,7 @@ to:
 Same command as Step 2. Expected: PASS
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_get_or_create_skips_archived -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_get_or_create_skips_archived -- --nocapture
 ```
 
 - [ ] **Step 5: Commit**
@@ -209,11 +209,11 @@ async fn test_clear_archives_instead_of_deleting() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox --lib memory::conversations::tests::test_clear_archives_instead_of_deleting -- --nocapture`
+Run: `cargo test -p haos-green --lib memory::conversations::tests::test_clear_archives_instead_of_deleting -- --nocapture`
 Expected: FAIL — message count is 0 after delete
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_clear_archives_instead_of_deleting -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_clear_archives_instead_of_deleting -- --nocapture
 ```
 
 - [ ] **Step 3: Replace `clear_conversation` implementation**
@@ -241,7 +241,7 @@ are all removed. The conversation and its messages remain searchable.
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_clear_archives_instead_of_deleting -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_clear_archives_instead_of_deleting -- --nocapture
 ```
 
 Expected: PASS
@@ -249,7 +249,7 @@ Expected: PASS
 - [ ] **Step 5: Run all memory tests to check nothing else broke**
 
 ```bash
-cargo test -p rustfox --lib memory
+cargo test -p haos-green --lib memory
 ```
 
 Expected: All pass. (Existing tests like `test_search_messages_scoped_to_conversation` should still pass.)
@@ -304,7 +304,7 @@ async fn test_load_messages_excludes_archived() {
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_load_messages_excludes_archived -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_load_messages_excludes_archived -- --nocapture
 ```
 
 Expected: FAIL — messages are still returned after archive
@@ -348,7 +348,7 @@ let mut raw_stmt = conn.prepare(
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_load_messages_excludes_archived -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_load_messages_excludes_archived -- --nocapture
 ```
 
 Expected: PASS
@@ -356,7 +356,7 @@ Expected: PASS
 - [ ] **Step 5: Run all tests**
 
 ```bash
-cargo test -p rustfox --lib
+cargo test -p haos-green --lib
 ```
 
 Expected: All pass
@@ -389,7 +389,7 @@ pub fn server_count(&self) -> usize {
 - [ ] **Step 2: Verify it compiles**
 
 ```bash
-cargo check -p rustfox
+cargo check -p haos-green
 ```
 
 Expected: No errors
@@ -439,7 +439,7 @@ BotCommand::new("clear", "Archive the current conversation, keeping past message
 - [ ] **Step 3: Verify tests pass**
 
 ```bash
-cargo test -p rustfox --lib platform::telegram::tests
+cargo test -p haos-green --lib platform::telegram::tests
 ```
 
 Expected: All pass
@@ -500,7 +500,7 @@ async fn test_search_messages_finds_archived_content() {
 - [ ] **Step 2: Run test**
 
 ```bash
-cargo test -p rustfox --lib memory::conversations::tests::test_search_messages_finds_archived_content -- --nocapture
+cargo test -p haos-green --lib memory::conversations::tests::test_search_messages_finds_archived_content -- --nocapture
 ```
 
 Expected: PASS
@@ -541,7 +541,7 @@ pub async fn notify_startup(
     };
 
     let msg = format!(
-        "RustFox is online 🦊\n\
+        "HaosGreen is online 🦊\n\
          Model: {}\n\
          MCP: {} server(s) connected\n\
          Skills: {} loaded\n\
@@ -573,7 +573,7 @@ pub async fn notify_shutdown(
     bot: &teloxide::Bot,
     allowed_user_ids: &[u64],
 ) {
-    let msg = "RustFox is going offline. Goodbye!";
+    let msg = "HaosGreen is going offline. Goodbye!";
 
     for &user_id in allowed_user_ids {
         let chat_id = teloxide::types::ChatId(user_id as i64);
@@ -620,7 +620,7 @@ This goes between the `info!("Starting...")` and the `let commands = ...` block.
 - [ ] **Step 4: Verify compilation**
 
 ```bash
-cargo check -p rustfox
+cargo check -p haos-green
 ```
 
 Expected: No errors
@@ -702,7 +702,7 @@ with:
 - [ ] **Step 2: Verify compilation**
 
 ```bash
-cargo check -p rustfox
+cargo check -p haos-green
 ```
 
 Expected: No errors

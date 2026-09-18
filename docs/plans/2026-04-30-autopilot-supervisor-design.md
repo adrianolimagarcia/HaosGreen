@@ -1,4 +1,4 @@
-# RustFox Autopilot Supervisor — Design (Spec v2)
+# HaosGreen Autopilot Supervisor — Design (Spec v2)
 
 > Source: user-provided spec, lightly reformatted for the repo. This is the design
 > document that the implementation plan (`2026-04-30-autopilot-supervisor.md`)
@@ -6,7 +6,7 @@
 
 ## 1. Purpose
 
-RustFox shall evolve from a task-oriented AI assistant into a general-purpose
+HaosGreen shall evolve from a task-oriented AI assistant into a general-purpose
 autonomous **task supervisor** for daily use. It must be able to:
 
 - accept user intent in natural language,
@@ -318,7 +318,7 @@ each transition; resume continues from last stable state.
 
 ## 25. Definition of Done
 
-RustFox v2 is complete when it can:
+HaosGreen v2 is complete when it can:
 
 - accept arbitrary user tasks,
 - classify them correctly,
@@ -335,7 +335,7 @@ RustFox v2 is complete when it can:
 
 ## 26. Final Design Statement
 
-RustFox should be a general autonomous task supervisor with a task router, a
+HaosGreen should be a general autonomous task supervisor with a task router, a
 policy engine, pluggable backends, reusable skills, explicit workflows,
 evidence-based completion, and resumable state. Claude Code CLI, Codex CLI,
 shell jobs, MCP jobs, and future tools should be treated as **interchangeable
@@ -343,7 +343,7 @@ execution backends**, not as architectural assumptions.
 
 ---
 
-## Mapping to Existing RustFox Code
+## Mapping to Existing HaosGreen Code
 
 The plan that derives from this spec must not greenfield — it must integrate
 with the existing module layout:

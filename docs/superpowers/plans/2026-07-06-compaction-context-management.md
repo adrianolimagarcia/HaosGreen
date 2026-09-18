@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) for syntax tracking.
 
-**Goal:** Add dynamic context window detection, system prompt preservation, structured YAML+state summaries, RAG-assisted compaction, and configurable hybrid search to RustFox's compaction system.
+**Goal:** Add dynamic context window detection, system prompt preservation, structured YAML+state summaries, RAG-assisted compaction, and configurable hybrid search to HaosGreen's compaction system.
 
 **Architecture:** Six focused changes across the provider layer, memory layer, agent prompt builder, and agent loop. ProviderConfig gains a runtime context_window_cache with a background warmup task. The compact flow partitions system messages before summarization, injects retrieved RAG context and tool-group-aware truncation, then rebuilds system messages after. vec0 tables gain metadata columns for pre-filtering.
 

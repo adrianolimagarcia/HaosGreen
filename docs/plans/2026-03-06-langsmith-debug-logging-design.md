@@ -57,7 +57,7 @@ impl LangSmithClient {
 ### Trace hierarchy per user message
 
 ```
-[chain] "rustfox_request"            ← root: full user message → final response
+[chain] "haos-green_request"            ← root: full user message → final response
   ├── [llm]  "llm_call"              ← iteration 0: messages + LLM response
   ├── [tool] "read_file"             ← tool executed
   ├── [tool] "run_command"           ← another tool
@@ -82,7 +82,7 @@ Headers:
 ```json
 {
   "id": "<uuid>",
-  "name": "rustfox_request",
+  "name": "haos-green_request",
   "run_type": "chain",
   "inputs": { "message": "<user text>" },
   "start_time": "<ISO8601>",
@@ -164,7 +164,7 @@ pub langsmith: Option<LangSmithConfig>,
 # Optional: LangSmith observability
 # [langsmith]
 # api_key = "ls__..."
-# project = "rustfox"   # default: "default"
+# project = "haos-green"   # default: "default"
 ```
 
 ---

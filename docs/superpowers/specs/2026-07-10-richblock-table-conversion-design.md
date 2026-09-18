@@ -1,12 +1,12 @@
 # Rich Message Conversion — Native Tables via sendRichMessage
 
 **Date:** 2026-07-10
-**Feature:** Convert RustFox's markdown→entity pipeline to use `sendRichMessage` (Bot API 10.1)
+**Feature:** Convert HaosGreen's markdown→entity pipeline to use `sendRichMessage` (Bot API 10.1)
 **Primary benefit:** Native `RichBlockTable` rendering for markdown pipe tables
 
 ## Problem
 
-RustFox currently renders markdown pipe tables as plain text with pipe separators:
+HaosGreen currently renders markdown pipe tables as plain text with pipe separators:
 
 ```
 A | B
@@ -225,7 +225,7 @@ if send_rich_message(token, stream_chat_id, &chunk_markdown).await.is_err() {
 After `let bot = Arc::new(teloxide::Bot::new(&config.telegram.bot_token));`, add:
 
 ```rust
-rustfox::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
+haos-green::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
 ```
 
 ### Data flow

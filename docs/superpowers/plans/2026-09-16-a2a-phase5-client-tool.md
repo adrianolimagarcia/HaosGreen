@@ -4,9 +4,9 @@
 
 **Goal:** Add a safe outbound A2A client and `call_a2a_agent` tool, proving Agent Card discovery, authenticated messaging, bounded polling, and failure handling.
 
-**Architecture:** `src/a2a/client.rs` owns outbound HTTP/SDK interaction and exposes a small `A2aClient` API. It uses an explicit reqwest timeout, bearer interceptor for RPC calls, authenticated card discovery, and bounded polling with a deadline. `src/a2a/tool.rs` adapts that API to RustFox's `ToolHandler`; peers are selected only from configured outbound entries and secrets are never logged. Tests use local ephemeral A2A routers and real HTTP without external services.
+**Architecture:** `src/a2a/client.rs` owns outbound HTTP/SDK interaction and exposes a small `A2aClient` API. It uses an explicit reqwest timeout, bearer interceptor for RPC calls, authenticated card discovery, and bounded polling with a deadline. `src/a2a/tool.rs` adapts that API to HaosGreen's `ToolHandler`; peers are selected only from configured outbound entries and secrets are never logged. Tests use local ephemeral A2A routers and real HTTP without external services.
 
-**Tech Stack:** Rust 2021, `a2a-client-lf 0.2.5`, `a2a-lf 0.3.1`, reqwest 0.12, axum, Tokio, serde_json, RustFox ToolHandler.
+**Tech Stack:** Rust 2021, `a2a-client-lf 0.2.5`, `a2a-lf 0.3.1`, reqwest 0.12, axum, Tokio, serde_json, HaosGreen ToolHandler.
 
 ---
 

@@ -1,4 +1,4 @@
-# RustFox Guide
+# HaosGreen Guide
 
 - [Configuration](#configuration)
 - [MCP Server Integration](#mcp-server-integration)
@@ -13,7 +13,7 @@
 
 ## Configuration
 
-RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.example.toml) to get started, or use `rustfox --setup` for the guided wizard.
+HaosGreen reads `config.toml` on startup. Copy [`config.example.toml`](../config.example.toml) to get started, or use `haos-green --setup` for the guided wizard.
 
 ### All Settings
 
@@ -25,7 +25,7 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 | | `model` | LLM model ID | `moonshotai/kimi-k2.6` |
 | | `base_url` | API base URL override | `https://openrouter.ai/api/v1` |
 | `[sandbox]` | `allowed_directory` | Directory for sandboxed file/command ops | `<home>/workspace` |
-| `[memory]` | `database_path` | SQLite database path | `<home>/rustfox.db` |
+| `[memory]` | `database_path` | SQLite database path | `<home>/haos-green.db` |
 | | `user_model_path` | User model file path | `<home>/user_model.md` |
 | | `query_rewriter_enabled` | Enable RAG query rewriting | `false` |
 | `[embedding]` | `model` | Embedding model for vector search | `qwen/qwen3-embedding-8b` |
@@ -36,22 +36,22 @@ RustFox reads `config.toml` on startup. Copy [`config.example.toml`](../config.e
 | `[agents]` | `directory` | Instance agent files directory | `<home>/agents/` |
 | `[subagents]` | `default_tools` | Default tool list for subagents | — |
 | `[[mcp_servers]]` | *(see below)* | MCP server definitions | — |
-| `[general]` | `home` | Absolute path overriding `~/.rustfox` | — |
+| `[general]` | `home` | Absolute path overriding `~/.haos-green` | — |
 | | `location` | Your location (injected into system prompt) | — |
 | `[agent]` | `max_iterations` | Max agentic loop iterations | `25` |
 | `[langsmith]` | `api_key` | LangSmith API key for LLM observability | — |
 | `[learning]` | `skill_extraction_enabled` | Post-task skill extraction | `false` |
 | `[supervisor]` | `default_autonomy_mode` | Workflow mode: `fast`, `standard`, `rigorous` | `standard` |
 
-> Persistent home: All paths resolve relative to `~/.rustfox` by default.
-> Override with `RUSTFOX_HOME` env or `[general].home`.
+> Persistent home: All paths resolve relative to `~/.haos-green` by default.
+> Override with `HAOS_GREEN_HOME` env or `[general].home`.
 > See [docs/persistent-home-directory.md](persistent-home-directory.md).
 
 ---
 
 ## MCP Server Integration
 
-RustFox supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) — an open standard for connecting AI assistants to external tools and data sources.
+HaosGreen supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) — an open standard for connecting AI assistants to external tools and data sources.
 
 ### Prerequisites
 
@@ -175,7 +175,7 @@ MCP tools are namespaced as `mcp_<server-name>_<tool-name>` (e.g. `mcp_git_git_l
 
 | Tool | Description |
 |------|-------------|
-| `plan_create` | Create a structured execution plan (`.rustfox_plan.json` in sandbox) |
+| `plan_create` | Create a structured execution plan (`.haos-green_plan.json` in sandbox) |
 | `plan_update` | Update a step's status or notes |
 | `plan_view` | View the current plan and step statuses |
 
@@ -304,7 +304,7 @@ Optional observability via LangSmith for LLM calls, tool runs, and chain traces.
 - [x] Nightly conversation summarization
 - [x] Verbose tool UI (`/verbose`)
 - [x] File & image upload support (vision API + OCR + document extraction)
-- [x] Persistent home directory (`~/.rustfox` with env/config override)
+- [x] Persistent home directory (`~/.haos-green` with env/config override)
 - [x] Autopilot v2 supervisor (classification, planning, multi-backend execution)
 - [x] LangSmith observability (LLM/tool/chain tracing)
 - [x] Post-task skill extraction + user model persistence

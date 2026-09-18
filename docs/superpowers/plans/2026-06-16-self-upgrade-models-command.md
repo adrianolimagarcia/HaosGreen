@@ -169,12 +169,12 @@ fn detect_deployment_mode() -> UpgradeMode {
     UpgradeMode::Release
 }
 
-/// Detect if RustFox is running as a systemd/launchd service.
+/// Detect if HaosGreen is running as a systemd/launchd service.
 fn is_service_installed() -> bool {
     #[cfg(target_os = "linux")]
     {
         let service_path = dirs::home_dir()
-            .map(|h| h.join(".config").join("systemd").join("user").join("rustfox.service"));
+            .map(|h| h.join(".config").join("systemd").join("user").join("haos-green.service"));
         if let Some(p) = service_path {
             if p.exists() {
                 return true;
@@ -184,7 +184,7 @@ fn is_service_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
         let plist_path = dirs::home_dir()
-            .map(|h| h.join("Library").join("LaunchAgents").join("com.rustfox.bot.plist"));
+            .map(|h| h.join("Library").join("LaunchAgents").join("com.haos-green.bot.plist"));
         if let Some(p) = plist_path {
             if p.exists() {
                 return true;
@@ -194,7 +194,7 @@ fn is_service_installed() -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        if let Ok(output) = Command::new("sc").args(["query", "RustFox"]).output() {
+        if let Ok(output) = Command::new("sc").args(["query", "HaosGreen"]).output() {
             if output.status.success() {
                 return true;
             }
@@ -210,7 +210,7 @@ pub fn restart_bot() -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
             let mut child = std::process::Command::new("systemctl")
-                .args(["--user", "restart", "rustfox.service"])
+                .args(["--user", "restart", "haos-green.service"])
                 .spawn()
                 .context("Failed to spawn systemctl restart")?;
             let _ = child.wait();
@@ -218,7 +218,7 @@ pub fn restart_bot() -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         {
             let mut child = std::process::Command::new("launchctl")
-                .args(["stop", "com.rustfox.bot"])
+                .args(["stop", "com.haos-green.bot"])
                 .spawn()
                 .context("Failed to spawn launchctl stop")?;
             let _ = child.wait();
@@ -226,12 +226,12 @@ pub fn restart_bot() -> anyhow::Result<()> {
         #[cfg(target_os = "windows")]
         {
             let mut child = std::process::Command::new("sc")
-                .args(["stop", "RustFox"])
+                .args(["stop", "HaosGreen"])
                 .spawn()
                 .context("Failed to spawn sc stop")?;
             let _ = child.wait();
             let mut child = std::process::Command::new("sc")
-                .args(["start", "RustFox"])
+                .args(["start", "HaosGreen"])
                 .spawn()
                 .context("Failed to spawn sc start")?;
             let _ = child.wait();
@@ -301,7 +301,7 @@ pub async fn self_upgrade(
             if !status_output.trim().is_empty() {
                 let stash_result = run_git_command(
                     &project_root,
-                    &["stash", "push", "-m", "rustfox-auto-stash-before-update"],
+                    &["stash", "push", "-m", "haos-green-auto-stash-before-update"],
                 ).await?;
                 log.push_str(&format!("  ⚠ Stashed: {}\n", stash_result.trim()));
             }
@@ -357,8 +357,8 @@ pub async fn self_upgrade(
             let update_result = tokio::task::spawn_blocking(|| {
                 self_update::backends::github::Update::configure()
                     .repo_owner("chinkan")
-                    .repo_name("RustFox")
-                    .bin_name("rustfox")
+                    .repo_name("HaosGreen")
+                    .bin_name("haos-green")
                     .show_download_progress(false)
                     .current_version(self_update::cargo_crate_version!())
                     .build()
@@ -381,12 +381,12 @@ pub async fn self_upgrade(
     if is_service_installed() {
         log.push_str("\n→ Re-registering service...\n");
         prog();
-        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("rustfox"));
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("haos-green"));
         let service_output = tokio::process::Command::new(&exe)
             .args(["--service", "install"])
             .output()
             .await
-            .context("Failed to run rustfox --service install")?;
+            .context("Failed to run haos-green --service install")?;
         let service_log = format!("{}{}",
             String::from_utf8_lossy(&service_output.stdout),
             String::from_utf8_lossy(&service_output.stderr));
@@ -501,7 +501,7 @@ git commit -m "chore: update tool_notifier display for self_upgrade"
 ### Task 6: Update systemd service template
 
 **Files:**
-- Modify: `scripts/services/rustfox.service.template`
+- Modify: `scripts/services/haos-green.service.template`
 
 - [ ] **Step 1: Change Restart policy**
 
@@ -510,7 +510,7 @@ Replace `Restart=on-failure` with `Restart=always` on line 9 of the template.
 - [ ] **Step 2: Commit**
 
 ```bash
-git add scripts/services/rustfox.service.template
+git add scripts/services/haos-green.service.template
 git commit -m "chore: change systemd Restart from on-failure to always"
 ```
 

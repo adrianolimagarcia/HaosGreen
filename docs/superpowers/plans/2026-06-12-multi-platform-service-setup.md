@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Integrate setup wizard into `rustfox --setup`, add `rustfox --service` for background service management across Linux/macOS/Windows, and provide build scripts + CI for release artifacts.
+**Goal:** Integrate setup wizard into `haos-green --setup`, add `haos-green --service` for background service management across Linux/macOS/Windows, and provide build scripts + CI for release artifacts.
 
 **Architecture:** Extract existing wizard from `src/bin/setup.rs` into new `src/setup/` library module (wizard + service sub-modules). Main binary absorbs `--setup` and `--service` flags via manual arg parsing (no new crate deps). Service templates use `{{MUSTACHE}}` placeholders rendered at install time via `std::env::current_exe()`.
 
@@ -52,14 +52,14 @@ Create `src/setup/mod.rs`:
 pub mod service;
 pub mod wizard;
 
-/// Subcommands for `rustfox --setup` and `rustfox --service`.
+/// Subcommands for `haos-green --setup` and `haos-green --service`.
 pub enum Command {
     Setup { cli: bool },
     Service { action: service::Action },
 }
 
 /// Parse argv into Command or return None (meaning: normal bot start).
-/// Also captures `--config <PATH>` and stores it in `RUSTFOX_CONFIG_PATH` env var.
+/// Also captures `--config <PATH>` and stores it in `HAOS_GREEN_CONFIG_PATH` env var.
 pub fn parse_args() -> Option<Command> {
     let mut args: Vec<String> = std::env::args().collect();
     args.remove(0);
@@ -88,7 +88,7 @@ pub fn parse_args() -> Option<Command> {
                     "start"   => service::Action::Start,
                     "stop"    => service::Action::Stop,
                     _ => {
-                        eprintln!("Usage: rustfox --service <install|remove|status|start|stop>");
+                        eprintln!("Usage: haos-green --service <install|remove|status|start|stop>");
                         std::process::exit(1);
                     }
                 };
@@ -105,7 +105,7 @@ pub fn parse_args() -> Option<Command> {
     }
 
     if let Some(path) = config_path {
-        std::env::set_var("RUSTFOX_CONFIG_PATH", path);
+        std::env::set_var("HAOS_GREEN_CONFIG_PATH", path);
     }
 
     command
@@ -138,26 +138,26 @@ git commit -m "feat: add setup module with CLI arg parsing"
 ### Task 2: Create service templates
 
 **Files:**
-- Create: `scripts/services/rustfox.service.template`
-- Create: `scripts/services/com.rustfox.bot.plist.template`
+- Create: `scripts/services/haos-green.service.template`
+- Create: `scripts/services/com.haos-green.bot.plist.template`
 - Create: `scripts/services/install-service.bat.template`
 - Create: `scripts/services/uninstall-service.bat.template`
 
 - [ ] **Step 1: Create systemd user service template**
 
-Create `scripts/services/rustfox.service.template`:
+Create `scripts/services/haos-green.service.template`:
 ```ini
 [Unit]
-Description=RustFox Telegram AI Assistant
+Description=HaosGreen Telegram AI Assistant
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={{RUSTFOX_BIN}} --config {{RUSTFOX_CONFIG}}
+ExecStart={{HAOS_GREEN_BIN}} --config {{HAOS_GREEN_CONFIG}}
 Restart=on-failure
 RestartSec=5
-Environment=RUSTFOX_HOME={{RUSTFOX_HOME}}
+Environment=HAOS_GREEN_HOME={{HAOS_GREEN_HOME}}
 
 [Install]
 WantedBy=default.target
@@ -165,7 +165,7 @@ WantedBy=default.target
 
 - [ ] **Step 2: Create launchd agent template**
 
-Create `scripts/services/com.rustfox.bot.plist.template`:
+Create `scripts/services/com.haos-green.bot.plist.template`:
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -173,26 +173,26 @@ Create `scripts/services/com.rustfox.bot.plist.template`:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.rustfox.bot</string>
+    <string>com.haos-green.bot</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{RUSTFOX_BIN}}</string>
+        <string>{{HAOS_GREEN_BIN}}</string>
         <string>--config</string>
-        <string>{{RUSTFOX_CONFIG}}</string>
+        <string>{{HAOS_GREEN_CONFIG}}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>RUSTFOX_HOME</key>
-        <string>{{RUSTFOX_HOME}}</string>
+        <key>HAOS_GREEN_HOME</key>
+        <string>{{HAOS_GREEN_HOME}}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{{RUSTFOX_HOME}}/Library/Logs/rustfox.log</string>
+    <string>{{HAOS_GREEN_HOME}}/Library/Logs/haos-green.log</string>
     <key>StandardErrorPath</key>
-    <string>{{RUSTFOX_HOME}}/Library/Logs/rustfox.log</string>
+    <string>{{HAOS_GREEN_HOME}}/Library/Logs/haos-green.log</string>
 </dict>
 </plist>
 ```
@@ -202,10 +202,10 @@ Create `scripts/services/com.rustfox.bot.plist.template`:
 Create `scripts/services/install-service.bat.template`:
 ```batch
 @echo off
-sc create RustFox binPath= "{{RUSTFOX_BIN}} --config {{RUSTFOX_CONFIG}}" start= auto
-sc description RustFox "RustFox Telegram AI Assistant"
-sc failure RustFox reset=86400 actions=restart/5000/restart/10000
-sc start RustFox
+sc create HaosGreen binPath= "{{HAOS_GREEN_BIN}} --config {{HAOS_GREEN_CONFIG}}" start= auto
+sc description HaosGreen "HaosGreen Telegram AI Assistant"
+sc failure HaosGreen reset=86400 actions=restart/5000/restart/10000
+sc start HaosGreen
 ```
 
 - [ ] **Step 4: Create Windows uninstall-service.bat template**
@@ -213,8 +213,8 @@ sc start RustFox
 Create `scripts/services/uninstall-service.bat.template`:
 ```batch
 @echo off
-sc stop RustFox
-sc delete RustFox
+sc stop HaosGreen
+sc delete HaosGreen
 ```
 
 - [ ] **Step 5: Commit**
@@ -248,16 +248,16 @@ pub enum Action {
 }
 
 fn home_dir() -> PathBuf {
-    dirs::home_dir().expect("Could not determine home directory").join(".rustfox")
+    dirs::home_dir().expect("Could not determine home directory").join(".haos-green")
 }
 
 fn render_template(template: &str, bin_path: &Path) -> String {
     let home = home_dir();
     let config_path = home.join("config.toml");
     template
-        .replace("{{RUSTFOX_BIN}}", &bin_path.to_string_lossy())
-        .replace("{{RUSTFOX_CONFIG}}", &config_path.to_string_lossy())
-        .replace("{{RUSTFOX_HOME}}", &home.to_string_lossy())
+        .replace("{{HAOS_GREEN_BIN}}", &bin_path.to_string_lossy())
+        .replace("{{HAOS_GREEN_CONFIG}}", &config_path.to_string_lossy())
+        .replace("{{HAOS_GREEN_HOME}}", &home.to_string_lossy())
 }
 
 pub fn handle(action: Action) -> Result<()> {
@@ -284,7 +284,7 @@ fn install() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn install_systemd(exe: &Path) -> Result<()> {
-    let template = include_str!("../../scripts/services/rustfox.service.template");
+    let template = include_str!("../../scripts/services/haos-green.service.template");
     let rendered = render_template(template, exe);
 
     let user_service_dir = dirs::home_dir()
@@ -295,7 +295,7 @@ fn install_systemd(exe: &Path) -> Result<()> {
     std::fs::create_dir_all(&user_service_dir)
         .context("Failed to create systemd user services directory")?;
 
-    let service_path = user_service_dir.join("rustfox.service");
+    let service_path = user_service_dir.join("haos-green.service");
     std::fs::write(&service_path, &rendered)
         .with_context(|| format!("Failed to write {}", service_path.display()))?;
 
@@ -308,26 +308,26 @@ fn install_systemd(exe: &Path) -> Result<()> {
     }
 
     let status = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", "rustfox.service"])
+        .args(["--user", "enable", "--now", "haos-green.service"])
         .status()
-        .context("Failed to enable/start rustfox service")?;
+        .context("Failed to enable/start haos-green service")?;
     if !status.success() {
         anyhow::bail!("systemctl enable --now failed");
     }
 
-    println!("✓ RustFox installed as a systemd user service");
-    println!("  Status: systemctl --user status rustfox");
-    println!("  Logs:   journalctl --user -u rustfox -f");
+    println!("✓ HaosGreen installed as a systemd user service");
+    println!("  Status: systemctl --user status haos-green");
+    println!("  Logs:   journalctl --user -u haos-green -f");
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn remove_systemd() -> Result<()> {
     let _ = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "rustfox.service"])
+        .args(["--user", "stop", "haos-green.service"])
         .status();
     let status = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "rustfox.service"])
+        .args(["--user", "disable", "haos-green.service"])
         .status()
         .context("Failed to disable service")?;
     if !status.success() {
@@ -339,19 +339,19 @@ fn remove_systemd() -> Result<()> {
         .join(".config")
         .join("systemd")
         .join("user")
-        .join("rustfox.service");
+        .join("haos-green.service");
     let _ = std::fs::remove_file(&service_path);
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
 
-    println!("✓ RustFox systemd service removed");
+    println!("✓ HaosGreen systemd service removed");
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn install_launchd(exe: &Path) -> Result<()> {
-    let template = include_str!("../../scripts/services/com.rustfox.bot.plist.template");
+    let template = include_str!("../../scripts/services/com.haos-green.bot.plist.template");
     let rendered = render_template(template, exe);
 
     let agent_dir = dirs::home_dir()
@@ -361,7 +361,7 @@ fn install_launchd(exe: &Path) -> Result<()> {
     std::fs::create_dir_all(&agent_dir)
         .context("Failed to create LaunchAgents directory")?;
 
-    let plist_path = agent_dir.join("com.rustfox.bot.plist");
+    let plist_path = agent_dir.join("com.haos-green.bot.plist");
     std::fs::write(&plist_path, &rendered)
         .with_context(|| format!("Failed to write {}", plist_path.display()))?;
 
@@ -374,9 +374,9 @@ fn install_launchd(exe: &Path) -> Result<()> {
         anyhow::bail!("launchctl load failed");
     }
 
-    println!("✓ RustFox installed as a launchd agent");
-    println!("  Status: launchctl list com.rustfox.bot");
-    println!("  Logs:   {}/Library/Logs/rustfox.log", dirs::home_dir().unwrap_or_default().display());
+    println!("✓ HaosGreen installed as a launchd agent");
+    println!("  Status: launchctl list com.haos-green.bot");
+    println!("  Logs:   {}/Library/Logs/haos-green.log", dirs::home_dir().unwrap_or_default().display());
     Ok(())
 }
 
@@ -386,7 +386,7 @@ fn remove_launchd() -> Result<()> {
         .context("HOME not set")?
         .join("Library")
         .join("LaunchAgents");
-    let plist_path = agent_dir.join("com.rustfox.bot.plist");
+    let plist_path = agent_dir.join("com.haos-green.bot.plist");
 
     let _ = std::process::Command::new("launchctl")
         .args(["unload", "-w"])
@@ -394,7 +394,7 @@ fn remove_launchd() -> Result<()> {
         .status();
     let _ = std::fs::remove_file(&plist_path);
 
-    println!("✓ RustFox launchd agent removed");
+    println!("✓ HaosGreen launchd agent removed");
     Ok(())
 }
 
@@ -406,7 +406,7 @@ fn install_windows_service(exe: &Path) -> Result<()> {
     let rendered = render_template(template, exe);
 
     // Write the rendered batch to a temp file and execute it
-    let tmp = std::env::temp_dir().join("rustfox-install-service.bat");
+    let tmp = std::env::temp_dir().join("haos-green-install-service.bat");
     std::fs::write(&tmp, &rendered)
         .context("Failed to write install batch script")?;
 
@@ -421,8 +421,8 @@ fn install_windows_service(exe: &Path) -> Result<()> {
     }
 
     let _ = std::fs::remove_file(&tmp);
-    println!("✓ RustFox installed as a Windows service");
-    println!("  Manage: sc query RustFox");
+    println!("✓ HaosGreen installed as a Windows service");
+    println!("  Manage: sc query HaosGreen");
     Ok(())
 }
 
@@ -433,7 +433,7 @@ fn remove_windows_service() -> Result<()> {
     let template = include_str!("../../scripts/services/uninstall-service.bat.template");
     let rendered = render_template(template, &std::env::current_exe().unwrap_or_default());
 
-    let tmp = std::env::temp_dir().join("rustfox-uninstall-service.bat");
+    let tmp = std::env::temp_dir().join("haos-green-uninstall-service.bat");
     std::fs::write(&tmp, &rendered)
         .context("Failed to write uninstall batch script")?;
 
@@ -448,7 +448,7 @@ fn remove_windows_service() -> Result<()> {
     }
 
     let _ = std::fs::remove_file(&tmp);
-    println!("✓ RustFox Windows service removed");
+    println!("✓ HaosGreen Windows service removed");
     Ok(())
 }
 
@@ -468,7 +468,7 @@ fn remove() -> Result<()> {
 fn status() -> Result<()> {
     #[cfg(target_os = "linux")] {
         let output = std::process::Command::new("systemctl")
-            .args(["--user", "--no-pager", "status", "rustfox.service"])
+            .args(["--user", "--no-pager", "status", "haos-green.service"])
             .output()
             .context("Failed to run systemctl status")?;
         print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -477,7 +477,7 @@ fn status() -> Result<()> {
     }
     #[cfg(target_os = "macos")] {
         let output = std::process::Command::new("launchctl")
-            .args(["list", "com.rustfox.bot"])
+            .args(["list", "com.haos-green.bot"])
             .output()
             .context("Failed to run launchctl list")?;
         print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -486,7 +486,7 @@ fn status() -> Result<()> {
     }
     #[cfg(target_os = "windows")] {
         let output = std::process::Command::new("sc")
-            .args(["query", "RustFox"])
+            .args(["query", "HaosGreen"])
             .output()
             .context("Failed to run sc query")?;
         print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -501,7 +501,7 @@ fn status() -> Result<()> {
 fn start() -> Result<()> {
     #[cfg(target_os = "linux")] {
         let status = std::process::Command::new("systemctl")
-            .args(["--user", "start", "rustfox.service"])
+            .args(["--user", "start", "haos-green.service"])
             .status()
             .context("Failed to start service")?;
         if !status.success() { anyhow::bail!("systemctl start failed"); }
@@ -510,7 +510,7 @@ fn start() -> Result<()> {
     }
     #[cfg(target_os = "macos")] {
         let status = std::process::Command::new("launchctl")
-            .args(["start", "com.rustfox.bot"])
+            .args(["start", "com.haos-green.bot"])
             .status()
             .context("Failed to start service")?;
         if !status.success() { anyhow::bail!("launchctl start failed"); }
@@ -519,7 +519,7 @@ fn start() -> Result<()> {
     }
     #[cfg(target_os = "windows")] {
         let status = std::process::Command::new("sc")
-            .args(["start", "RustFox"])
+            .args(["start", "HaosGreen"])
             .status()
             .context("Failed to start service")?;
         if !status.success() { anyhow::bail!("sc start failed"); }
@@ -534,7 +534,7 @@ fn start() -> Result<()> {
 fn stop() -> Result<()> {
     #[cfg(target_os = "linux")] {
         let status = std::process::Command::new("systemctl")
-            .args(["--user", "stop", "rustfox.service"])
+            .args(["--user", "stop", "haos-green.service"])
             .status()
             .context("Failed to stop service")?;
         if !status.success() { anyhow::bail!("systemctl stop failed"); }
@@ -543,7 +543,7 @@ fn stop() -> Result<()> {
     }
     #[cfg(target_os = "macos")] {
         let status = std::process::Command::new("launchctl")
-            .args(["stop", "com.rustfox.bot"])
+            .args(["stop", "com.haos-green.bot"])
             .status()
             .context("Failed to stop service")?;
         if !status.success() { anyhow::bail!("launchctl stop failed"); }
@@ -552,7 +552,7 @@ fn stop() -> Result<()> {
     }
     #[cfg(target_os = "windows")] {
         let status = std::process::Command::new("sc")
-            .args(["stop", "RustFox"])
+            .args(["stop", "HaosGreen"])
             .status()
             .context("Failed to stop service")?;
         if !status.success() { anyhow::bail!("sc stop failed"); }
@@ -572,23 +572,23 @@ mod tests {
 
     #[test]
     fn test_render_template_replaces_placeholders() {
-        let template = "bin={{RUSTFOX_BIN}}\nconfig={{RUSTFOX_CONFIG}}\nhome={{RUSTFOX_HOME}}";
-        let bin_path = Path::new("/usr/local/bin/rustfox");
+        let template = "bin={{HAOS_GREEN_BIN}}\nconfig={{HAOS_GREEN_CONFIG}}\nhome={{HAOS_GREEN_HOME}}";
+        let bin_path = Path::new("/usr/local/bin/haos-green");
         let result = render_template(template, bin_path);
-        assert!(result.contains("/usr/local/bin/rustfox"));
-        assert!(result.contains(".rustfox/config.toml"));
-        assert!(result.contains(".rustfox\n"));
+        assert!(result.contains("/usr/local/bin/haos-green"));
+        assert!(result.contains(".haos-green/config.toml"));
+        assert!(result.contains(".haos-green\n"));
         // Should NOT contain raw placeholders
-        assert!(!result.contains("{{RUSTFOX_BIN}}"));
-        assert!(!result.contains("{{RUSTFOX_CONFIG}}"));
-        assert!(!result.contains("{{RUSTFOX_HOME}}"));
+        assert!(!result.contains("{{HAOS_GREEN_BIN}}"));
+        assert!(!result.contains("{{HAOS_GREEN_CONFIG}}"));
+        assert!(!result.contains("{{HAOS_GREEN_HOME}}"));
     }
 
     #[test]
     fn test_render_template_empty_home_does_not_panic() {
         // Should handle gracefully even if home dir is weird
-        let template = "{{RUSTFOX_HOME}}";
-        let bin_path = Path::new("/usr/local/bin/rustfox");
+        let template = "{{HAOS_GREEN_HOME}}";
+        let bin_path = Path::new("/usr/local/bin/haos-green");
         let result = render_template(template, bin_path);
         assert!(!result.contains("{{"));
     }
@@ -627,7 +627,7 @@ Create `src/setup/wizard.rs`:
 //! Setup wizard — web (Axum server + browser) and CLI modes.
 //!
 //! Extracted from `src/bin/setup.rs` so the main binary can reuse it
-//! via `rustfox --setup`.
+//! via `haos-green --setup`.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -948,7 +948,7 @@ async fn run_web(config_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to bind to {addr}"))?;
 
     println!("\n============================================");
-    println!("  RustFox Setup Wizard");
+    println!("  HaosGreen Setup Wizard");
     println!("  http://localhost:{SETUP_PORT}");
     println!("============================================");
     println!("Press Ctrl-C to exit without saving.\n");
@@ -1045,7 +1045,7 @@ async fn oauth_start(
 
     let redir = redirect_uri();
     let reg_body = ClientRegistrationRequest {
-        client_name: "RustFox Setup".into(),
+        client_name: "HaosGreen Setup".into(),
         redirect_uris: vec![redir.clone()],
         grant_types: vec!["authorization_code".into()],
         response_types: vec!["code".into()],
@@ -1218,7 +1218,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     use std::io::{self, Write};
 
     println!("============================================");
-    println!("  RustFox CLI Setup");
+    println!("  HaosGreen CLI Setup");
     println!("============================================");
     println!("Press Enter to accept [defaults].\n");
 
@@ -1240,7 +1240,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     let model = or_default(
         read_line("Model [moonshotai/kimi-k2.5]: ")?, "moonshotai/kimi-k2.5",
     );
-    let db_path = or_default(read_line("Memory DB path [rustfox.db]: ")?, "rustfox.db");
+    let db_path = or_default(read_line("Memory DB path [haos-green.db]: ")?, "haos-green.db");
     let location = read_line("Your location (optional, e.g. Tokyo, Japan): ")?;
 
     let config = format_config(&ConfigParams {
@@ -1267,7 +1267,7 @@ fn run_cli(config_dir: &Path) -> Result<()> {
     if buf.trim().is_empty() || buf.trim().eq_ignore_ascii_case("y") {
         if let Err(e) = crate::setup::service::handle(crate::setup::service::Action::Install) {
             eprintln!("Warning: Service installation failed: {e}");
-            eprintln!("You can retry later with: rustfox --service install");
+            eprintln!("You can retry later with: haos-green --service install");
         }
     }
 
@@ -1635,21 +1635,21 @@ git commit -m "feat(setup): extract wizard into library module (web + CLI + OAut
 
 Replace the entire content of `src/bin/setup.rs` with:
 ```rust
-//! Thin wrapper — delegates to `rustfox::setup::wizard`.
+//! Thin wrapper — delegates to `haos-green::setup::wizard`.
 //!
 //! Kept for backwards compat with `./setup.sh` and `cargo run --bin setup`.
-//! New users should use `rustfox --setup` instead.
+//! New users should use `haos-green --setup` instead.
 
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = std::env::args().any(|a| a == "--cli");
-    let config_dir = std::env::var("RUSTFOX_CONFIG_PATH")
+    let config_dir = std::env::var("HAOS_GREEN_CONFIG_PATH")
         .map(PathBuf::from)
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    rustfox::setup::wizard::run(&config_dir, cli).await
+    haos-green::setup::wizard::run(&config_dir, cli).await
 }
 ```
 
@@ -1667,7 +1667,7 @@ Expected: all existing tests still pass
 
 ```bash
 git add src/bin/setup.rs
-git commit -m "refactor(setup): bin/setup.rs becomes thin wrapper around rustfox::setup::wizard"
+git commit -m "refactor(setup): bin/setup.rs becomes thin wrapper around haos-green::setup::wizard"
 ```
 
 ---
@@ -1681,7 +1681,7 @@ git commit -m "refactor(setup): bin/setup.rs becomes thin wrapper around rustfox
 
 Add after line 15:
 ```rust
-use rustfox::setup;
+use haos-green::setup;
 ```
 
 - [ ] **Step 2: Add setup/service dispatch before config loading**
@@ -1693,7 +1693,7 @@ Replace the config-path detection block (lines 28-47) with:
     if let Some(cmd) = setup::parse_args() {
         match cmd {
             setup::Command::Setup { cli } => {
-                let config_dir = std::env::var("RUSTFOX_CONFIG_PATH")
+                let config_dir = std::env::var("HAOS_GREEN_CONFIG_PATH")
                     .map(PathBuf::from)
                     .and_then(|p| p.parent().map(|d| d.to_path_buf()))
                     .unwrap_or_else(|| {
@@ -1709,16 +1709,16 @@ Replace the config-path detection block (lines 28-47) with:
     }
 
     // If we reach here, it's a normal bot start — resolve config path
-    let config_path = if let Ok(path) = std::env::var("RUSTFOX_CONFIG_PATH") {
+    let config_path = if let Ok(path) = std::env::var("HAOS_GREEN_CONFIG_PATH") {
         PathBuf::from(path)
     } else {
         let cwd = PathBuf::from("config.toml");
         if cwd.exists() {
             cwd
         } else {
-            let env_home = std::env::var("RUSTFOX_HOME").ok();
+            let env_home = std::env::var("HAOS_GREEN_HOME").ok();
             if let Some(home) =
-                rustfox::home::default_home(env_home.as_deref(), dirs::home_dir().as_deref())
+                haos-green::home::default_home(env_home.as_deref(), dirs::home_dir().as_deref())
             {
                 let candidate = home.join("config.toml");
                 if candidate.exists() { candidate } else { cwd }
@@ -1750,10 +1750,10 @@ git commit -m "feat: add --setup and --service dispatch to main binary"
 
 - [ ] **Step 1: Create release workflow**
 
-Create `.github/workflows/release.yml` (replaces the previous workflow — setup binary is now part of the main binary, so only `rustfox` is shipped):
+Create `.github/workflows/release.yml` (replaces the previous workflow — setup binary is now part of the main binary, so only `haos-green` is shipped):
 
 Key changes from the previous version:
-1. Single binary (setup is now part of `rustfox` via `--setup`)
+1. Single binary (setup is now part of `haos-green` via `--setup`)
 2. Service templates bundled in archives
 3. Native target only (no cross-compilation)
 
@@ -1777,16 +1777,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            rustfox_bin: rustfox
-            archive_name: rustfox-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            haos-green_bin: haos-green
+            archive_name: haos-green-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            rustfox_bin: rustfox
-            archive_name: rustfox-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            haos-green_bin: haos-green
+            archive_name: haos-green-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            rustfox_bin: rustfox.exe
-            archive_name: rustfox-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+            haos-green_bin: haos-green.exe
+            archive_name: haos-green-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -1804,7 +1804,7 @@ jobs:
         shell: bash
         run: |
           mkdir staging
-          cp target/release/${{ matrix.rustfox_bin }} staging/
+          cp target/release/${{ matrix.haos-green_bin }} staging/
           cp config.example.toml staging/
           cp scripts/install.sh staging/
           cp -r scripts/services staging/services
@@ -1871,27 +1871,27 @@ git commit -m "ci: update release workflow for single-binary + service templates
 Create `scripts/install.sh`:
 ```bash
 #!/usr/bin/env bash
-# RustFox universal installer.
+# HaosGreen universal installer.
 # Detects platform, installs via cargo, runs setup, offers service install.
 set -euo pipefail
 
-RUSTFOX_VERSION="${1:-latest}"
+HAOS_GREEN_VERSION="${1:-latest}"
 
 echo "============================================"
-echo "  RustFox Installer"
+echo "  HaosGreen Installer"
 echo "============================================"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # When run from the repo, SCRIPT_DIR = <repo>/scripts/, so project root is SCRIPT_DIR/..
 # When run from a release archive, install.sh is at archive root (no Cargo.toml there;
-# the archive is for binary-only installs — use `tar xzf` and run `rustfox --setup`).
+# the archive is for binary-only installs — use `tar xzf` and run `haos-green --setup`).
 PROJECT_ROOT="$SCRIPT_DIR"
 if [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
     PROJECT_ROOT="$SCRIPT_DIR"
 elif [ -f "$SCRIPT_DIR/../Cargo.toml" ]; then
     PROJECT_ROOT="$SCRIPT_DIR/.."
 else
-    echo "Error: Cannot find Cargo.toml. Run install.sh from the rustfox repository root."
+    echo "Error: Cannot find Cargo.toml. Run install.sh from the haos-green repository root."
     exit 1
 fi
 
@@ -1904,22 +1904,22 @@ fi
 
 # Install from source
 echo ""
-echo "Installing rustfox from ${PROJECT_ROOT}..."
+echo "Installing haos-green from ${PROJECT_ROOT}..."
 cargo install --path "$PROJECT_ROOT" --locked
 
 echo ""
-echo "✓ rustfox installed to $(which rustfox)"
+echo "✓ haos-green installed to $(which haos-green)"
 
 # Offer setup
 echo ""
 echo "Run the setup wizard to configure your bot:"
-echo "  rustfox --setup"
+echo "  haos-green --setup"
 echo ""
 echo "Or use the CLI wizard:"
-echo "  rustfox --setup --cli"
+echo "  haos-green --setup --cli"
 echo ""
 echo "After setup, install as a background service:"
-echo "  rustfox --service install"
+echo "  haos-green --service install"
 ```
 
 - [ ] **Step 2: Make it executable and commit**
@@ -1927,7 +1927,7 @@ echo "  rustfox --service install"
 ```bash
 chmod +x scripts/install.sh
 git add scripts/install.sh
-git commit -m "feat: add universal install script for rustfox"
+git commit -m "feat: add universal install script for haos-green"
 ```
 
 ---
@@ -1957,7 +1957,7 @@ case "$TARGET" in
   aarch64) ARCH=arm64 ;;
   *) echo "Unknown arch for $TARGET"; exit 1 ;;
 esac
-echo "TODO: build .deb for $ARCH from dist/rustfox"
+echo "TODO: build .deb for $ARCH from dist/haos-green"
 echo "See docs/superpowers/specs/2026-06-12-multi-platform-service-setup-design.md"
 ```
 
@@ -1968,7 +1968,7 @@ Create `scripts/build-rpm.sh`:
 #!/usr/bin/env bash
 # Build .rpm package from a pre-built binary in dist/
 set -euo pipefail
-echo "TODO: build .rpm from dist/rustfox"
+echo "TODO: build .rpm from dist/haos-green"
 echo "See docs/superpowers/specs/2026-06-12-multi-platform-service-setup-design.md"
 ```
 
@@ -1979,7 +1979,7 @@ Create `scripts/build-macos.sh`:
 #!/usr/bin/env bash
 # Build .tar.gz from a pre-built binary in dist/
 set -euo pipefail
-echo "TODO: build macOS .tar.gz from dist/rustfox"
+echo "TODO: build macOS .tar.gz from dist/haos-green"
 echo "See docs/superpowers/specs/2026-06-12-multi-platform-service-setup-design.md"
 ```
 
@@ -1988,7 +1988,7 @@ echo "See docs/superpowers/specs/2026-06-12-multi-platform-service-setup-design.
 Create `scripts/build-windows.ps1`:
 ```powershell
 # Build .zip from a pre-built binary in dist/
-Write-Output "TODO: build Windows .zip from dist/rustfox.exe"
+Write-Output "TODO: build Windows .zip from dist/haos-green.exe"
 Write-Output "See docs/superpowers/specs/2026-06-12-multi-platform-service-setup-design.md"
 ```
 

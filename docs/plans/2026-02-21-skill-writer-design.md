@@ -7,7 +7,7 @@
 
 ## Goal
 
-Enable the RustFox Telegram bot to:
+Enable the HaosGreen Telegram bot to:
 1. Interactively author new agent skills in the correct format at a user's request
 2. Write multi-file skill directories (SKILL.md + supporting reference/template/script files)
 3. Hot-reload skills into memory immediately — no bot restart required

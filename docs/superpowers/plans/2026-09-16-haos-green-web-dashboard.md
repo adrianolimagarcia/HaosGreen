@@ -2090,7 +2090,7 @@ async fn chat_requires_authentication() {
 ```
 
 A live SSE test gated behind `HAOS_GREEN_WEB_LIVE=1`, following the existing
-`RUSTFOX_A2A_LIVE` pattern, asserting the stream contains at least one `token`
+`HAOS_GREEN_A2A_LIVE` pattern, asserting the stream contains at least one `token`
 event and exactly one terminal `done` event.
 
 - [ ] **Step 2: Run the tests to verify they fail**

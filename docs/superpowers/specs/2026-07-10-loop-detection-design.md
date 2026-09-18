@@ -1,8 +1,8 @@
-# Loop Detection Mechanism for RustFox
+# Loop Detection Mechanism for HaosGreen
 
 ## Problem
 
-RustFox's agentic loop has no detection for repetitive tool-call patterns. The
+HaosGreen's agentic loop has no detection for repetitive tool-call patterns. The
 only safeguard is `max_iterations` (default 25), which is a blunt instrument —
 it kills long legitimate tasks just as readily as stuck ones, and a 3-iteration
 tight loop burns 12% of the budget before any guard fires.

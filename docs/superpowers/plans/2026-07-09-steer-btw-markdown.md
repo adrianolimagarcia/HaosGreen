@@ -129,7 +129,7 @@ fn test_blockquote_emits_entity() {
 
 - [ ] **Step 7: Run tests to verify**
 
-Run: `cargo test -p rustfox markdown_entities -- --test-threads=1`
+Run: `cargo test -p haos-green markdown_entities -- --test-threads=1`
 Expected: ALL tests pass (including updated blockquote test)
 
 - [ ] **Step 8: Commit**
@@ -307,7 +307,7 @@ fn test_spoiler_with_bold() {
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p rustfox markdown_entities -- --test-threads=1`
+Run: `cargo test -p haos-green markdown_entities -- --test-threads=1`
 Expected: ALL tests pass
 
 - [ ] **Step 6: Commit**
@@ -417,7 +417,7 @@ fn test_ordered_list_renders_with_numbers() {
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p rustfox markdown_entities -- --test-threads=1`
+Run: `cargo test -p haos-green markdown_entities -- --test-threads=1`
 Expected: ALL tests pass
 
 - [ ] **Step 7: Commit**

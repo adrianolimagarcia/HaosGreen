@@ -1,8 +1,8 @@
-# Soul Files: Persistent AI Identity + User Model for RustFox
+# Soul Files: Persistent AI Identity + User Model for HaosGreen
 
 ## Overview
 
-RustFox gains three "soul" files — `SOUL.md`, `AGENTS.md`, `USER.md` — that persist the AI's identity, experiential learnings, and user preferences across sessions. Inspired by OpenClaw's workspace bootstrap pattern and the [soul.md](https://soul.md) philosophy.
+HaosGreen gains three "soul" files — `SOUL.md`, `AGENTS.md`, `USER.md` — that persist the AI's identity, experiential learnings, and user preferences across sessions. Inspired by OpenClaw's workspace bootstrap pattern and the [soul.md](https://soul.md) philosophy.
 
 ## Files & Locations
 
@@ -13,7 +13,7 @@ RustFox gains three "soul" files — `SOUL.md`, `AGENTS.md`, `USER.md` — that 
 ├── USER.md      # User model (exists, relocated/enhanced)
 ```
 
-All three files live directly in the RustFox home directory (`<home>/SOUL.md`, etc.). Their paths are hardcoded relative to the resolved home directory (not configurable keys), resolved in `Config::resolve()` alongside other paths in `ResolvedPaths`.
+All three files live directly in the HaosGreen home directory (`<home>/SOUL.md`, etc.). Their paths are hardcoded relative to the resolved home directory (not configurable keys), resolved in `Config::resolve()` alongside other paths in `ResolvedPaths`.
 
 **Migration:** On first run after this change, if the old `user_model_path` file exists and is different from `<home>/USER.md`, copy its content to `<home>/USER.md` and log a deprecation notice. The old `learning.user_model_path` config key is removed.
 
@@ -27,7 +27,7 @@ version: 1
 # Soul
 
 ## Who I Am
-I'm RustFox, a Telegram AI assistant. I use tools to help the user.
+I'm HaosGreen, a Telegram AI assistant. I use tools to help the user.
 
 ## My Values
 - Be genuinely helpful, not performatively helpful

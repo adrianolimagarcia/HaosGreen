@@ -9,7 +9,6 @@ ExecStart={{HAOS_GREEN_BIN}} --config {{HAOS_GREEN_CONFIG}}
 Restart=always
 RestartSec=5
 Environment=HAOS_GREEN_HOME={{HAOS_GREEN_HOME}}
-Environment=RUSTFOX_HOME={{RUSTFOX_HOME}}
 Environment=PATH={{HAOS_GREEN_PATH}}
 
 [Install]

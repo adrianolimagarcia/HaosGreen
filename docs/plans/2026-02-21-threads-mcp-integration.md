@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add Meta Threads publishing support to RustFox via `baguskto/threads-mcp`, with a setup-wizard catalog entry, a guideline popup modal (matching the Google Workspace pattern), a `config.example.toml` example, and a README update.
+**Goal:** Add Meta Threads publishing support to HaosGreen via `baguskto/threads-mcp`, with a setup-wizard catalog entry, a guideline popup modal (matching the Google Workspace pattern), a `config.example.toml` example, and a README update.
 
 **Architecture:** Three static files only — `setup/index.html` (catalog + modal + JS), `config.example.toml` (commented example block), `README.md` (table row + TOML snippet). No Rust source changes are needed because `mcp.rs` handles any stdio-based MCP server generically.
 

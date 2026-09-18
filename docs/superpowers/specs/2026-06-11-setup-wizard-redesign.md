@@ -61,10 +61,10 @@ Non-tech users are intimidated by the raw config file. Tech users want full cont
 │  ┌─────────────────────────────────────────────┐│
 │  │ Location: [Tokyo, Japan ________________]    ││  ← Shown by default
 │  │ [▼ Advanced settings]                       ││
-│  │   Sandbox dir: [~/.rustfox/workspace ____]  ││
-│  │   DB path:     [~/.rustfox/rustfox.db ___]  ││
-│  │   Skills dir:  [~/.rustfox/skills _______]  ││
-│  │   Home dir:    [~/.rustfox _______________]  ││
+│  │   Sandbox dir: [~/.haos-green/workspace ____]  ││
+│  │   DB path:     [~/.haos-green/haos-green.db ___]  ││
+│  │   Skills dir:  [~/.haos-green/skills _______]  ││
+│  │   Home dir:    [~/.haos-green _______________]  ││
 │  │   OCR model dir: [~/.cache/ocrs _________]  ││
 │  └─────────────────────────────────────────────┘│
 │                                                 │
@@ -74,7 +74,7 @@ Non-tech users are intimidated by the raw config file. Tech users want full cont
 │  │ ☐ Threads  ☐ Brave Search  ☐ Notion  ☐ Exa ││
 │  │ [▼ Advanced settings]                       ││
 │  │   LangSmith key:  [_____________________]   ││
-│  │   LangSmith proj: [rustfox ______________]  ││
+│  │   LangSmith proj: [haos-green ______________]  ││
 │  │   Embedding key:  [_____________________]   ││
 │  │   Embedding model: [qwen/qwen3-embedding-8b]││
 │  │   Learning extraction: [☑]                  ││
@@ -92,7 +92,7 @@ Non-tech users are intimidated by the raw config file. Tech users want full cont
 ### Web UI Design Principles
 
 1. **Single-page wizard** with step indicator and back/next navigation
-2. **Dark theme** matching the current RustFox brand
+2. **Dark theme** matching the current HaosGreen brand
 3. **Inline validation** — red border + error message on invalid fields
 4. **Placeholder defaults** — all fields show their default value as placeholder text
 5. **Progress saved** — navigating between steps doesn't reset form state
@@ -106,7 +106,7 @@ Same progressive disclosure but adapted for terminal:
 ```
 $ cargo run --bin setup -- --cli
 
-RustFox Setup Wizard
+HaosGreen Setup Wizard
 ====================
 Press Enter to accept [defaults].
 
@@ -125,7 +125,7 @@ Step 2/4: Location & Storage
 
 ...
 
-Config saved to /home/user/.rustfox/config.toml
+Config saved to /home/user/.haos-green/config.toml
 ```
 
 The `--advanced` flag skips the "Configure advanced settings?" prompts and shows everything upfront.

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add /stop (cooperative cancel), /btw (parallel subagent question), and steer/inject (user messages injected mid-processing) to RustFox.
+**Goal:** Add /stop (cooperative cancel), /btw (parallel subagent question), and steer/inject (user messages injected mid-processing) to HaosGreen.
 
 **Architecture:** Three features sharing per-user CancellationToken registry + pending injection queue on Agent. Cancellation checks at iteration boundaries in the agentic loop. Injection drains between tool execution and next LLM call. BTW spawns isolated ad-hoc subagent via `run_subagent`.
 

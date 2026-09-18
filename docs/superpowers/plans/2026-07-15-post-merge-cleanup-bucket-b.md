@@ -95,7 +95,7 @@ Replace the `"reload_agents"` handler body:
 - [ ] **Step 4: Update main.rs to pass new parameters**
 
 ```rust
-tool_registry.register(Box::new(rustfox::skill_tools::SkillTools::new(
+tool_registry.register(Box::new(haos-green::skill_tools::SkillTools::new(
     config.skills.directory.clone(),
     config.agents.directory.clone(),
     skills_rw.clone(),
@@ -177,7 +177,7 @@ tracing::info!("Running experiment '{}'", technology);
 - [ ] **Step 5: Update main.rs to pass new params**
 
 ```rust
-tool_registry.register(Box::new(rustfox::builtin_tools::BuiltinTools::new(
+tool_registry.register(Box::new(haos-green::builtin_tools::BuiltinTools::new(
     config.skills.directory.clone(),
     skills_rw.clone(),
     Arc::clone(&agent.restart_pending),  // or construct from Agent's flags

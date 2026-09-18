@@ -116,7 +116,7 @@ pub fn build_providers(&self) -> (Vec<ProviderSection>, String, Vec<String>) {
 - [ ] **Step 5: Run tests to verify existing config parsing still works**
 
 ```bash
-cargo test -p rustfox -- config::tests --nocapture
+cargo test -p haos-green -- config::tests --nocapture
 ```
 Expected: Existing config tests pass (backward compat).
 
@@ -1317,7 +1317,7 @@ mod tests {
 - [ ] **Step 2: Run resolve_model tests**
 
 ```bash
-cargo test -p rustfox -- provider::tests --nocapture
+cargo test -p haos-green -- provider::tests --nocapture
 ```
 Expected: All 7 tests pass.
 
@@ -1419,7 +1419,7 @@ fn test_fallback_defaults_empty() {
 - [ ] **Step 4: Run config tests**
 
 ```bash
-cargo test -p rustfox -- config::tests --nocapture
+cargo test -p haos-green -- config::tests --nocapture
 ```
 Expected: All new and existing config tests pass.
 
@@ -1464,7 +1464,7 @@ Add after the existing `[openrouter]` example section in `config.example.toml`:
 # model = "qwen2.5-7b-instruct"
 
 # ── Fallback Chain (optional) ──────────────────────────────────────────
-# When the primary model fails, RustFox tries each fallback in order.
+# When the primary model fails, HaosGreen tries each fallback in order.
 # Each entry is a full provider-prefixed model string.
 # [fallback]
 # chain = [

@@ -1839,25 +1839,21 @@ const REGURGITATION_ERROR_MSG: &str = "Error: Your tool call arguments are in co
 /// tool call arguments.  This happens when the model learns the marker from a
 /// compacted history entry and outputs it verbatim instead of real JSON.
 ///
-/// Handles three formats:
-/// - Old (backward compat): JSON object with `_rustfox_compacted_arguments: true` or `_haos_green_compacted_arguments: true`
-/// - Legacy text: plain-text starting with `[RustFox compacted:`
-/// - Current text: plain-text starting with `COMPACTION_MARKER_PREFIX` (`[HaosGreen compacted:`)
+/// Handles two formats:
+/// - JSON object with `_haos_green_compacted_arguments: true`
+/// - Plain-text starting with `COMPACTION_MARKER_PREFIX` (`[HaosGreen compacted:`)
 #[allow(dead_code)]
 fn is_compacted_regurgitation(raw: &str, parsed: &serde_json::Value) -> bool {
     // Old JSON format — lookup the marker key in the parsed object.
     if parsed
         .get("_haos_green_compacted_arguments")
-        .or_else(|| parsed.get("_rustfox_compacted_arguments"))
         .and_then(|v| v.as_bool())
         == Some(true)
     {
         return true;
     }
-    // Plain-text format — check both current and legacy marker prefixes.
-    if raw.starts_with(crate::agent_prompt::COMPACTION_MARKER_PREFIX)
-        || raw.starts_with(crate::agent_prompt::LEGACY_COMPACTION_MARKER_PREFIX)
-    {
+    // Plain-text format.
+    if raw.starts_with(crate::agent_prompt::COMPACTION_MARKER_PREFIX) {
         return true;
     }
     false
@@ -2122,11 +2118,20 @@ mod tests {
             "[HaosGreen compacted: previous invoke_subagent call with 1200 bytes of arguments]";
         let parsed: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
         assert!(is_compacted_regurgitation(raw, &parsed));
+    }
 
-        let legacy_raw =
+    /// The pre-rename formats are deliberately no longer recognised: this is the
+    /// observable cost of the hard rename, asserted rather than assumed.
+    #[test]
+    fn legacy_rustfox_markers_are_no_longer_recognized() {
+        let legacy_text =
             "[RustFox compacted: previous invoke_subagent call with 1200 bytes of arguments]";
-        let legacy_parsed: serde_json::Value = serde_json::from_str(legacy_raw).unwrap_or_default();
-        assert!(is_compacted_regurgitation(legacy_raw, &legacy_parsed));
+        let parsed: serde_json::Value = serde_json::from_str(legacy_text).unwrap_or_default();
+        assert!(!is_compacted_regurgitation(legacy_text, &parsed));
+
+        let legacy_json = r#"{"_rustfox_compacted_arguments": true, "tool_name": "invoke_subagent", "original_char_count": 1200, "preview": "{\"skill\": \"test\"}"}"#;
+        let parsed: serde_json::Value = serde_json::from_str(legacy_json).unwrap();
+        assert!(!is_compacted_regurgitation(legacy_json, &parsed));
     }
 
     #[test]
@@ -2134,10 +2139,6 @@ mod tests {
         let raw = r#"{"_haos_green_compacted_arguments": true, "tool_name": "invoke_subagent", "original_char_count": 1200, "preview": "{\"skill\": \"test\"}"}"#;
         let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(is_compacted_regurgitation(raw, &parsed));
-
-        let legacy_raw = r#"{"_rustfox_compacted_arguments": true, "tool_name": "invoke_subagent", "original_char_count": 1200, "preview": "{\"skill\": \"test\"}"}"#;
-        let legacy_parsed: serde_json::Value = serde_json::from_str(legacy_raw).unwrap();
-        assert!(is_compacted_regurgitation(legacy_raw, &legacy_parsed));
     }
 
     #[test]

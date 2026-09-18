@@ -1,10 +1,10 @@
-# Persistent Home Directory (`~/.rustfox`) Implementation Plan
+# Persistent Home Directory (`~/.haos-green`) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give each RustFox instance a single persistent home directory (default `~/.rustfox`) that holds config, DB, skills, agents, artifacts, and a durable `workspace/` sandbox, with env/config overrides and a seed-plus-update flow for bundled skills.
+**Goal:** Give each HaosGreen instance a single persistent home directory (default `~/.haos-green`) that holds config, DB, skills, agents, artifacts, and a durable `workspace/` sandbox, with env/config overrides and a seed-plus-update flow for bundled skills.
 
-**Architecture:** A new pure-logic module `src/home.rs` resolves the home root (env → config → `~/.rustfox`) and every data path (unset → home default; absolute → verbatim; relative → CWD legacy + warning). `Config::resolve()` calls it, creates directories, and writes the resolved **absolute** paths back into the existing config fields so all downstream consumers (`main.rs`, `agent.rs`, `tools.rs`, `learning.rs`) keep reading the same fields unchanged. Skills/agents are seed-copied into the home on first run and refreshed by an explicit `/update-skills` command that diffs content hashes recorded in a home-side `skills-lock.json`.
+**Architecture:** A new pure-logic module `src/home.rs` resolves the home root (env → config → `~/.haos-green`) and every data path (unset → home default; absolute → verbatim; relative → CWD legacy + warning). `Config::resolve()` calls it, creates directories, and writes the resolved **absolute** paths back into the existing config fields so all downstream consumers (`main.rs`, `agent.rs`, `tools.rs`, `learning.rs`) keep reading the same fields unchanged. Skills/agents are seed-copied into the home on first run and refreshed by an explicit `/update-skills` command that diffs content hashes recorded in a home-side `skills-lock.json`.
 
 **Tech Stack:** Rust (edition 2021), Tokio, serde/toml, `dirs` crate (new), `sha2` (already present), `tempfile` (dev). Telegram via teloxide.
 
@@ -23,7 +23,7 @@
 - **Modify** `src/main.rs` — config-file discovery fallback, seed call, startup log of home.
 - **Modify** `src/agent.rs` — add `reload_skills_and_agents()` method; update system prompt sandbox text.
 - **Modify** `src/platform/telegram.rs` — `/update-skills` command + `/start` help text.
-- **Modify** `config.example.toml` — document optional paths, `RUSTFOX_HOME`, `[general].home`.
+- **Modify** `config.example.toml` — document optional paths, `HAOS_GREEN_HOME`, `[general].home`.
 - **Modify** `CLAUDE.md` / `README.md` — note the home model.
 
 **Naming decision (resolved from spec open question):** the module is `src/home.rs`.
@@ -40,7 +40,7 @@
 In `Cargo.toml`, under `[dependencies]`, after the `regex = "1"` line, add:
 
 ```toml
-# OS home-directory resolution for the persistent home dir (~/.rustfox)
+# OS home-directory resolution for the persistent home dir (~/.haos-green)
 dirs = "5"
 ```
 
@@ -85,9 +85,9 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
 /// Resolve the home root from the override sources, in priority order:
-/// 1. `RUSTFOX_HOME` env var (must be absolute)
+/// 1. `HAOS_GREEN_HOME` env var (must be absolute)
 /// 2. `[general].home` config value (must be absolute)
-/// 3. `<os_home>/.rustfox`
+/// 3. `<os_home>/.haos-green`
 pub fn resolve_home(
     env_home: Option<&str>,
     config_home: Option<&Path>,
@@ -126,13 +126,13 @@ mod tests {
     #[test]
     fn relative_config_is_ignored_falls_to_default() {
         let got = resolve_home(None, Some(Path::new("rel")), Some(Path::new("/home/u"))).unwrap();
-        assert_eq!(got, PathBuf::from("/home/u/.rustfox"));
+        assert_eq!(got, PathBuf::from("/home/u/.haos-green"));
     }
 
     #[test]
-    fn default_is_os_home_dot_rustfox() {
+    fn default_is_os_home_dot_haos-green() {
         let got = resolve_home(None, None, Some(Path::new("/home/u"))).unwrap();
-        assert_eq!(got, PathBuf::from("/home/u/.rustfox"));
+        assert_eq!(got, PathBuf::from("/home/u/.haos-green"));
     }
 
     #[test]
@@ -162,7 +162,7 @@ pub fn resolve_home(
         if p.is_absolute() {
             return Ok(p.to_path_buf());
         }
-        tracing::warn!("RUSTFOX_HOME='{env}' is not absolute; ignoring it");
+        tracing::warn!("HAOS_GREEN_HOME='{env}' is not absolute; ignoring it");
     }
     if let Some(cfg) = config_home {
         if cfg.is_absolute() {
@@ -174,9 +174,9 @@ pub fn resolve_home(
         );
     }
     let home = os_home.ok_or_else(|| {
-        anyhow!("Could not determine the OS home directory; set RUSTFOX_HOME or [general].home")
+        anyhow!("Could not determine the OS home directory; set HAOS_GREEN_HOME or [general].home")
     })?;
-    Ok(home.join(".rustfox"))
+    Ok(home.join(".haos-green"))
 }
 ```
 
@@ -238,21 +238,21 @@ Tests (inside `mod tests`):
 ```rust
     #[test]
     fn unset_path_resolves_under_home() {
-        let (p, o) = resolve_data_path(Path::new(""), Path::new("/h/.rustfox"), "workspace");
-        assert_eq!(p, PathBuf::from("/h/.rustfox/workspace"));
+        let (p, o) = resolve_data_path(Path::new(""), Path::new("/h/.haos-green"), "workspace");
+        assert_eq!(p, PathBuf::from("/h/.haos-green/workspace"));
         assert_eq!(o, PathOrigin::Default);
     }
 
     #[test]
     fn absolute_path_used_verbatim() {
-        let (p, o) = resolve_data_path(Path::new("/data/wp"), Path::new("/h/.rustfox"), "workspace");
+        let (p, o) = resolve_data_path(Path::new("/data/wp"), Path::new("/h/.haos-green"), "workspace");
         assert_eq!(p, PathBuf::from("/data/wp"));
         assert_eq!(o, PathOrigin::Absolute);
     }
 
     #[test]
     fn relative_path_is_legacy() {
-        let (p, o) = resolve_data_path(Path::new("skills"), Path::new("/h/.rustfox"), "skills");
+        let (p, o) = resolve_data_path(Path::new("skills"), Path::new("/h/.haos-green"), "skills");
         assert_eq!(p, PathBuf::from("skills"));
         assert_eq!(o, PathOrigin::RelativeLegacy);
     }
@@ -332,11 +332,11 @@ Add the test inside `mod tests` (note: requires the `tempfile` dev-dependency, a
     #[test]
     fn ensure_dirs_creates_full_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let paths = ResolvedPaths {
             home: home.clone(),
             workspace: home.join("workspace"),
-            database: home.join("rustfox.db"),
+            database: home.join("haos-green.db"),
             skills: home.join("skills"),
             agents: home.join("agents"),
             artifacts: home.join("artifacts"),
@@ -445,13 +445,13 @@ Test inside `mod tests`:
     fn warning_render_includes_paths_and_commands() {
         let w = LegacyPathWarning {
             label: "memory.database_path".to_string(),
-            current: PathBuf::from("/work/rustfox.db"),
-            home_default: PathBuf::from("/h/.rustfox/rustfox.db"),
+            current: PathBuf::from("/work/haos-green.db"),
+            home_default: PathBuf::from("/h/.haos-green/haos-green.db"),
         };
         let s = w.render();
         assert!(s.contains("memory.database_path"));
-        assert!(s.contains("/work/rustfox.db"));
-        assert!(s.contains("/h/.rustfox/rustfox.db"));
+        assert!(s.contains("/work/haos-green.db"));
+        assert!(s.contains("/h/.haos-green/haos-green.db"));
         assert!(s.contains("cp -rT"));
     }
 ```
@@ -626,7 +626,7 @@ pub struct GeneralConfig {
     /// Optional location string injected into the system prompt (e.g. "Tokyo, Japan")
     #[serde(default)]
     pub location: Option<String>,
-    /// Optional absolute path overriding the default `~/.rustfox` home root.
+    /// Optional absolute path overriding the default `~/.haos-green` home root.
     #[serde(default)]
     pub home: Option<PathBuf>,
 }
@@ -678,7 +678,7 @@ Add to the `#[cfg(test)] mod tests` block in `src/config.rs`:
     #[test]
     fn resolve_fills_unset_paths_under_home() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -687,7 +687,7 @@ Add to the `#[cfg(test)] mod tests` block in `src/config.rs`:
         let warnings = cfg.resolve().unwrap();
         assert_eq!(cfg.resolved_home.as_ref().unwrap(), &home);
         assert_eq!(cfg.sandbox.allowed_directory, home.join("workspace"));
-        assert_eq!(cfg.memory.database_path, home.join("rustfox.db"));
+        assert_eq!(cfg.memory.database_path, home.join("haos-green.db"));
         assert_eq!(cfg.skills.directory, home.join("skills"));
         assert_eq!(cfg.agents.directory, home.join("agents"));
         assert_eq!(cfg.supervisor.artifacts_dir, home.join("artifacts"));
@@ -698,7 +698,7 @@ Add to the `#[cfg(test)] mod tests` block in `src/config.rs`:
     #[test]
     fn resolve_keeps_absolute_overrides() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -713,7 +713,7 @@ Add to the `#[cfg(test)] mod tests` block in `src/config.rs`:
     #[test]
     fn resolve_warns_on_relative_override() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let mut cfg: Config = toml::from_str(base_toml()).unwrap();
         cfg.general = Some(GeneralConfig {
             location: None,
@@ -742,7 +742,7 @@ Add inside `impl Config { ... }` (before `pub fn load`):
     pub fn resolve(&mut self) -> Result<Vec<crate::home::LegacyPathWarning>> {
         use crate::home::{ensure_dirs, resolve_data_path, resolve_home, PathOrigin, ResolvedPaths};
 
-        let env_home = std::env::var("RUSTFOX_HOME").ok();
+        let env_home = std::env::var("HAOS_GREEN_HOME").ok();
         let config_home = self.general.as_ref().and_then(|g| g.home.as_deref());
         let os_home = dirs::home_dir();
         let home = resolve_home(env_home.as_deref(), config_home, os_home.as_deref())?;
@@ -761,7 +761,7 @@ Add inside `impl Config { ... }` (before `pub fn load`):
         };
 
         let workspace = resolve_one("sandbox.allowed_directory", &self.sandbox.allowed_directory, "workspace");
-        let database = resolve_one("memory.database_path", &self.memory.database_path, "rustfox.db");
+        let database = resolve_one("memory.database_path", &self.memory.database_path, "haos-green.db");
         let skills = resolve_one("skills.directory", &self.skills.directory, "skills");
         let agents = resolve_one("agents.directory", &self.agents.directory, "agents");
         let artifacts = resolve_one("supervisor.artifacts_dir", &self.supervisor.artifacts_dir, "artifacts");
@@ -817,7 +817,7 @@ Add to `mod tests`:
     #[test]
     fn load_resolves_paths_to_absolute() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join(".rustfox");
+        let home = tmp.path().join(".haos-green");
         let cfg_path = tmp.path().join("config.toml");
         let toml = format!(
             r#"
@@ -894,7 +894,7 @@ Add to `src/home.rs` after `resolve_home`:
 
 ```rust
 /// The home root used purely for *config-file discovery*, before the config is
-/// loaded. Uses only `RUSTFOX_HOME` (if absolute) or `<os_home>/.rustfox`.
+/// loaded. Uses only `HAOS_GREEN_HOME` (if absolute) or `<os_home>/.haos-green`.
 pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<PathBuf> {
     if let Some(env) = env_home {
         let p = Path::new(env);
@@ -902,7 +902,7 @@ pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<Pa
             return Some(p.to_path_buf());
         }
     }
-    os_home.map(|h| h.join(".rustfox"))
+    os_home.map(|h| h.join(".haos-green"))
 }
 ```
 
@@ -917,10 +917,10 @@ Add the test in `mod tests`:
         );
         assert_eq!(
             default_home(None, Some(Path::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.rustfox"))
+            Some(PathBuf::from("/home/u/.haos-green"))
         );
         assert_eq!(default_home(Some("rel"), Some(Path::new("/home/u"))),
-            Some(PathBuf::from("/home/u/.rustfox")));
+            Some(PathBuf::from("/home/u/.haos-green")));
     }
 ```
 
@@ -955,8 +955,8 @@ with:
         if cwd.exists() {
             return cwd;
         }
-        let env_home = std::env::var("RUSTFOX_HOME").ok();
-        if let Some(home) = rustfox::home::default_home(env_home.as_deref(), dirs::home_dir().as_deref()) {
+        let env_home = std::env::var("HAOS_GREEN_HOME").ok();
+        if let Some(home) = haos-green::home::default_home(env_home.as_deref(), dirs::home_dir().as_deref()) {
             let candidate = home.join("config.toml");
             if candidate.exists() {
                 return candidate;
@@ -1001,12 +1001,12 @@ git commit -m "feat(home): config-file discovery fallback to <home>/config.toml"
 Create `tests/home_sandbox.rs`:
 
 ```rust
-use rustfox::config::Config;
+use haos-green::config::Config;
 
 #[test]
 fn sandbox_defaults_to_home_workspace_and_excludes_secrets() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join(".rustfox");
+    let home = tmp.path().join(".haos-green");
     let cfg_path = tmp.path().join("config.toml");
     let toml = format!(
         r#"
@@ -1026,7 +1026,7 @@ fn sandbox_defaults_to_home_workspace_and_excludes_secrets() {
     // Sandbox is the workspace subdir of home.
     assert_eq!(cfg.sandbox.allowed_directory, home.join("workspace"));
     // DB lives ABOVE the sandbox → structurally unreachable by file tools.
-    assert_eq!(cfg.memory.database_path, home.join("rustfox.db"));
+    assert_eq!(cfg.memory.database_path, home.join("haos-green.db"));
     assert!(!cfg.memory.database_path.starts_with(&cfg.sandbox.allowed_directory));
 }
 ```
@@ -1577,12 +1577,12 @@ In `src/main.rs`, immediately **before** the line `let skills = load_skills_from
     let bundled_skills = PathBuf::from("skills");
     let bundled_agents = PathBuf::from("agents");
     if let Err(e) =
-        rustfox::skills::seed::seed_dir_if_empty(&bundled_skills, &config.skills.directory).await
+        haos-green::skills::seed::seed_dir_if_empty(&bundled_skills, &config.skills.directory).await
     {
         warn!("Skill seeding failed: {e}");
     }
     if let Err(e) =
-        rustfox::skills::seed::seed_dir_if_empty(&bundled_agents, &config.agents.directory).await
+        haos-green::skills::seed::seed_dir_if_empty(&bundled_agents, &config.agents.directory).await
     {
         warn!("Agent seeding failed: {e}");
     }
@@ -1591,9 +1591,9 @@ In `src/main.rs`, immediately **before** the line `let skills = load_skills_from
     if let Some(home) = &config.resolved_home {
         let lock_path = home.join("skills-lock.json");
         if !lock_path.exists() {
-            let lock = rustfox::skills::update::SkillLock {
+            let lock = haos-green::skills::update::SkillLock {
                 version: 1,
-                skills: rustfox::skills::seed::lock_map_for(&config.skills.directory),
+                skills: haos-green::skills::seed::lock_map_for(&config.skills.directory),
             };
             if let Ok(json) = serde_json::to_string_pretty(&lock) {
                 let _ = std::fs::write(&lock_path, json);
@@ -1609,8 +1609,8 @@ Expected: builds cleanly. (`serde_json` and `warn` are already imported in `main
 
 - [ ] **Step 3: Manual smoke check**
 
-Run: `RUSTFOX_HOME="$(mktemp -d)/.rustfox" cargo run -- config.toml` for ~3 seconds, then Ctrl-C.
-Expected log lines: `Home: .../.rustfox`, `Seeded N skill(s) ...`, `Skills: N`. A `skills-lock.json` exists in the home.
+Run: `HAOS_GREEN_HOME="$(mktemp -d)/.haos-green" cargo run -- config.toml` for ~3 seconds, then Ctrl-C.
+Expected log lines: `Home: .../.haos-green`, `Seeded N skill(s) ...`, `Skills: N`. A `skills-lock.json` exists in the home.
 
 (If `config.toml` is not present/valid in the dev env, skip this manual step and rely on the integration test in Task 10 plus the unit tests.)
 
@@ -1688,7 +1688,7 @@ In `src/platform/telegram.rs`, immediately **after** the `if text == "/skills" {
             .unwrap_or_else(|| std::path::PathBuf::from("skills-lock.json"));
 
         let mut lines = Vec::new();
-        match rustfox::skills::update::update_skills(
+        match haos-green::skills::update::update_skills(
             &bundled_skills,
             &agent.config.skills.directory,
             &lock_path,
@@ -1698,7 +1698,7 @@ In `src/platform/telegram.rs`, immediately **after** the `if text == "/skills" {
             Ok(r) => lines.push(format!("Skills — {}", r.summary())),
             Err(e) => lines.push(format!("Skills update failed: {e}")),
         }
-        match rustfox::skills::update::update_skills(
+        match haos-green::skills::update::update_skills(
             &bundled_agents,
             &agent.config.agents.directory,
             &lock_path,
@@ -1756,21 +1756,21 @@ In `config.example.toml`, change the `[sandbox]` section from:
 
 ```toml
 [sandbox]
-allowed_directory = "/tmp/rustfox-sandbox"
+allowed_directory = "/tmp/haos-green-sandbox"
 ```
 
 to:
 
 ```toml
 # ── Home directory & paths ──────────────────────────────────────────────
-# By default RustFox stores everything under ~/.rustfox:
-#   ~/.rustfox/config.toml, rustfox.db, skills/, agents/, workspace/, artifacts/
-# Override the home root with the RUSTFOX_HOME env var (absolute path) or
+# By default HaosGreen stores everything under ~/.haos-green:
+#   ~/.haos-green/config.toml, haos-green.db, skills/, agents/, workspace/, artifacts/
+# Override the home root with the HAOS_GREEN_HOME env var (absolute path) or
 # [general].home below. Run a second isolated instance with:
-#   RUSTFOX_HOME="$HOME/.rustfox-work" cargo run
+#   HAOS_GREEN_HOME="$HOME/.haos-green-work" cargo run
 #
 # [general]
-# home = "/absolute/path/to/home"   # optional; overrides ~/.rustfox
+# home = "/absolute/path/to/home"   # optional; overrides ~/.haos-green
 
 [sandbox]
 # The LLM's persistent workspace (file/command tools are confined here).
@@ -1780,10 +1780,10 @@ to:
 
 - [ ] **Step 2: Comment out the now-optional path keys**
 
-Find the `[memory]` section and change `database_path = "rustfox.db"` to:
+Find the `[memory]` section and change `database_path = "haos-green.db"` to:
 ```toml
-# Leave unset to use <home>/rustfox.db. Set an absolute path to override.
-# database_path = "/absolute/path/to/rustfox.db"
+# Leave unset to use <home>/haos-green.db. Set an absolute path to override.
+# database_path = "/absolute/path/to/haos-green.db"
 ```
 
 Find `[skills]` and change `directory = "skills"` to:
@@ -1798,7 +1798,7 @@ If `[agents]`, `[supervisor].artifacts_dir`, or `[learning].user_model_path` key
 
 ```bash
 git add config.example.toml
-git commit -m "docs: document ~/.rustfox home and optional paths in example config"
+git commit -m "docs: document ~/.haos-green home and optional paths in example config"
 ```
 
 ---
@@ -1813,18 +1813,18 @@ git commit -m "docs: document ~/.rustfox home and optional paths in example conf
 Create `docs/persistent-home-directory.md`:
 
 ````markdown
-# Persistent Home Directory (`~/.rustfox`)
+# Persistent Home Directory (`~/.haos-green`)
 
-RustFox stores all of its state under a single **home directory**, by default
-`~/.rustfox`. This survives reboots, keeps secrets out of the LLM sandbox, and
+HaosGreen stores all of its state under a single **home directory**, by default
+`~/.haos-green`. This survives reboots, keeps secrets out of the LLM sandbox, and
 makes it easy to run several isolated instances on one machine.
 
 ## Layout
 
 ```
-~/.rustfox/
+~/.haos-green/
   config.toml      # secrets (bot token, API keys) — OUTSIDE the sandbox
-  rustfox.db       # SQLite memory + embeddings     — OUTSIDE the sandbox
+  haos-green.db       # SQLite memory + embeddings     — OUTSIDE the sandbox
   skills/          # skills (seeded on first run, editable)
   agents/          # agents (seeded on first run, editable)
   workspace/       # THE SANDBOX — durable scratch space for the LLM
@@ -1833,15 +1833,15 @@ makes it easy to run several isolated instances on one machine.
 ```
 
 Only `workspace/` is reachable by the file and command tools. `config.toml`
-and `rustfox.db` live above it and cannot be read or written by the LLM.
+and `haos-green.db` live above it and cannot be read or written by the LLM.
 
 ## Choosing where the home lives
 
 Resolution order (first match wins):
 
-1. `RUSTFOX_HOME` environment variable (must be an absolute path)
+1. `HAOS_GREEN_HOME` environment variable (must be an absolute path)
 2. `[general].home` in `config.toml` (absolute path)
-3. `~/.rustfox` (default)
+3. `~/.haos-green` (default)
 
 Each individual path can still be pinned independently in `config.toml`
 (e.g. `[memory].database_path`). An absolute value is used verbatim; an unset
@@ -1849,28 +1849,28 @@ value falls back to the home default.
 
 ## Migrating existing data
 
-If you previously ran RustFox from a project directory (with `./rustfox.db`,
-`./skills`, etc.), RustFox will **not** move your files automatically. On
+If you previously ran HaosGreen from a project directory (with `./haos-green.db`,
+`./skills`, etc.), HaosGreen will **not** move your files automatically. On
 startup it prints an actionable warning for each legacy path. To migrate:
 
-RustFox auto-creates the home subdirectories on startup, so use `cp -rT`
+HaosGreen auto-creates the home subdirectories on startup, so use `cp -rT`
 (merge into the existing destination directory) rather than plain `cp -r`,
-which would nest (e.g. `~/.rustfox/skills/skills`). Each command copies only
+which would nest (e.g. `~/.haos-green/skills/skills`). Each command copies only
 that one path — never your whole project.
 
 ```bash
-mkdir -p ~/.rustfox
-cp     ./rustfox.db            ~/.rustfox/rustfox.db
-cp -rT ./skills               ~/.rustfox/skills
-cp -rT ./agents               ~/.rustfox/agents
-cp -rT ./supervisor/artifacts ~/.rustfox/artifacts   # if you used the supervisor
-cp     ./memory/USER.md        ~/.rustfox/user_model.md   # if present
+mkdir -p ~/.haos-green
+cp     ./haos-green.db            ~/.haos-green/haos-green.db
+cp -rT ./skills               ~/.haos-green/skills
+cp -rT ./agents               ~/.haos-green/agents
+cp -rT ./supervisor/artifacts ~/.haos-green/artifacts   # if you used the supervisor
+cp     ./memory/USER.md        ~/.haos-green/user_model.md   # if present
 # Move your old sandbox contents into the new persistent workspace:
-cp -rT /tmp/rustfox-sandbox    ~/.rustfox/workspace   # adjust to your old sandbox
+cp -rT /tmp/haos-green-sandbox    ~/.haos-green/workspace   # adjust to your old sandbox
 ```
 
-Then remove any path overrides from `config.toml` so RustFox uses the home
-defaults, and place your `config.toml` at `~/.rustfox/config.toml` (or keep
+Then remove any path overrides from `config.toml` so HaosGreen uses the home
+defaults, and place your `config.toml` at `~/.haos-green/config.toml` (or keep
 passing it as the first CLI argument).
 
 ## Keeping the old location instead
@@ -1881,7 +1881,7 @@ If you prefer your current layout, pin the paths explicitly in `config.toml`:
 [sandbox]
 allowed_directory = "/abs/path/to/old/sandbox"
 [memory]
-database_path = "/abs/path/to/rustfox.db"
+database_path = "/abs/path/to/haos-green.db"
 [skills]
 directory = "/abs/path/to/skills"
 ```
@@ -1890,8 +1890,8 @@ Absolute paths are always honored unchanged.
 
 ## Starting fresh
 
-Doing nothing is the "start fresh" path: RustFox creates an empty
-`~/.rustfox/workspace`, a new database, and seeds skills/agents from the bundled
+Doing nothing is the "start fresh" path: HaosGreen creates an empty
+`~/.haos-green/workspace`, a new database, and seeds skills/agents from the bundled
 copies. Your old project-directory files are left untouched.
 
 ## Running multiple instances
@@ -1903,7 +1903,7 @@ Give each instance its own home:
 cargo run
 
 # A separate work instance, fully isolated
-RUSTFOX_HOME="$HOME/.rustfox-work" cargo run
+HAOS_GREEN_HOME="$HOME/.haos-green-work" cargo run
 ```
 
 Each home has independent skills, agents, workspace, database, and artifacts.
@@ -1941,12 +1941,12 @@ In `CLAUDE.md`, in the `### Configuration` section, after the existing list of r
 ```markdown
 ### Home directory
 
-RustFox stores all state under a single home directory (default `~/.rustfox`),
-resolved as: `RUSTFOX_HOME` env (absolute) → `[general].home` config → `~/.rustfox`.
-Layout: `config.toml`, `rustfox.db`, `skills/`, `agents/`, `workspace/` (the
+HaosGreen stores all state under a single home directory (default `~/.haos-green`),
+resolved as: `HAOS_GREEN_HOME` env (absolute) → `[general].home` config → `~/.haos-green`.
+Layout: `config.toml`, `haos-green.db`, `skills/`, `agents/`, `workspace/` (the
 sandbox), `artifacts/`, `user_model.md`. Each path can be pinned to an absolute
 location in `config.toml`; unset paths fall back to the home default. Run
-isolated instances with `RUSTFOX_HOME=...`. See
+isolated instances with `HAOS_GREEN_HOME=...`. See
 `docs/persistent-home-directory.md`. Path resolution lives in `src/home.rs`
 (`Config::resolve` writes the resolved absolute paths back into the config).
 Bundled skills/agents are seed-copied on first run; `/update-skills` re-syncs
@@ -1959,9 +1959,9 @@ In `README.md`, find the configuration/setup section that mentions the sandbox
 directory and add a short note (place it near where `[sandbox]` is described):
 
 ```markdown
-> **Persistent home:** RustFox keeps all state under `~/.rustfox` by default
+> **Persistent home:** HaosGreen keeps all state under `~/.haos-green` by default
 > (config, database, skills, agents, and a durable `workspace/` sandbox).
-> Override with the `RUSTFOX_HOME` environment variable or `[general].home`.
+> Override with the `HAOS_GREEN_HOME` environment variable or `[general].home`.
 > See [docs/persistent-home-directory.md](docs/persistent-home-directory.md).
 ```
 
@@ -2021,9 +2021,9 @@ git commit -m "chore: fmt + clippy fixups for persistent home directory"
 
 | Spec section | Task(s) |
 |---|---|
-| §1 Directory model (hybrid home, RUSTFOX_HOME, [general].home, per-path override) | 2, 3, 6, 7 |
+| §1 Directory model (hybrid home, HAOS_GREEN_HOME, [general].home, per-path override) | 2, 3, 6, 7 |
 | §1 Config discovery `<home>/config.toml` | 9 |
-| §1 Multi-instance via RUSTFOX_HOME | 7, 9, 17 |
+| §1 Multi-instance via HAOS_GREEN_HOME | 7, 9, 17 |
 | §2 Home resolution module + ResolvedPaths + ensure_dirs (0700) | 2, 3, 4 |
 | §3 Sandbox = workspace; secrets unreachable | 7, 10 |
 | §4 Durable workspace + prompt text | 10 |

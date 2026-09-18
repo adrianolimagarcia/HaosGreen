@@ -59,7 +59,7 @@ Be concise and helpful."""
 # ── Home directory & paths ──────────────────────────────────────────────
 # By default HaosGreen stores everything under ~/.haos-green:
 #   ~/.haos-green/config.toml, haos-green.db, skills/, agents/, workspace/, artifacts/
-# Override the home root with the HAOS_GREEN_HOME env var (absolute path; RUSTFOX_HOME also checked for compatibility) or
+# Override the home root with the HAOS_GREEN_HOME env var (absolute path) or
 # [general].home (see the [general] section below). Run a second isolated
 # instance with:
 #   HAOS_GREEN_HOME="$HOME/.haos-green-work" cargo run

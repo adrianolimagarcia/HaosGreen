@@ -12,13 +12,7 @@ pub enum Action {
 
 fn home_dir() -> PathBuf {
     let os_home = dirs::home_dir().expect("Could not determine home directory");
-    let new_home = os_home.join(".haos-green");
-    let legacy_home = os_home.join(".rustfox");
-    if !new_home.exists() && legacy_home.exists() {
-        legacy_home
-    } else {
-        new_home
-    }
+    os_home.join(".haos-green")
 }
 
 fn render_template(template: &str, bin_path: &Path) -> String {
@@ -30,10 +24,6 @@ fn render_template(template: &str, bin_path: &Path) -> String {
         .replace("{{HAOS_GREEN_CONFIG}}", &config_path.to_string_lossy())
         .replace("{{HAOS_GREEN_HOME}}", &home.to_string_lossy())
         .replace("{{HAOS_GREEN_PATH}}", &path)
-        .replace("{{RUSTFOX_BIN}}", &bin_path.to_string_lossy())
-        .replace("{{RUSTFOX_CONFIG}}", &config_path.to_string_lossy())
-        .replace("{{RUSTFOX_HOME}}", &home.to_string_lossy())
-        .replace("{{RUSTFOX_PATH}}", &path)
 }
 
 pub fn handle(action: Action) -> Result<()> {
@@ -68,7 +58,7 @@ fn install() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn install_systemd(exe: &Path) -> Result<()> {
-    let template = include_str!("../../scripts/services/rustfox.service.template");
+    let template = include_str!("../../scripts/services/haos-green.service.template");
     let rendered = render_template(template, exe);
 
     let user_service_dir = dirs::home_dir()
@@ -111,19 +101,12 @@ fn remove_systemd() -> Result<()> {
         .args(["--user", "stop", "haos-green.service"])
         .status();
     let _ = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "rustfox.service"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
         .args(["--user", "disable", "haos-green.service"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "rustfox.service"])
         .status();
 
     if let Some(home) = dirs::home_dir() {
         let user_service_dir = home.join(".config").join("systemd").join("user");
         let _ = std::fs::remove_file(user_service_dir.join("haos-green.service"));
-        let _ = std::fs::remove_file(user_service_dir.join("rustfox.service"));
     }
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -135,7 +118,7 @@ fn remove_systemd() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_launchd(exe: &Path) -> Result<()> {
-    let template = include_str!("../../scripts/services/com.rustfox.bot.plist.template");
+    let template = include_str!("../../scripts/services/com.haos-green.bot.plist.template");
     let rendered = render_template(template, exe);
 
     let agent_dir = dirs::home_dir()
@@ -173,18 +156,12 @@ fn remove_launchd() -> Result<()> {
         .join("Library")
         .join("LaunchAgents");
     let plist_path = agent_dir.join("com.haos-green.bot.plist");
-    let legacy_plist_path = agent_dir.join("com.rustfox.bot.plist");
 
     let _ = std::process::Command::new("launchctl")
         .args(["unload", "-w"])
         .arg(&plist_path)
         .status();
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(&legacy_plist_path)
-        .status();
     let _ = std::fs::remove_file(&plist_path);
-    let _ = std::fs::remove_file(&legacy_plist_path);
 
     println!("✓ HaosGreen launchd agent removed");
     Ok(())
@@ -263,14 +240,7 @@ fn remove() -> Result<()> {
 fn status() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let svc = if dirs::home_dir()
-            .map(|h| h.join(".config/systemd/user/haos-green.service").exists())
-            .unwrap_or(false)
-        {
-            "haos-green.service"
-        } else {
-            "rustfox.service"
-        };
+        let svc = "haos-green.service";
         let output = std::process::Command::new("systemctl")
             .args(["--user", "--no-pager", "status", svc])
             .output()
@@ -281,17 +251,7 @@ fn status() -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let label = if dirs::home_dir()
-            .map(|h| {
-                h.join("Library/LaunchAgents/com.haos-green.bot.plist")
-                    .exists()
-            })
-            .unwrap_or(false)
-        {
-            "com.haos-green.bot"
-        } else {
-            "com.rustfox.bot"
-        };
+        let label = "com.haos-green.bot";
         let output = std::process::Command::new("launchctl")
             .args(["list", label])
             .output()
@@ -302,16 +262,7 @@ fn status() -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let svc = if std::process::Command::new("sc")
-            .args(["query", "HaosGreen"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            "HaosGreen"
-        } else {
-            "RustFox"
-        };
+        let svc = "HaosGreen";
         let output = std::process::Command::new("sc")
             .args(["query", svc])
             .output()
@@ -329,14 +280,7 @@ fn status() -> Result<()> {
 fn start() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let svc = if dirs::home_dir()
-            .map(|h| h.join(".config/systemd/user/haos-green.service").exists())
-            .unwrap_or(false)
-        {
-            "haos-green.service"
-        } else {
-            "rustfox.service"
-        };
+        let svc = "haos-green.service";
         let status = std::process::Command::new("systemctl")
             .args(["--user", "start", svc])
             .status()
@@ -349,17 +293,7 @@ fn start() -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let label = if dirs::home_dir()
-            .map(|h| {
-                h.join("Library/LaunchAgents/com.haos-green.bot.plist")
-                    .exists()
-            })
-            .unwrap_or(false)
-        {
-            "com.haos-green.bot"
-        } else {
-            "com.rustfox.bot"
-        };
+        let label = "com.haos-green.bot";
         let status = std::process::Command::new("launchctl")
             .args(["start", label])
             .status()
@@ -372,16 +306,7 @@ fn start() -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let svc = if std::process::Command::new("sc")
-            .args(["query", "HaosGreen"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            "HaosGreen"
-        } else {
-            "RustFox"
-        };
+        let svc = "HaosGreen";
         let status = std::process::Command::new("sc")
             .args(["start", svc])
             .status()
@@ -401,14 +326,7 @@ fn start() -> Result<()> {
 fn stop() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let svc = if dirs::home_dir()
-            .map(|h| h.join(".config/systemd/user/haos-green.service").exists())
-            .unwrap_or(false)
-        {
-            "haos-green.service"
-        } else {
-            "rustfox.service"
-        };
+        let svc = "haos-green.service";
         let status = std::process::Command::new("systemctl")
             .args(["--user", "stop", svc])
             .status()
@@ -421,17 +339,7 @@ fn stop() -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let label = if dirs::home_dir()
-            .map(|h| {
-                h.join("Library/LaunchAgents/com.haos-green.bot.plist")
-                    .exists()
-            })
-            .unwrap_or(false)
-        {
-            "com.haos-green.bot"
-        } else {
-            "com.rustfox.bot"
-        };
+        let label = "com.haos-green.bot";
         let status = std::process::Command::new("launchctl")
             .args(["stop", label])
             .status()
@@ -444,16 +352,7 @@ fn stop() -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let svc = if std::process::Command::new("sc")
-            .args(["query", "HaosGreen"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            "HaosGreen"
-        } else {
-            "RustFox"
-        };
+        let svc = "HaosGreen";
         let status = std::process::Command::new("sc")
             .args(["stop", svc])
             .status()
@@ -482,10 +381,8 @@ mod tests {
         let bin_path = Path::new("/usr/local/bin/haos-green");
         let result = render_template(template, bin_path);
         assert!(result.contains("/usr/local/bin/haos-green"));
-        assert!(
-            result.contains(".haos-green/config.toml") || result.contains(".rustfox/config.toml")
-        );
-        assert!(result.contains(".haos-green\n") || result.contains(".rustfox\n"));
+        assert!(result.contains(".haos-green/config.toml"));
+        assert!(result.contains(".haos-green\n"));
         assert!(
             result.contains('/'),
             "PATH must be populated in rendered template, got: {}",
@@ -503,5 +400,30 @@ mod tests {
         let bin_path = Path::new("/usr/local/bin/haos-green");
         let result = render_template(template, bin_path);
         assert!(!result.contains("{{"));
+    }
+
+    /// The real templates, not a synthetic string: an unrendered placeholder
+    /// would otherwise be written verbatim into a unit file that systemd then
+    /// reads. `render_template` only substitutes the `HAOS_GREEN_*` names, so a
+    /// leftover `{{RUSTFOX_*}}` in a template ships as literal text.
+    #[test]
+    fn shipped_templates_render_completely_and_name_only_haos_green() {
+        let bin_path = Path::new("/usr/local/bin/haos-green");
+        for template in [
+            include_str!("../../scripts/services/haos-green.service.template"),
+            include_str!("../../scripts/services/com.haos-green.bot.plist.template"),
+            include_str!("../../scripts/services/install-service.bat.template"),
+            include_str!("../../scripts/services/uninstall-service.bat.template"),
+        ] {
+            let rendered = render_template(template, bin_path);
+            assert!(
+                !rendered.contains("{{"),
+                "unrendered placeholder left in a shipped template:\n{rendered}"
+            );
+            assert!(
+                !rendered.to_lowercase().contains("rustfox"),
+                "template still names the pre-rename project:\n{rendered}"
+            );
+        }
     }
 }

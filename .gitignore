@@ -10,6 +10,10 @@ web-auth.toml
 *.swp
 *.swo
 .env
+# The live database. `rustfox.db*` is the pre-rename name and is kept on
+# purpose: an ignore rule is a safety net, not branding, and a stale database
+# left in the tree holds memory contents that must never be committed.
+haos-green.db*
 rustfox.db*
 .worktrees/
 

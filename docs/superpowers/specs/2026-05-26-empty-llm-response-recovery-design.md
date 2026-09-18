@@ -2,13 +2,13 @@
 
 ## Goal
 
-Prevent RustFox from silently finishing a Telegram request when the LLM provider returns an assistant message with no content and no tool calls, especially during long tool-heavy tasks.
+Prevent HaosGreen from silently finishing a Telegram request when the LLM provider returns an assistant message with no content and no tool calls, especially during long tool-heavy tasks.
 
 ## Evidence
 
 The production trace `20732c50-bcdb-4233-9133-5c1d89111d62` shows the failure clearly:
 
-- Root run `rustfox_request` ended with `error = null` and `outputs.response = ""`.
+- Root run `haos-green_request` ended with `error = null` and `outputs.response = ""`.
 - Final child run `510d2452-2dc0-4c36-bdb5-62fd7b06fa05` returned an assistant message with `content = null` and `tool_calls = null`.
 - Console logging for that same call reported `finish_reason = None`.
 - The failing request had 67 messages: 33 assistant messages, 32 tool messages, and 2 user messages.
@@ -22,7 +22,7 @@ Local code currently turns this provider-null response into a successful empty a
 
 ## Root Cause
 
-RustFox has no invalid-response state between the LLM client and the agent loop. A malformed or provider-empty assistant message is indistinguishable from a legitimate final assistant message whose content is an empty string.
+HaosGreen has no invalid-response state between the LLM client and the agent loop. A malformed or provider-empty assistant message is indistinguishable from a legitimate final assistant message whose content is an empty string.
 
 Prompt growth from many tool calls is a contributing trigger. The agent keeps full assistant tool-call messages and full tool results in the in-flight prompt. Large file-write or shell-command arguments can dominate the prompt even after the tool result is short. This makes the provider-null response more likely during multi-step tasks.
 
@@ -271,7 +271,7 @@ Emit structured logs for operational visibility:
 - `empty_response.retry_exhausted`
 - `prompt_compaction.applied`
 
-Counters can be logs first; a metrics sink can be added later if RustFox gains one.
+Counters can be logs first; a metrics sink can be added later if HaosGreen gains one.
 
 ## Non-Goals
 

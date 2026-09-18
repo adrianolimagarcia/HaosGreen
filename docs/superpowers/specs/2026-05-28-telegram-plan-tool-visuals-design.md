@@ -2,7 +2,7 @@
 
 ## Goal
 
-Improve RustFox's Telegram verbose-mode experience for agent planning and tool execution.
+Improve HaosGreen's Telegram verbose-mode experience for agent planning and tool execution.
 
 When verbose mode is enabled, users should see one clear live progress message while the agent works, then a persistent audit card after completion. Planning tools should render as a readable checklist instead of generic tool-call text. Other tools should still appear in the same progress surface as a compact activity log.
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Support two skill layers — instance (custom/writable, `~/.rustfox/skills/`) and bundled (read-only templates, `./skills/`) — with instance shadowing bundled on name collision.
+**Goal:** Support two skill layers — instance (custom/writable, `~/.haos-green/skills/`) and bundled (read-only templates, `./skills/`) — with instance shadowing bundled on name collision.
 
 **Architecture:** `SkillRegistry` gains two internal maps (`instance_skills` + `bundled_skills`) and a `skill_base_dirs` lookup. `load_skills_from_dir` takes a `SkillSource` enum to tag skills. Agent tools (`read_skill_file`, `write_skill_file`, etc.) resolve via the registry's source tracking. Config adds `bundled_directory` fields for skills and agents.
 
@@ -33,7 +33,7 @@ pub struct SkillRegistry {
     instance_skills: HashMap<String, Skill>,
     bundled_skills: HashMap<String, Skill>,
     /// Maps skill name → absolute base directory for read_skill_file path resolution.
-    /// Uses the source directory (e.g. ~/.rustfox/skills/ or /project/skills/).
+    /// Uses the source directory (e.g. ~/.haos-green/skills/ or /project/skills/).
     skill_base_dirs: HashMap<String, PathBuf>,
 }
 ```
@@ -178,7 +178,7 @@ pub async fn load_skills_from_dir(
 }
 ```
 
-The `base_dir` parameter is the root skills directory (e.g. `~/.rustfox/skills/` or `/project/skills/`). This is what gets stored in `skill_base_dirs` for `read_skill_file` resolution.
+The `base_dir` parameter is the root skills directory (e.g. `~/.haos-green/skills/` or `/project/skills/`). This is what gets stored in `skill_base_dirs` for `read_skill_file` resolution.
 
 - [ ] **Step 2: Update `register` call inside `load_skills_from_dir`**
 
@@ -548,7 +548,7 @@ let agents = load_skills_from_dir(&config.agents.directory).await?;
 ```
 To:
 ```rust
-use rustfox::skills::SkillSource;
+use haos-green::skills::SkillSource;
 
 let mut skills = load_skills_from_dir(
     &config.skills.directory,

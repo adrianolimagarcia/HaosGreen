@@ -6,7 +6,7 @@
 src/
 ├── main.rs           # Entry point, config loading, MCP setup, bot launch
 ├── config.rs         # TOML config parsing (all sections)
-├── home.rs           # Persistent home directory resolution (~/.rustfox)
+├── home.rs           # Persistent home directory resolution (~/.haos-green)
 ├── agent.rs          # Agentic loop, tool dispatch, skills/agents layer
 ├── agent_prompt.rs   # Prompt preparation, compaction, recovery nudges
 ├── tools.rs          # Built-in tool definitions + sandbox path validation

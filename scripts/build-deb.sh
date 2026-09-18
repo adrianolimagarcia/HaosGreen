@@ -75,7 +75,6 @@ cat > "$PKG_DIR/DEBIAN/prerm" << 'PRERM'
 set -e
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user disable --now haos-green.service 2>/dev/null || true
-  systemctl --user disable --now rustfox.service 2>/dev/null || true
 fi
 PRERM
 chmod 755 "$PKG_DIR/DEBIAN/prerm"

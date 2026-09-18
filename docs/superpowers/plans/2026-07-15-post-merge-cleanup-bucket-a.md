@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 /// Validates that a path is within the allowed sandbox directory.
 pub fn validate_sandbox_path(/* ... */) -> Result<PathBuf> { /* ... */ }
 
-/// Validates that a path is within the RustFox home directory.
+/// Validates that a path is within the HaosGreen home directory.
 pub fn validate_home_path(/* ... */) -> Result<PathBuf> { /* ... */ }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ pub(crate) fn preprocess_markdown(md: &str) -> String {
 
 - [ ] **Step 2: Run tests to verify nothing broke**
 
-Run: `cargo test -p rustfox markdown_entities -- --test-threads=1`
+Run: `cargo test -p haos-green markdown_entities -- --test-threads=1`
 Expected: ALL tests pass
 
 - [ ] **Step 3: Commit**
@@ -345,10 +345,10 @@ pub fn init_bot_token(token: String) {
 In `src/main.rs`, after line 209 (`let bot = Arc::new(teloxide::Bot::new(&config.telegram.bot_token));`), add:
 
 ```rust
-    rustfox::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
+    haos-green::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
 ```
 
-Note: ensure the `rustfox::platform::telegram` module path is visible (it is — `run_bot` already uses `rustfox::platform::telegram`).
+Note: ensure the `haos-green::platform::telegram` module path is visible (it is — `run_bot` already uses `haos-green::platform::telegram`).
 
 - [ ] **Step 3: Build and verify**
 
@@ -624,7 +624,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p rustfox -- --test-threads=1`
+Run: `cargo test -p haos-green -- --test-threads=1`
 Expected: All tests pass (existing + new chunking tests)
 
 - [ ] **Step 3: Commit**

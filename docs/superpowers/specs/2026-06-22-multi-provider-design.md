@@ -2,11 +2,11 @@
 
 **Date:** 2026-06-22
 **Status:** Draft
-**Author:** RustFox Brainstorming Session
+**Author:** HaosGreen Brainstorming Session
 
 ## 1. Problem
 
-RustFox currently supports a single LLM provider (OpenRouter) via `[openrouter]` config.
+HaosGreen currently supports a single LLM provider (OpenRouter) via `[openrouter]` config.
 This creates three limitations:
 
 1. **No fallback** — if OpenRouter is down, the bot is unusable

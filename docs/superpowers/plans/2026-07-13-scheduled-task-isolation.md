@@ -465,7 +465,7 @@ git commit -m "feat(telegram): make send_markdown_message pub for scheduled task
 At the top of `src/main.rs`, add to the existing `use` block:
 
 ```rust
-use rustfox::platform::telegram::send_markdown_message;
+use haos-green::platform::telegram::send_markdown_message;
 ```
 
 - [ ] **Step 2: Replace the background runner body**
@@ -599,7 +599,7 @@ At the end of the test module in `tool_notifier.rs`, before the closing `}` of `
 
 - [ ] **Step 3: Build and test**
 
-Run: `cargo test -p rustfox tool_notifier -- --test-threads=1`
+Run: `cargo test -p haos-green tool_notifier -- --test-threads=1`
 Expected: All tests pass including the two new ones
 
 - [ ] **Step 4: Commit**
@@ -684,7 +684,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p rustfox reminders -- --test-threads=1`
+Run: `cargo test -p haos-green reminders -- --test-threads=1`
 Expected: All tests pass
 
 - [ ] **Step 3: Commit**

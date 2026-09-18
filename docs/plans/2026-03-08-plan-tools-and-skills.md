@@ -4,7 +4,7 @@
 
 **Goal:** Add `plan_create`, `plan_update`, `plan_view` built-in tools to `src/tools.rs`, update the default system prompt in `src/config.rs`, and create two new bot skills: `code-interpreter` (subagent) and `problem-solver` (orchestration subagent with plan tools).
 
-**Architecture:** Plan state is stored as `.rustfox_plan.json` in the sandbox directory — no new shared state needed, fits cleanly into the existing stateless `execute_builtin_tool(tool_name, arguments, sandbox_dir)` signature. Skills are YAML-frontmatter markdown files dropped into `skills/` — no code changes needed for skill loading.
+**Architecture:** Plan state is stored as `.haos-green_plan.json` in the sandbox directory — no new shared state needed, fits cleanly into the existing stateless `execute_builtin_tool(tool_name, arguments, sandbox_dir)` signature. Skills are YAML-frontmatter markdown files dropped into `skills/` — no code changes needed for skill loading.
 
 **Tech Stack:** Rust 2021, `serde_json` (already imported in `tools.rs`), `tokio::fs` (already used), `anyhow` for errors.
 
@@ -41,7 +41,7 @@ mod tests {
         assert!(result.contains("Step A"));
         assert!(result.contains("Step B"));
 
-        let plan_path = dir.path().join(".rustfox_plan.json");
+        let plan_path = dir.path().join(".haos-green_plan.json");
         assert!(plan_path.exists());
         let content = std::fs::read_to_string(plan_path).unwrap();
         let plan: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -125,7 +125,7 @@ Insert before the `_ =>` catch-all arm:
         "steps": plan_steps
     });
 
-    let plan_path = sandbox_dir.join(".rustfox_plan.json");
+    let plan_path = sandbox_dir.join(".haos-green_plan.json");
     tokio::fs::write(&plan_path, serde_json::to_string_pretty(&plan)?)
         .await
         .context("Failed to write plan file")?;
@@ -201,7 +201,7 @@ async fn test_plan_update_changes_step_status() {
     assert!(result.contains("in_progress") || result.contains("→"));
 
     // Verify the JSON was updated
-    let plan_path = dir.path().join(".rustfox_plan.json");
+    let plan_path = dir.path().join(".haos-green_plan.json");
     let content = std::fs::read_to_string(plan_path).unwrap();
     let plan: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(plan["steps"][0]["status"].as_str().unwrap(), "in_progress");
@@ -229,7 +229,7 @@ async fn test_plan_update_stores_notes() {
         .await
         .unwrap();
 
-    let plan_path = dir.path().join(".rustfox_plan.json");
+    let plan_path = dir.path().join(".haos-green_plan.json");
     let content = std::fs::read_to_string(plan_path).unwrap();
     let plan: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(plan["steps"][0]["notes"].as_str().unwrap(), "Completed successfully");
@@ -293,7 +293,7 @@ Insert before the `_ =>` catch-all:
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let plan_path = sandbox_dir.join(".rustfox_plan.json");
+    let plan_path = sandbox_dir.join(".haos-green_plan.json");
     let content = tokio::fs::read_to_string(&plan_path)
         .await
         .context("No active plan found. Call plan_create first.")?;
@@ -435,7 +435,7 @@ ToolDefinition {
 
 ```rust
 "plan_view" => {
-    let plan_path = sandbox_dir.join(".rustfox_plan.json");
+    let plan_path = sandbox_dir.join(".haos-green_plan.json");
     let content = tokio::fs::read_to_string(&plan_path)
         .await
         .context("No active plan found. Call plan_create first.")?;
@@ -505,10 +505,10 @@ Replace the function body at `src/config.rs:116-121`:
 
 ```rust
 fn default_system_prompt() -> String {
-    "You are RustFox — an AI assistant with tools, memory, and skills.\n\
+    "You are HaosGreen — an AI assistant with tools, memory, and skills.\n\
      \n\
      ## Identity\n\
-     Your name is RustFox, but your soul (if loaded) overrides any default identity.\n\
+     Your name is HaosGreen, but your soul (if loaded) overrides any default identity.\n\
      Soul takes precedence over everything.\n\
      \n\
      ## Priority Chain\n\

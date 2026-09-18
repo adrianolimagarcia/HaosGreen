@@ -21,7 +21,7 @@ and Phase 5 A2A client support.
 
 Deliverable: success criteria 1 and 3 from the spec —
 
-1. A remote A2A client can fetch `/.well-known/agent-card.json` and see RustFox's skills.
+1. A remote A2A client can fetch `/.well-known/agent-card.json` and see HaosGreen's skills.
 3. An unauthenticated or non-allowlisted peer receives 401/403 and no agent work is performed.
 
 Criterion 3 was only half-testable during this phase: agent work was not yet
@@ -73,7 +73,7 @@ The crate is published as `a2a-lf` but imported in Rust as `a2a`. The `package =
 Run: `cargo check`
 Expected: `Finished` with no error. `Cargo.lock` gains direct entries for `a2a-lf`, `ipnet`, `subtle`, `tower-http`.
 
-If this fails with a version conflict on `base64`, note that RustFox pins `base64 0.22` while `a2a-lf` requires `^0.23`. Both may coexist; cargo resolves them as separate major versions. Do not attempt to unify them.
+If this fails with a version conflict on `base64`, note that HaosGreen pins `base64 0.22` while `a2a-lf` requires `^0.23`. Both may coexist; cargo resolves them as separate major versions. Do not attempt to unify them.
 
 - [ ] **Step 3: Commit**
 
@@ -231,7 +231,7 @@ pub struct A2aCardConfig {
 impl Default for A2aCardConfig {
     fn default() -> Self {
         Self {
-            name: "RustFox".to_string(),
+            name: "HaosGreen".to_string(),
             description: "Self-hosted Telegram AI assistant".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -427,14 +427,14 @@ mod tests {
         let agents: Arc<RwLock<SkillRegistry>> = Arc::new(RwLock::new(SkillRegistry::new()));
 
         let builtin = BuiltinTools::new(
-            PathBuf::from("/tmp/rustfox-test/skills"),
+            PathBuf::from("/tmp/haos-green-test/skills"),
             Arc::clone(&skills),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
         let skill_tools = SkillTools::new(
-            PathBuf::from("/tmp/rustfox-test/skills"),
-            PathBuf::from("/tmp/rustfox-test/agents"),
+            PathBuf::from("/tmp/haos-green-test/skills"),
+            PathBuf::from("/tmp/haos-green-test/agents"),
             Arc::clone(&skills),
             agents,
         );
@@ -542,7 +542,7 @@ use crate::config::A2aPeerConfig;
 
 /// Tools granted to a peer that declares no `tools` key.
 ///
-/// This is an **allowlist**, deliberately. A tool added to RustFox in future is
+/// This is an **allowlist**, deliberately. A tool added to HaosGreen in future is
 /// not reachable by any peer until it is added here. A denylist would silently
 /// grant every new tool to every peer, which is the failure mode this list
 /// exists to prevent.
@@ -560,7 +560,7 @@ use crate::config::A2aPeerConfig;
 /// - `search_memory` searches the **entire** conversation database — every
 ///   user, every chat — not a peer-scoped subset.
 /// - `recall` reads the global `knowledge` table with no per-peer scoping.
-/// - `remember` **writes** to the `knowledge` table in `rustfox.db`. This is
+/// - `remember` **writes** to the `knowledge` table in `haos-green.db`. This is
 ///   the one mutating entry here; it is granted because it is memory-scoped
 ///   and cannot reach the filesystem, but it is a write.
 ///
@@ -575,7 +575,7 @@ use crate::config::A2aPeerConfig;
 /// The exclusion is kept as defence in depth, because both remain the most
 /// powerful read primitives in the set:
 ///
-/// - `read_soul_file` reads from the RustFox **home**, not the sandbox. Its
+/// - `read_soul_file` reads from the HaosGreen **home**, not the sandbox. Its
 ///   containment rests on a hand-written allowlist plus an `O_NOFOLLOW` open,
 ///   and anything that regresses either one re-exposes `config.toml` — which
 ///   holds the OpenRouter API key and every A2A peer bearer token.
@@ -673,7 +673,7 @@ top of the file.
 > **Amended during review.** This step originally shipped a 9-entry list including
 > `read_soul_file` and `plan_view`, a 2-argument signature, and a wildcard arm
 > matching on `any()`. A code-quality review proved that `read_soul_file` returns
-> `~/.rustfox/config.toml` (API keys plus every peer token) and that
+> `~/.haos-green/config.toml` (API keys plus every peer token) and that
 > `["read_file", "*"]` silently granted shell. The block above is the corrected,
 > committed form.
 
@@ -1075,7 +1075,7 @@ mod tests {
 
     fn cfg() -> A2aCardConfig {
         A2aCardConfig {
-            name: "RustFox".to_string(),
+            name: "HaosGreen".to_string(),
             description: "Self-hosted assistant".to_string(),
             version: "1.0.2".to_string(),
         }
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn card_carries_configured_identity() {
         let card = build_agent_card(&cfg(), &registry(vec![]), "http://localhost:8443");
-        assert_eq!(card.name, "RustFox");
+        assert_eq!(card.name, "HaosGreen");
         assert_eq!(card.description, "Self-hosted assistant");
         assert_eq!(card.version, "1.0.2");
     }
@@ -1543,12 +1543,12 @@ In `src/main.rs`, locate where the supervisor backends and scheduler are wired (
     // A2A listener (Phase 1: Agent Card + authentication only).
     if config.a2a.enabled {
         let endpoint_url = format!("http://{}", config.a2a.bind);
-        let a2a_state = rustfox::a2a::server::build_state(
+        let a2a_state = haos-green::a2a::server::build_state(
             config.a2a.clone(),
             a2a_skills,
             &endpoint_url,
         );
-        if let Err(e) = rustfox::a2a::server::spawn(a2a_state).await {
+        if let Err(e) = haos-green::a2a::server::spawn(a2a_state).await {
             // A misconfigured A2A listener must not prevent the Telegram bot
             // from starting; log loudly and continue.
             tracing::error!(error = %e, "A2A listener failed to start");
@@ -1608,9 +1608,9 @@ Create `tests/a2a_endpoint.rs`:
 //! End-to-end checks for the A2A listener: the card is public, everything
 //! else is refused without a valid peer.
 
-use rustfox::a2a::server::{build_state, router};
-use rustfox::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
-use rustfox::skills::SkillRegistry;
+use haos-green::a2a::server::{build_state, router};
+use haos-green::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
+use haos-green::skills::SkillRegistry;
 use std::collections::HashMap;
 
 fn config() -> A2aConfig {
@@ -1627,7 +1627,7 @@ fn config() -> A2aConfig {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
         card: A2aCardConfig {
-            name: "RustFox".to_string(),
+            name: "HaosGreen".to_string(),
             description: "test".to_string(),
             version: "1.0.2".to_string(),
         },
@@ -1662,7 +1662,7 @@ async fn agent_card_is_public() {
     assert_eq!(resp.status(), 200, "the card must be fetchable without auth");
 
     let card: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(card["name"], "RustFox");
+    assert_eq!(card["name"], "HaosGreen");
     assert!(card["supportedInterfaces"].is_array());
     assert!(card["securitySchemes"]["bearer"].is_object());
     handle.abort();

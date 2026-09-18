@@ -140,7 +140,7 @@
 
 - [ ] **Step 2: Run static and unit gates.** Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; capture exact outputs and investigate every failure.
 
-- [ ] **Step 3: Run live gates.** With the configured local provider, run `RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored` and `HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint a_live_chat_message_streams_tokens_and_exactly_one_done_event -- --ignored`. Report each observed result separately.
+- [ ] **Step 3: Run live gates.** With the configured local provider, run `HAOS_GREEN_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored` and `HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint a_live_chat_message_streams_tokens_and_exactly_one_done_event -- --ignored`. Report each observed result separately.
 
 - [ ] **Step 4: Run final mutation smoke tests.** Re-run the shutdown, timeout, lease, authorization and output-boundary mutations in scratch copies. Confirm every mutant fails and every source revert restores green. Never mutate or commit `.measure/`.
 

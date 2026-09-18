@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add framework-level chat history RAG auto-injection, nightly conversation summarization, and a live-editing Telegram tool-call progress UI to RustFox.
+**Goal:** Add framework-level chat history RAG auto-injection, nightly conversation summarization, and a live-editing Telegram tool-call progress UI to HaosGreen.
 
 **Architecture:** Three additive modules — `memory/rag.rs`, `memory/summarizer.rs`, `platform/tool_notifier.rs` — plus small surgical edits to `agent.rs`, `platform/telegram.rs`, `memory/conversations.rs`, `memory/mod.rs`, `config.rs`, `scheduler/tasks.rs`, and `main.rs`. No new external crates. All changes are backwards-compatible (opt-in features, additive DB migrations).
 
@@ -1381,10 +1381,10 @@ In `src/config.rs`, find `default_system_prompt()` (line 124). Replace with:
 
 ```rust
 fn default_system_prompt() -> String {
-    "You are RustFox — an AI assistant with tools, memory, and skills.\n\
+    "You are HaosGreen — an AI assistant with tools, memory, and skills.\n\
      \n\
      ## Identity\n\
-     Your name is RustFox, but your soul (if loaded) overrides any default identity.\n\
+     Your name is HaosGreen, but your soul (if loaded) overrides any default identity.\n\
      Soul takes precedence over everything.\n\
      \n\
      ## Priority Chain\n\

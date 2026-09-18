@@ -5,7 +5,7 @@
 
 ## Goal
 
-Add Meta Threads publishing support to RustFox via the `baguskto/threads-mcp` MCP server. The integration must match the existing Google Workspace MCP pattern: catalog entry in the setup wizard, a guideline popup modal for token setup, a commented example in `config.example.toml`, and a README update.
+Add Meta Threads publishing support to HaosGreen via the `baguskto/threads-mcp` MCP server. The integration must match the existing Google Workspace MCP pattern: catalog entry in the setup wizard, a guideline popup modal for token setup, a commented example in `config.example.toml`, and a README update.
 
 ## Chosen MCP
 
@@ -106,7 +106,7 @@ No new CSS is needed. The existing `.modal-overlay`, `.modal-box`, `.oauth-steps
 
 ## No Rust / Backend Changes
 
-All changes are in static files (`setup/index.html`, `config.example.toml`, `README.md`). No Rust source code changes are required because RustFox's MCP manager (`mcp.rs`) already handles any stdio-based MCP server generically.
+All changes are in static files (`setup/index.html`, `config.example.toml`, `README.md`). No Rust source code changes are required because HaosGreen's MCP manager (`mcp.rs`) already handles any stdio-based MCP server generically.
 
 ## Testing Notes
 

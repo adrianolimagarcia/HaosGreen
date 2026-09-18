@@ -2,7 +2,7 @@
 
 ## Overview
 
-Deepen the RustFox codebase by extracting four shallow modules into deeper ones,
+Deepen the HaosGreen codebase by extracting four shallow modules into deeper ones,
 improving locality, testability, and AI-navigability. All changes are pure
 refactors — no new features, no behavioral change.
 

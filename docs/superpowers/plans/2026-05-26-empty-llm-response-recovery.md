@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prevent RustFox from silently completing Telegram requests when OpenRouter returns an assistant message with no content and no tool calls.
+**Goal:** Prevent HaosGreen from silently completing Telegram requests when OpenRouter returns an assistant message with no content and no tool calls.
 
 **Architecture:** Add an explicit chat-completion wrapper that preserves `finish_reason`, classify empty assistant responses after Kimi tool-call parsing, retry invalid empty responses with a configurable budget, and compact large tool-heavy prompts only in process memory before LLM calls. Persistent memory and Telegram streaming stay unchanged except that exhausted empty-response recovery returns an error through the existing visible error path.
 
-**Tech Stack:** Rust 2021, Tokio, reqwest, serde, anyhow, tracing, LangSmith HTTP tracing, existing RustFox memory and Telegram platform modules.
+**Tech Stack:** Rust 2021, Tokio, reqwest, serde, anyhow, tracing, LangSmith HTTP tracing, existing HaosGreen memory and Telegram platform modules.
 
 ---
 
@@ -516,7 +516,7 @@ fn compact_message(message: &ChatMessage) -> ChatMessage {
             let arg_chars = call.function.arguments.chars().count();
             if arg_chars > TOOL_ARGUMENT_COMPACT_THRESHOLD {
                 call.function.arguments = serde_json::json!({
-                    "_rustfox_compacted_arguments": true,
+                    "_haos-green_compacted_arguments": true,
                     "tool_name": call.function.name,
                     "original_char_count": arg_chars,
                     "preview": truncate_chars(&call.function.arguments, 240)
@@ -531,7 +531,7 @@ fn compact_message(message: &ChatMessage) -> ChatMessage {
             let content_chars = content.chars().count();
             if content_chars > TOOL_RESULT_COMPACT_THRESHOLD {
                 compacted.content = Some(format!(
-                    "[rustfox compacted tool result: original_char_count={}]\n{}",
+                    "[haos-green compacted tool result: original_char_count={}]\n{}",
                     content_chars,
                     truncate_chars(content, TOOL_RESULT_PREVIEW_CHARS)
                 ));
@@ -648,12 +648,12 @@ mod tests {
         assert_eq!(prepared.messages.len(), messages.len());
 
         let old_args = &prepared.messages[2].tool_calls.as_ref().unwrap()[0].function.arguments;
-        assert!(old_args.contains("_rustfox_compacted_arguments"));
+        assert!(old_args.contains("_haos-green_compacted_arguments"));
         assert!(prepared.messages[3]
             .content
             .as_deref()
             .unwrap()
-            .contains("rustfox compacted tool result"));
+            .contains("haos-green compacted tool result"));
 
         let middle_args = &prepared.messages[4].tool_calls.as_ref().unwrap()[0].function.arguments;
         let new_args = &prepared.messages[6].tool_calls.as_ref().unwrap()[0].function.arguments;

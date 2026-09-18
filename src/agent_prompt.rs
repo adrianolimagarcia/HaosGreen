@@ -2,7 +2,7 @@
 //!
 //! Tiers 1-2 (sync, 0 LLM cost):
 //!   Tier 1: observation_mask — replace old tool results with placeholder,
-//!           neutralize old [HaosGreen compacted:...] / [RustFox compacted:...] markers
+//!           neutralize old [HaosGreen compacted:...] markers
 //!   Tier 2: collapse_context — remove oldest tool groups entirely,
 //!           insert boundary marker
 //!
@@ -111,8 +111,6 @@ const COMPACT_MIN_MESSAGE_COUNT: usize = 15;
 
 /// Main marker prefix for HaosGreen.
 pub const COMPACTION_MARKER_PREFIX: &str = "[HaosGreen compacted:";
-/// Old marker prefix kept for backward compatibility.
-pub const LEGACY_COMPACTION_MARKER_PREFIX: &str = "[RustFox compacted:";
 
 /// Statistics about prompt preparation and compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +302,7 @@ pub fn recovery_nudge_for(messages: &[ChatMessage]) -> ChatMessage {
 ///
 /// Replace old tool result content with a masked placeholder. The LLM
 /// knows it made the call but the bulky payload is gone. Also neutralize
-/// any old [RustFox compacted:...] markers in tool call arguments.
+/// any old [HaosGreen compacted:...] markers in tool call arguments.
 ///
 /// Trigger: estimated bytes > context_window * OBSERVATION_MASK_PCT
 /// Applies to: tool results older than PRESERVED_TOOL_GROUPS.
@@ -350,16 +348,6 @@ pub fn observation_mask(messages: &[ChatMessage], context_window: usize) -> Vec<
                                 .function
                                 .arguments
                                 .replace(COMPACTION_MARKER_PREFIX, "[compacted");
-                        }
-                        if call
-                            .function
-                            .arguments
-                            .contains(LEGACY_COMPACTION_MARKER_PREFIX)
-                        {
-                            call.function.arguments = call
-                                .function
-                                .arguments
-                                .replace(LEGACY_COMPACTION_MARKER_PREFIX, "[compacted");
                         }
                     }
                 }

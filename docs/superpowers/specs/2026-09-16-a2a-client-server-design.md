@@ -6,7 +6,7 @@ Status: Fully implemented (Phases 1–5: Server phases 1–4 and Phase 5 outboun
 ## Current implementation status
 
 Both server-side and client-side phases are implemented and covered by unit and live E2E tests:
-- Server: `AgentExecutor` drives the RustFox agent loop under the authenticated peer tool
+- Server: `AgentExecutor` drives the HaosGreen agent loop under the authenticated peer tool
 policy; `SendMessage`, `SendStreamingMessage`, `GetTask`, and `CancelTask` use
 the SDK router and SQLite task store; and `TaskGate` bounds concurrent tasks.
 The SDK JSON-RPC router is mounted at `/jsonrpc`; its streaming method returns
@@ -18,19 +18,19 @@ a terminal task whose state reflects the agent outcome (`TASK_STATE_COMPLETED`,
 `TASK_STATE_FAILED`, or `TASK_STATE_CANCELED`) and whose history includes the
 terminal reply.
 - Client: Phase 5 outbound client support (`client.rs` and the `call_a2a_agent` tool in
-`tool.rs`) is implemented. RustFox can discover remote agent cards via authenticated
+`tool.rs`) is implemented. HaosGreen can discover remote agent cards via authenticated
 GET requests, construct an `A2AClient` with Bearer auth, send tasks, and poll for
 completion with bounded timeouts. Anti-recursion is enforced by keeping `call_a2a_agent`
 strictly out of `DEFAULT_PEER_TOOLS`.
 
 ## Goal
 
-Make RustFox interoperate with other agents over the A2A protocol, in both
+Make HaosGreen interoperate with other agents over the A2A protocol, in both
 directions:
 
-- **Server** — expose RustFox as an A2A agent so peers can discover it via an
+- **Server** — expose HaosGreen as an A2A agent so peers can discover it via an
   Agent Card and submit tasks.
-- **Client** — let RustFox call remote A2A agents, as a new tool alongside the
+- **Client** — let HaosGreen call remote A2A agents, as a new tool alongside the
   existing `invoke_agent` (which only reaches local subagents).
 
 Target deployment: **LAN/VPN**, peers are the operator's own machines or their
@@ -72,13 +72,13 @@ Research performed against primary sources before this design:
 
 Dependency fit verified against this repo's `Cargo.lock`:
 
-| SDK requires | RustFox already has |
+| SDK requires | HaosGreen already has |
 |---|---|
 | `axum ^0.8` | 0.8.9 |
 | `reqwest ^0.12` | 0.12.28 |
 | `chrono`, `serde`, `serde_json`, `uuid`, `async-trait`, `futures`, `tracing` | all present |
 
-Phase 1 added `a2a-lf` 0.3.1 and `base64 0.23.1` (RustFox already has 0.22;
+Phase 1 added `a2a-lf` 0.3.1 and `base64 0.23.1` (HaosGreen already has 0.22;
 the two coexist as separate majors and cannot be deduplicated because `reqwest`,
 `rmcp` and `teloxide-core` still require 0.22). `ipnet` 2.12.1, `subtle` 2.6.1
 and `tower-http` 0.6.11 were **already present transitively** and were only
@@ -92,7 +92,7 @@ promoted to direct dependencies.
 >
 > An earlier revision of this document said ~224. That was wrong: it came from
 > a measurement in a standalone scratch crate, where the SDK's *entire*
-> transitive tree counts as new. Against RustFox's existing 454 packages the
+> transitive tree counts as new. Against HaosGreen's existing 454 packages the
 > true delta is 38. The build also gains a protobuf codegen step; it uses
 > `protoc_bin_vendored`, so no system protoc is required, and `cargo check`
 > completed in 1m01s from cold on this machine.
@@ -119,7 +119,7 @@ modules.
 > the route before it reaches the SDK handler.
 
 
-Existing RustFox machinery this design reuses (all verified in-tree):
+Existing HaosGreen machinery this design reuses (all verified in-tree):
 
 - `LoopConfig.allowed_tools: Option<Vec<String>>` (`src/loop_runner.rs:33`),
   enforced both when offering tool definitions to the LLM
@@ -143,7 +143,7 @@ This is not a greenfield system. A prior audit of this repo established:
 - `self_upgrade` replaces the running binary; `schedule_task` persists cron jobs.
 - The only access control today is `telegram.allowed_user_ids`.
 
-**Consequence:** exposing RustFox as an A2A server puts `execute_command` on the
+**Consequence:** exposing HaosGreen as an A2A server puts `execute_command` on the
 network. Every security control in §6 exists because of this, and none of them
 is optional. A peer that authenticates and is granted `["*"]` has unvalidated
 shell on the host — this is a deliberate, configured decision, not an accident,
@@ -164,7 +164,7 @@ Out of scope for this design (candidates for later):
 
 - gRPC and SLIMRPC bindings.
 - Push notifications (`CreateTaskPushNotificationConfig` and siblings). The SDK provides
-  `HttpPushSender` and `PushConfigStore`, but no RustFox use case requires it yet.
+  `HttpPushSender` and `PushConfigStore`, but no HaosGreen use case requires it yet.
 - Public-internet hardening (rate limiting, OAuth2, mTLS).
 - Reworking the `execute_command` sandbox. This design gates access to tools; it
   does not make the tools themselves safe.
@@ -179,7 +179,7 @@ New module `src/a2a/`:
 | `card.rs` | `AgentCardProducer` built from `skills/` + config | `src/skills/loader.rs` |
 | `auth.rs` | bearer + IP allowlist, fail-closed (plain function + axum middleware) | — |
 | `policy.rs` | resolve peer → `allowed_tools` (`["*"]` = all) | `src/loop_runner.rs:33` |
-| `executor.rs` | `AgentExecutor` → RustFox agentic loop | `src/main.rs:269` |
+| `executor.rs` | `AgentExecutor` → HaosGreen agentic loop | `src/main.rs:269` |
 | `task_store.rs` | `TaskStore` over the existing SQLite connection | `src/supervisor/store.rs` |
 | `server.rs` | axum listener, bind address, TLS | `src/setup/wizard.rs` |
 | `client.rs` | A2A client + `call_a2a_agent` tool | `src/skill_tools.rs` |
@@ -190,7 +190,7 @@ the live agent, its tool registry, MCP connections and memory store.
 
 ## Task State Machine
 
-| A2A state | RustFox origin |
+| A2A state | HaosGreen origin |
 |---|---|
 | `submitted` | task row created, queued behind the concurrency semaphore |
 | `working` | agentic loop running |
@@ -260,9 +260,9 @@ them as safe because they are "read-only" — but read-only is not the same as
 *confined*, and that framing is precisely what let the problem survive design
 review:
 
-- **`read_soul_file`** reads relative to the RustFox **home**, not the sandbox.
+- **`read_soul_file`** reads relative to the HaosGreen **home**, not the sandbox.
   Its JSON-schema `enum` was only a hint to the LLM, never enforced at runtime,
-  so `file_name = "config.toml"` returned `~/.rustfox/config.toml` — the
+  so `file_name = "config.toml"` returned `~/.haos-green/config.toml` — the
   OpenRouter API key and **every peer bearer token in this system**. The tool
   has since been hardened (allowlist plus `O_NOFOLLOW`), but it remains the only
   read primitive that reaches the credential store, so it stays out on
@@ -291,14 +291,14 @@ This is a property Phase 2 must preserve: whatever set `["*"]` expands to has to
 come from the registry, never from a hand-written list of "everything", or the
 wildcard will silently start granting subagent delegation that Phase 1 does not.
 
-The default is an allowlist, not a denylist: a tool added to RustFox in the
+The default is an allowlist, not a denylist: a tool added to HaosGreen in the
 future is **not** granted to peers until it is added here. This matters because
 the denylist alternative would silently grant every new tool to every peer.
 Granting `["*"]` must be an explicit, visible line in `config.toml`.
 
 ## Persistence
 
-New tables in the existing `rustfox.db`, created idempotently at startup, the
+New tables in the existing `haos-green.db`, created idempotently at startup, the
 same way `MemoryStore::run_migrations` (`src/memory/mod.rs:110`) does today:
 
 - `a2a_tasks` — id, context_id, peer, state, skill, timestamps
@@ -322,7 +322,7 @@ Optimizing throughput before measuring would be guesswork.
 Also included:
 
 - `PRAGMA busy_timeout = 5000` — guards against a second process touching the
-  same database (setup wizard, or an isolated instance via `RUSTFOX_HOME`).
+  same database (setup wizard, or an isolated instance via `HAOS_GREEN_HOME`).
 - Note for future work: rusqlite calls are synchronous and currently run inside
   async functions while holding the mutex, so they block a tokio worker for the
   duration of the query. Acceptable under bounded concurrency; the escalation
@@ -343,7 +343,7 @@ tls_key      = "/path/key.pem"
 max_concurrent_tasks = 4
 
 [a2a.card]
-name         = "RustFox"
+name         = "HaosGreen"
 description  = "Self-hosted Telegram AI assistant"
 version      = "1.0.2"
 
@@ -403,7 +403,7 @@ Phase 1 established authentication before the executor was introduced. Server ph
   - Exposes the `call_a2a_agent` tool taking arguments `{"peer": "<name>", "prompt": "<text>"}`.
   - If no outbound peers are configured in `config.toml` (`[a2a.outbound.peers]`), the tool definition is empty and not advertised to the LLM.
   - Peer lookup is strict: unknown peer names fail closed immediately without making network calls.
-  - **Anti-Recursion Invariant**: `call_a2a_agent` is strictly forbidden from `DEFAULT_PEER_TOOLS` in `src/a2a/policy.rs`. Remote peers calling into RustFox cannot invoke `call_a2a_agent` unless explicitly and deliberately granted via wildcard or explicit operator configuration, preventing unconstrained remote agent call amplification loops.
+  - **Anti-Recursion Invariant**: `call_a2a_agent` is strictly forbidden from `DEFAULT_PEER_TOOLS` in `src/a2a/policy.rs`. Remote peers calling into HaosGreen cannot invoke `call_a2a_agent` unless explicitly and deliberately granted via wildcard or explicit operator configuration, preventing unconstrained remote agent call amplification loops.
   - **Secret Redaction**: Configured tokens are never serialized in debug outputs (`A2aOutboundPeerConfig::fmt` uses `[REDACTED]`). Tool outputs and error messages are filtered through `sanitize_text` to scrub any configured peer tokens and generic `Bearer <token>` / `token: ...` patterns before returning to the model or logging.
 
 ## Risks
@@ -421,7 +421,7 @@ Phase 1 established authentication before the executor was introduced. Server ph
    not take down the Telegram dispatcher. Executor work belongs in spawned tasks
    with error capture, never unwrapped on the dispatcher task.
 
-### Phase 2 hazards (found by reading the SDK and RustFox source before implementing)
+### Phase 2 hazards (found by reading the SDK and HaosGreen source before implementing)
 
 These are not hypotheticals — each was confirmed in the code. They are recorded
 here because getting any of them wrong is either a security failure or a silent
@@ -488,12 +488,12 @@ loss of function.
   `MaxIterations`; cancellation mid-run reaches `canceled`.
 - Concurrency — with `max_concurrent_tasks = 1`, a second task stays `submitted`
   until the first terminates.
-- Interop — run the SDK's `helloworld` example agent and have RustFox call it as
+- Interop — run the SDK's `helloworld` example agent and have HaosGreen call it as
   a client; verify the Agent Card parses and a task completes.
 
 ## Success Criteria
 
-1. A remote A2A client can fetch `/.well-known/agent-card.json` and see RustFox's
+1. A remote A2A client can fetch `/.well-known/agent-card.json` and see HaosGreen's
    skills.
 2. `SendMessage` from an authenticated, allowlisted peer produces a `completed`
    task whose result is the agent's answer.
@@ -502,4 +502,4 @@ loss of function.
 4. A peer without `execute_command` in its policy cannot invoke it, even if the
    LLM attempts the call.
 5. `CancelTask` stops an in-flight task and the task reaches `canceled`.
-6. RustFox can discover and call a remote A2A agent through `call_a2a_agent`.
+6. HaosGreen can discover and call a remote A2A agent through `call_a2a_agent`.

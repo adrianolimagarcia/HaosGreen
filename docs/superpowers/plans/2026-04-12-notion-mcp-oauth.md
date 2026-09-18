@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Eliminate misleading configuration and implement **OAuth 2.0 Authorization Code + PKCE** so users obtain a valid **Notion MCP access token** during setup and RustFox can connect to `https://mcp.notion.com/mcp` without `AuthRequired` / `invalid_token` failures.
+**Goal:** Eliminate misleading configuration and implement **OAuth 2.0 Authorization Code + PKCE** so users obtain a valid **Notion MCP access token** during setup and HaosGreen can connect to `https://mcp.notion.com/mcp` without `AuthRequired` / `invalid_token` failures.
 
-**Architecture:** Notion’s hosted server requires OAuth (not an internal integration secret) per [Connecting to Notion MCP](https://developers.notion.com/guides/mcp/get-started-with-mcp) and [Integrating your own MCP client](https://developers.notion.com/guides/mcp/build-mcp-client). RustFox already embeds the setup SPA from [`setup/index.html`](../../../setup/index.html) via [`src/bin/setup.rs`](../../../src/bin/setup.rs) (Axum on a local port, default **8719**). The **primary delivery path** is: extend that setup binary with OAuth discovery + PKCE endpoints; update the **Notion modal and Step 5 UI** so the user clicks **Sign in with Notion**, completes OAuth in a browser window, and the callback delivers the **access token** (and optionally **refresh token**) into the form so generated `config.toml` contains `url = "https://mcp.notion.com/mcp"` and `auth_token = "<access_token>"` (raw string, no `Bearer ` prefix). The main bot’s [`src/mcp.rs`](../../../src/mcp.rs) continues to pass that value to `StreamableHttpClientTransportConfig::auth_header` ([rmcp docs](https://docs.rs/rmcp/latest/rmcp/transport/streamable_http_client/struct.StreamableHttpClientTransportConfig.html)). A **follow-up** task adds **token refresh** at runtime so expired access tokens do not break the bot without re-running setup.
+**Architecture:** Notion’s hosted server requires OAuth (not an internal integration secret) per [Connecting to Notion MCP](https://developers.notion.com/guides/mcp/get-started-with-mcp) and [Integrating your own MCP client](https://developers.notion.com/guides/mcp/build-mcp-client). HaosGreen already embeds the setup SPA from [`setup/index.html`](../../../setup/index.html) via [`src/bin/setup.rs`](../../../src/bin/setup.rs) (Axum on a local port, default **8719**). The **primary delivery path** is: extend that setup binary with OAuth discovery + PKCE endpoints; update the **Notion modal and Step 5 UI** so the user clicks **Sign in with Notion**, completes OAuth in a browser window, and the callback delivers the **access token** (and optionally **refresh token**) into the form so generated `config.toml` contains `url = "https://mcp.notion.com/mcp"` and `auth_token = "<access_token>"` (raw string, no `Bearer ` prefix). The main bot’s [`src/mcp.rs`](../../../src/mcp.rs) continues to pass that value to `StreamableHttpClientTransportConfig::auth_header` ([rmcp docs](https://docs.rs/rmcp/latest/rmcp/transport/streamable_http_client/struct.StreamableHttpClientTransportConfig.html)). A **follow-up** task adds **token refresh** at runtime so expired access tokens do not break the bot without re-running setup.
 
 **Tech Stack:** Rust (`src/bin/setup.rs`, `src/mcp.rs`), Axum, `oauth2` + PKCE (`PkceCodeChallenge`), optional `reqwest` for discovery HTTP GETs, vanilla JS in `setup/index.html`, Notion MCP docs.
 
@@ -139,7 +139,7 @@ Register on the same `Router` as `/` and `/api/load-config`:
 - [ ] **`GET /api/notion/oauth/callback?code=...&state=...`**  
   - Validate `state`, load PKCE verifier, exchange `code` at `token_endpoint`.  
   - Return small **HTML** document that:  
-    - Calls `window.opener.postMessage({ type: 'rustfox-notion-oauth', ok: true, access_token: '...', refresh_token: '...', expires_in: N }, window.location.origin)` (or `'*'` if origin matching is awkward during dev—prefer origin).  
+    - Calls `window.opener.postMessage({ type: 'haos-green-notion-oauth', ok: true, access_token: '...', refresh_token: '...', expires_in: N }, window.location.origin)` (or `'*'` if origin matching is awkward during dev—prefer origin).  
     - `window.close()` after short delay; show error HTML if exchange fails.
 
 - [ ] **Security notes in code comments:** Setup server is local-only; tokens cross from callback page to SPA via `postMessage`—validate `event.origin` in the parent listener.
@@ -162,7 +162,7 @@ Register on the same `Router` as `/` and `/api/load-config`:
 
 - [ ] **Unit tests** in `setup.rs`: discovery parsing (mock JSON fixtures), PKCE state round-trip without network if feasible; or integration test with `curl` against local server (optional).
 
-- [ ] **Manual:** `cargo run --bin setup` → Step 5 → Connect Notion → complete OAuth → save config → inspect `config.toml` for `[[mcp_servers]]` with `url` + `auth_token`. Run `cargo run --bin rustfox` and confirm MCP connects (see prior log line `Connected to MCP server 'notion'`).
+- [ ] **Manual:** `cargo run --bin setup` → Step 5 → Connect Notion → complete OAuth → save config → inspect `config.toml` for `[[mcp_servers]]` with `url` + `auth_token`. Run `cargo run --bin haos-green` and confirm MCP connects (see prior log line `Connected to MCP server 'notion'`).
 
 - [ ] **Commit** (split if large): `feat(setup): Notion MCP OAuth PKCE in setup wizard`, `fix(setup): load-config returns url/auth_token for HTTP MCP`.
 
@@ -175,7 +175,7 @@ Register on the same `Router` as `/` and `/api/load-config`:
 - Modify: `src/config.rs` — optional `notion_refresh_token` or generic `mcp_server` OAuth fields (design with YAGNI: only what Notion needs).
 - Modify: `src/mcp.rs` — before `serve(transport)`, if token expired or API returns 401, refresh using `refresh_token` and update on-disk config or a sidecar file (document security: file permissions).
 
-- [ ] **Step 1:** Persist `refresh_token` from Task 3 callback into `config.toml` (or `~/.config/rustfox/notion-mcp.json`) when user saves from setup wizard.
+- [ ] **Step 1:** Persist `refresh_token` from Task 3 callback into `config.toml` (or `~/.config/haos-green/notion-mcp.json`) when user saves from setup wizard.
 - [ ] **Step 2:** Implement refresh using `token_endpoint` + `oauth2` `refresh_token` grant (reuse discovery or cache endpoints in config).
 - [ ] **Step 3:** Document token rotation in `config.example.toml`.
 

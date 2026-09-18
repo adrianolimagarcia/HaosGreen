@@ -50,7 +50,7 @@ pub fn resolve_home(
         if p.is_absolute() {
             return Ok(p.to_path_buf());
         }
-        tracing::warn!("HAOS_GREEN_HOME/RUSTFOX_HOME='{env}' is not absolute; ignoring it");
+        tracing::warn!("HAOS_GREEN_HOME='{env}' is not absolute; ignoring it");
     }
     if let Some(cfg) = config_home {
         if cfg.is_absolute() {
@@ -64,17 +64,11 @@ pub fn resolve_home(
     let home = os_home.ok_or_else(|| {
         anyhow!("Could not determine the OS home directory; set HAOS_GREEN_HOME or [general].home")
     })?;
-    let new_home = home.join(".haos-green");
-    let legacy_home = home.join(".rustfox");
-    if !new_home.exists() && legacy_home.exists() {
-        Ok(legacy_home)
-    } else {
-        Ok(new_home)
-    }
+    Ok(home.join(".haos-green"))
 }
 
 /// The home root used purely for *config-file discovery*, before the config is
-/// loaded. Uses only `HAOS_GREEN_HOME` / `RUSTFOX_HOME` (if absolute) or `<os_home>/.haos-green` (or `<os_home>/.rustfox`).
+/// loaded. Uses only `HAOS_GREEN_HOME` (if absolute) or `<os_home>/.haos-green`.
 pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<PathBuf> {
     if let Some(env) = env_home {
         let p = Path::new(env);
@@ -82,15 +76,7 @@ pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<Pa
             return Some(p.to_path_buf());
         }
     }
-    os_home.map(|h| {
-        let new_home = h.join(".haos-green");
-        let legacy_home = h.join(".rustfox");
-        if !new_home.exists() && legacy_home.exists() {
-            legacy_home
-        } else {
-            new_home
-        }
-    })
+    os_home.map(|h| h.join(".haos-green"))
 }
 
 /// Resolve the config file path to use at startup.
@@ -99,8 +85,8 @@ pub fn default_home(env_home: Option<&str>, os_home: Option<&Path>) -> Option<Pa
 /// 1. `env_config_path` if `Some`, used verbatim (no existence check — the
 ///    caller decides what to do with a missing file).
 /// 2. `<cwd>/config.toml` if it exists.
-/// 3. `<home>/config.toml` where `home` comes from `HAOS_GREEN_HOME` / `RUSTFOX_HOME` (absolute)
-///    or `<os_home>/.haos-green` (falling back to `<os_home>/.rustfox`). Only returned if the candidate file exists.
+/// 3. `<home>/config.toml` where `home` comes from `HAOS_GREEN_HOME` (absolute)
+///    or `<os_home>/.haos-green`. Only returned if the candidate file exists.
 /// 4. Falls back to `<cwd>/config.toml` (the wizard treats a non-existent
 ///    candidate as "no config found" and writes the first-run config there).
 ///
@@ -285,12 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn default_falls_back_to_legacy_rustfox_if_exists() {
+    fn legacy_rustfox_home_is_ignored() {
+        // The pre-rename home must no longer be picked up, even when it is the
+        // only one that exists: `.haos-green` is now unconditional.
         let tmp = tempfile::tempdir().unwrap();
-        let legacy_home = tmp.path().join(".rustfox");
-        std::fs::create_dir_all(&legacy_home).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".rustfox")).unwrap();
         let got = resolve_home(None, None, Some(tmp.path())).unwrap();
-        assert_eq!(got, legacy_home);
+        assert_eq!(got, tmp.path().join(".haos-green"));
     }
 
     #[test]

@@ -132,7 +132,7 @@ Fetches the task from DB, creates a new one-shot job with 0-second delay (fires 
 
 #### `src/main.rs`
 
-- Add import: `use rustfox::platform::telegram::send_markdown_message;`
+- Add import: `use haos-green::platform::telegram::send_markdown_message;`
 
 **Background runner** (line 238):
 

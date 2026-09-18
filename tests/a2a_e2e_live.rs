@@ -15,13 +15,13 @@
 //! Two gates, because this test cannot pass on a machine without the endpoint:
 //!
 //! 1. `#[ignore]` — `cargo test` never picks it up.
-//! 2. A runtime check of `RUSTFOX_A2A_LIVE=1` — even an explicit
+//! 2. A runtime check of `HAOS_GREEN_A2A_LIVE=1` — even an explicit
 //!    `--ignored` run exits early with a printed message when it is unset.
 //!
 //! Run it with:
 //!
 //! ```text
-//! RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture
+//! HAOS_GREEN_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture
 //! ```
 //!
 //! # Endpoint requirements
@@ -39,7 +39,7 @@
 //! # Why this file does not mutate the environment
 //!
 //! The home directory comes from `[general].home` in the generated config, not
-//! from `RUSTFOX_HOME`, so the test never calls `std::env::set_var` (which is
+//! from `HAOS_GREEN_HOME`, so the test never calls `std::env::set_var` (which is
 //! process-global and would race with any other test in the same binary).
 
 use std::collections::HashMap;
@@ -366,13 +366,13 @@ async fn build_agent(config_path: &Path, memory: &MemoryStore, a2a: A2aConfig) -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a live OpenAI-compatible LLM on 127.0.0.1:8790; \
-            run with: RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture"]
+            run with: HAOS_GREEN_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture"]
 async fn an_authenticated_peer_drives_a_send_message_to_completed() {
-    if std::env::var("RUSTFOX_A2A_LIVE").as_deref() != Ok("1") {
+    if std::env::var("HAOS_GREEN_A2A_LIVE").as_deref() != Ok("1") {
         println!(
-            "SKIP: RUSTFOX_A2A_LIVE is not set to 1 — this test needs a live LLM at {} serving `{}`.\n\
+            "SKIP: HAOS_GREEN_A2A_LIVE is not set to 1 — this test needs a live LLM at {} serving `{}`.\n\
              Run it with:\n    \
-             RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture",
+             HAOS_GREEN_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture",
             live_llm_base_url(),
             live_llm_model()
         );
@@ -590,10 +590,10 @@ async fn an_authenticated_peer_drives_a_send_message_to_completed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires RUSTFOX_A2A_LIVE=1 and a live OpenAI-compatible LLM"]
+#[ignore = "requires HAOS_GREEN_A2A_LIVE=1 and a live OpenAI-compatible LLM"]
 async fn an_authenticated_peer_streams_working_and_completed_pong() {
-    if std::env::var("RUSTFOX_A2A_LIVE").as_deref() != Ok("1") {
-        println!("SKIP: RUSTFOX_A2A_LIVE is not set to 1");
+    if std::env::var("HAOS_GREEN_A2A_LIVE").as_deref() != Ok("1") {
+        println!("SKIP: HAOS_GREEN_A2A_LIVE is not set to 1");
         return;
     }
 
@@ -686,10 +686,10 @@ async fn an_authenticated_peer_streams_working_and_completed_pong() {
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires RUSTFOX_A2A_LIVE=1"]
+#[ignore = "requires HAOS_GREEN_A2A_LIVE=1"]
 async fn an_in_progress_task_can_be_canceled() {
-    if std::env::var("RUSTFOX_A2A_LIVE").as_deref() != Ok("1") {
-        println!("SKIP: RUSTFOX_A2A_LIVE is not set to 1");
+    if std::env::var("HAOS_GREEN_A2A_LIVE").as_deref() != Ok("1") {
+        println!("SKIP: HAOS_GREEN_A2A_LIVE is not set to 1");
         return;
     }
     let cancel = CancellationToken::new();

@@ -55,17 +55,6 @@ pub fn is_service_installed() -> bool {
                 return true;
             }
         }
-        let legacy_path = dirs::home_dir().map(|h| {
-            h.join(".config")
-                .join("systemd")
-                .join("user")
-                .join("rustfox.service")
-        });
-        if let Some(p) = legacy_path {
-            if p.exists() {
-                return true;
-            }
-        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -79,27 +68,11 @@ pub fn is_service_installed() -> bool {
                 return true;
             }
         }
-        let legacy_path = dirs::home_dir().map(|h| {
-            h.join("Library")
-                .join("LaunchAgents")
-                .join("com.rustfox.bot.plist")
-        });
-        if let Some(p) = legacy_path {
-            if p.exists() {
-                return true;
-            }
-        }
     }
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
         if let Ok(output) = Command::new("sc").args(["query", "HaosGreen"]).output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("STATE") {
-                return true;
-            }
-        }
-        if let Ok(output) = Command::new("sc").args(["query", "RustFox"]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.contains("STATE") {
                 return true;
@@ -115,14 +88,7 @@ pub fn restart_bot() -> anyhow::Result<()> {
     if is_service_installed() {
         #[cfg(target_os = "linux")]
         {
-            let svc_name = if dirs::home_dir()
-                .map(|h| h.join(".config/systemd/user/haos-green.service").exists())
-                .unwrap_or(false)
-            {
-                "haos-green.service"
-            } else {
-                "rustfox.service"
-            };
+            let svc_name = "haos-green.service";
             let status = std::process::Command::new("systemctl")
                 .args(["--user", "restart", svc_name])
                 .status()
@@ -133,17 +99,7 @@ pub fn restart_bot() -> anyhow::Result<()> {
         }
         #[cfg(target_os = "macos")]
         {
-            let label = if dirs::home_dir()
-                .map(|h| {
-                    h.join("Library/LaunchAgents/com.haos-green.bot.plist")
-                        .exists()
-                })
-                .unwrap_or(false)
-            {
-                "com.haos-green.bot"
-            } else {
-                "com.rustfox.bot"
-            };
+            let label = "com.haos-green.bot";
             let status = std::process::Command::new("launchctl")
                 .args(["stop", label])
                 .status()
@@ -154,16 +110,7 @@ pub fn restart_bot() -> anyhow::Result<()> {
         }
         #[cfg(target_os = "windows")]
         {
-            let svc = if Command::new("sc")
-                .args(["query", "HaosGreen"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                "HaosGreen"
-            } else {
-                "RustFox"
-            };
+            let svc = "HaosGreen";
             let status = std::process::Command::new("sc")
                 .args(["stop", svc])
                 .status()

@@ -5,7 +5,7 @@
 
 ## Overview
 
-Two features to improve RustFox's runtime management:
+Two features to improve HaosGreen's runtime management:
 
 1. **Unified self-upgrade** — a single `self_upgrade()` function that auto-detects deployment mode (source code, release binary, system service), upgrades the binary, re-registers the service if needed, and restarts. Exposed as both a `/self-upgrade` command (bypasses LLM, shows inline progress) and a `self_upgrade` tool (for LLM use).
 2. **`/models` command** — browse and change the OpenRouter model at runtime, persisted to config.toml and hot-reloaded without restart.
@@ -28,7 +28,7 @@ The project has a full release pipeline (`.github/workflows/release.yml`) that b
 - `aarch64-apple-darwin` (`.tar.gz`)
 - `x86_64-pc-windows-msvc` (`.zip`)
 
-Archive naming: `rustfox-<tag>-<target>.tar.gz` / `.zip`, containing the binary, `config.example.toml`, `install.sh`, and service scripts.
+Archive naming: `haos-green-<tag>-<target>.tar.gz` / `.zip`, containing the binary, `config.example.toml`, `install.sh`, and service scripts.
 
 ### Design: Unified `self_upgrade()` Function
 
@@ -51,20 +51,20 @@ self_upgrade(branch: "main", mode: "auto")
   │   └─ Wrap in tokio::task::spawn_blocking (self_update is sync)
   │   └─ self_update::backends::github::Update::configure()
   │        .repo_owner("chinkan")
-  │        .repo_name("RustFox")
-  │        .bin_name("rustfox")
+  │        .repo_name("HaosGreen")
+  │        .bin_name("haos-green")
   │        .current_version(cargo_crate_version!())  // "1.0.1"
   │        .build()?.update()?
   │
   ├─ Step 3: Service detection (both modes)
-  │   ├─ systemd unit: ~/.config/systemd/user/rustfox.service exists?
-  │   ├─ LaunchAgent: ~/Library/LaunchAgents/com.rustfox.bot.plist exists?
+  │   ├─ systemd unit: ~/.config/systemd/user/haos-green.service exists?
+  │   ├─ LaunchAgent: ~/Library/LaunchAgents/com.haos-green.bot.plist exists?
   │   └─ No service file → FOREGROUND MODE
   │
   ├─ Step 4a: SERVICE MODE
   │   ├─ SOURCE only: cargo install --path . --force
-  │   ├─ rustfox --service install (re-renders service file)
-  │   └─ systemctl --user restart rustfox.service (or launchctl equivalent)
+  │   ├─ haos-green --service install (re-renders service file)
+  │   └─ systemctl --user restart haos-green.service (or launchctl equivalent)
   │
   └─ Step 4b: FOREGROUND MODE
       ├─ Spawn new binary as child process
@@ -75,7 +75,7 @@ self_upgrade(branch: "main", mode: "auto")
 **Detection methods:**
 - **Source mode**: Walk up from `current_exe()`, look for `Cargo.toml`, max depth 10
 - **Release binary mode**: No `Cargo.toml` found — use `self_update` crate
-- **Service mode**: Check `~/.config/systemd/user/rustfox.service` (Linux), `~/Library/LaunchAgents/com.rustfox.bot.plist` (macOS), or `sc query RustFox` (Windows)
+- **Service mode**: Check `~/.config/systemd/user/haos-green.service` (Linux), `~/Library/LaunchAgents/com.haos-green.bot.plist` (macOS), or `sc query HaosGreen` (Windows)
 
 **`mode` parameter** allows the caller (LLM or user) to force a specific mode: `"auto"`, `"source"`, `"release"`.
 
@@ -177,7 +177,7 @@ async fn restart_bot() -> Result<()> {
 
 ### Service Template Update
 
-`scripts/services/rustfox.service.template`: change `Restart=on-failure` to `Restart=always` so that if systemd was tracking the original PID, it re-launches after the parent exits. (With the service restart path, systemctl stop/start is used directly, so this is more of a safety net.)
+`scripts/services/haos-green.service.template`: change `Restart=on-failure` to `Restart=always` so that if systemd was tracking the original PID, it re-launches after the parent exits. (With the service restart path, systemctl stop/start is used directly, so this is more of a safety net.)
 
 ### Edge Cases
 
@@ -307,7 +307,7 @@ Internal LLM calls (query rewriter, summarizer, learning) use `self.llm.chat()` 
 | `src/platform/telegram.rs` | Add `/self-upgrade` command with inline progress + `/models` command with smart matching + restart check after `process_message` + restart_bot() helper + `supported_commands()` updates |
 | `src/platform/tool_notifier.rs` | Update display name `self_update_to_branch` → `self_upgrade` |
 | `src/main.rs` | Pass `config_path` to `Agent::new()` |
-| `scripts/services/rustfox.service.template` | Update systemd template: `Restart=on-failure` → `Restart=always` |
+| `scripts/services/haos-green.service.template` | Update systemd template: `Restart=on-failure` → `Restart=always` |
 
 ## No Other New Dependencies
 

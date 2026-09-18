@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make an authenticated, allowlisted A2A peer's `SendMessage` request drive a real RustFox agent turn under that peer's tool policy, producing a `completed` task — without ever granting a tool the peer's policy withholds.
+**Goal:** Make an authenticated, allowlisted A2A peer's `SendMessage` request drive a real HaosGreen agent turn under that peer's tool policy, producing a `completed` task — without ever granting a tool the peer's policy withholds.
 
 **Architecture:** Mount the official `a2a-server-lf` 0.3.1 JSON-RPC router at `/jsonrpc` behind the existing Phase 1 auth middleware. Implement the SDK's `AgentExecutor` to drive `AgenticLoop` **directly** with an explicit `allowed_tools` policy, and the SDK's `TaskStore` over the existing SQLite connection. The SDK owns the JSON-RPC envelope, task lifecycle bookkeeping and event fan-out; we own authentication, policy resolution and the agent turn.
 
@@ -14,7 +14,7 @@
 
 The design spec is `docs/superpowers/specs/2026-09-16-a2a-client-server-design.md`.
 Its **"Phase 2 hazards"** section (§Risks, items 5–11) lists seven traps that
-were confirmed by reading both the SDK and RustFox source. Every one of them is
+were confirmed by reading both the SDK and HaosGreen source. Every one of them is
 load-bearing. The three that will silently produce a security or correctness
 failure if missed:
 
@@ -382,7 +382,7 @@ Create `src/a2a/task_store.rs` with only the test module and a stub, so the
 test fails for the right reason:
 
 ```rust
-//! SQLite-backed [`a2a_server::TaskStore`] over the existing RustFox database.
+//! SQLite-backed [`a2a_server::TaskStore`] over the existing HaosGreen database.
 
 use a2a::types::{Task, TaskState, TaskStatus};
 use a2a_server::task_store::TaskStore;
@@ -629,7 +629,7 @@ This is hazards 5, 6 and 7 together — the security-critical task.
 Create `src/a2a/executor.rs` with the test module first:
 
 ```rust
-//! Bridges an A2A task to a RustFox agent turn, under the peer's tool policy.
+//! Bridges an A2A task to a HaosGreen agent turn, under the peer's tool policy.
 
 use std::sync::Arc;
 
@@ -714,7 +714,7 @@ pub fn cancel_key(task_id: &str) -> String {
     format!("a2a:{task_id}")
 }
 
-/// Drives an A2A task through the RustFox agent loop.
+/// Drives an A2A task through the HaosGreen agent loop.
 pub struct A2aExecutor {
     agent: Arc<crate::agent::Agent>,
 }
@@ -859,7 +859,7 @@ impl a2a_server::AgentExecutor for A2aExecutor {
 /// handler. The SDK forwards request headers into `ExecutorContext` via
 /// `service_params` (`middleware.rs:17-28`), which is the ONLY identity channel
 /// available: the SDK sets `ctx.user` to `None` unconditionally.
-pub const PEER_HEADER: &str = "x-rustfox-a2a-peer";
+pub const PEER_HEADER: &str = "x-haos-green-a2a-peer";
 
 /// Recover the peer name the auth middleware resolved.
 ///
@@ -1082,7 +1082,7 @@ pub async fn spawn(
 - [ ] **Step 2: Update the call site**
 
 In `src/main.rs`, the A2A block currently reads
-`rustfox::a2a::server::spawn(config.a2a.clone(), a2a_skills)`. Change it to pass
+`haos-green::a2a::server::spawn(config.a2a.clone(), a2a_skills)`. Change it to pass
 `agent.clone()`. `agent` is in scope (built at `src/main.rs:248`); confirm the
 binding name with `grep -n 'Arc::new_cyclic' src/main.rs`.
 
@@ -1113,9 +1113,9 @@ Proves success criteria 2 and 4 from the spec.
 //! End-to-end: an authenticated peer's SendMessage drives a real agent turn,
 //! and a peer whose policy withholds execute_command cannot invoke it.
 
-use rustfox::a2a::server::{build_state, router};
-use rustfox::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
-use rustfox::skills::SkillRegistry;
+use haos-green::a2a::server::{build_state, router};
+use haos-green::config::{A2aCardConfig, A2aConfig, A2aPeerConfig};
+use haos-green::skills::SkillRegistry;
 use std::collections::HashMap;
 
 fn send_message_body(text: &str) -> serde_json::Value {
@@ -1156,7 +1156,7 @@ async fn a_default_peer_cannot_reach_execute_command() {
     // Success criterion 4. The assertion is on the OFFERED tool set: a tool
     // the peer's policy withholds must never be presented to the model, so
     // the LLM cannot call it in the first place.
-    let available = rustfox::a2a::resolve_allowed_tools(
+    let available = haos-green::a2a::resolve_allowed_tools(
         "laptop",
         &default_peer(),
         &[

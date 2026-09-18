@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     // it the ring is clean and the persisted console log is not — the leak this
     // line used to be.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,haos_green=debug,rustfox=debug".into());
+        .unwrap_or_else(|_| "info,haos_green=debug".into());
 
     haos_green::web::logs::log_subscriber(env_filter, Arc::clone(&logs), Arc::clone(&log_capture))
         .with(haos_green::web::logs::console_layer_with(std::io::stdout))
@@ -71,10 +71,7 @@ async fn main() -> Result<()> {
         match cmd {
             setup::Command::Setup { cli } => {
                 let cfg_path = haos_green::home::resolve_config_path(
-                    std::env::var("HAOS_GREEN_CONFIG_PATH")
-                        .or_else(|_| std::env::var("RUSTFOX_CONFIG_PATH"))
-                        .ok()
-                        .as_deref(),
+                    std::env::var("HAOS_GREEN_CONFIG_PATH").ok().as_deref(),
                     &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                     dirs::home_dir().as_deref(),
                 );
@@ -95,10 +92,7 @@ async fn main() -> Result<()> {
 
     // If we reach here, it's a normal bot start — resolve config path
     let config_path = haos_green::home::resolve_config_path(
-        std::env::var("HAOS_GREEN_CONFIG_PATH")
-            .or_else(|_| std::env::var("RUSTFOX_CONFIG_PATH"))
-            .ok()
-            .as_deref(),
+        std::env::var("HAOS_GREEN_CONFIG_PATH").ok().as_deref(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         dirs::home_dir().as_deref(),
     );

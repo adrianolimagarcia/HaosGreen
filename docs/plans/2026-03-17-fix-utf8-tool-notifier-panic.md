@@ -107,7 +107,7 @@ fn test_format_args_preview_multi_arg_chinese_no_panic() {
 **Step 2: Run the tests to confirm they fail (or panic)**
 
 ```bash
-cargo test -p rustfox test_format_args_preview_single_arg_chinese test_format_args_preview_multi_arg_chinese_no_panic 2>&1
+cargo test -p haos-green test_format_args_preview_single_arg_chinese test_format_args_preview_multi_arg_chinese_no_panic 2>&1
 ```
 
 Expected: one or both tests **panic** (not just fail) with `byte index N is not a char boundary`. If they don't panic yet, the strings may not be long enough — adjust the Chinese string to be longer.
@@ -210,7 +210,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 **Step 3: Run all tool_notifier tests**
 
 ```bash
-cargo test -p rustfox tool_notifier 2>&1
+cargo test -p haos-green tool_notifier 2>&1
 ```
 
 Expected: ALL tests pass including the two new ones. If any fail, read the error and fix before proceeding.

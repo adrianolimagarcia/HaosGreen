@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Let the RustFox agent write multi-file skill directories and hot-reload them instantly — no bot restart required.
+**Goal:** Let the HaosGreen agent write multi-file skill directories and hot-reload them instantly — no bot restart required.
 
 **Architecture:** Wrap `SkillRegistry` in `tokio::sync::RwLock` so `reload_skills` can swap it at runtime. Add `write_skill_file` + `reload_skills` as built-in tools in `agent.rs`. Rebuild the system prompt from the live registry on every `process_message` call so new skills take effect immediately in the same conversation.
 
@@ -70,7 +70,7 @@ At the bottom of `src/agent.rs`, inside the existing `#[cfg(test)] mod tests` bl
 ### Step 2: Run tests — expect compile failure (functions don't exist yet)
 
 ```bash
-cargo test -p rustfox 2>&1 | head -30
+cargo test -p haos-green 2>&1 | head -30
 ```
 
 Expected: `error[E0425]: cannot find function 'validate_skill_name'`
@@ -114,7 +114,7 @@ fn validate_skill_path(path: &str) -> Result<(), String> {
 ### Step 4: Run tests — expect GREEN
 
 ```bash
-cargo test -p rustfox 2>&1 | tail -20
+cargo test -p haos-green 2>&1 | tail -20
 ```
 
 Expected: all new tests pass.

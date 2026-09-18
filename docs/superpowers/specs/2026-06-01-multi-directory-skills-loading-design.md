@@ -6,8 +6,8 @@
 
 ## Problem
 
-RustFox skills are loaded from a single instance directory (`config.skills.directory`,
-default `~/.rustfox/skills/`). Bundled skills (shipped with the project at `./skills/`)
+HaosGreen skills are loaded from a single instance directory (`config.skills.directory`,
+default `~/.haos-green/skills/`). Bundled skills (shipped with the project at `./skills/`)
 are seed-copied into this directory on first run, mixing predefined templates with
 user/custom skills in one flat namespace. This creates several issues:
 
@@ -49,7 +49,7 @@ Skills are resolved from two directories in priority order:
 
 | Priority | Layer | Path | Writable | Purpose |
 |----------|-------|------|----------|---------|
-| 1 (high) | Instance | `config.skills.directory` → `~/.rustfox/skills/` | ✅ Yes | User/custom skills created by the agent |
+| 1 (high) | Instance | `config.skills.directory` → `~/.haos-green/skills/` | ✅ Yes | User/custom skills created by the agent |
 | 2 (low)  | Bundled  | `<cwd>/skills/` | ❌ No  | Read-only templates shipped with the project |
 
 **Shadow semantics:** Instance layer shadows bundled. A skill named `"thread-writer"`
@@ -109,7 +109,7 @@ matching the existing convention. Users who run from a non-project CWD can set i
 
 ```toml
 [skills]
-bundled_directory = "/opt/RustFox/skills"
+bundled_directory = "/opt/HaosGreen/skills"
 ```
 
 ### Agent tool resolution
@@ -156,7 +156,7 @@ The same layering applies to agents:
 
 | Layer | Path | Writable |
 |-------|------|----------|
-| Instance | `config.agents.directory` → `~/.rustfox/agents/` | ✅ Yes |
+| Instance | `config.agents.directory` → `~/.haos-green/agents/` | ✅ Yes |
 | Bundled  | `<cwd>/agents/` | ❌ No |
 
 `read_agent_file`, `write_agent_file` follow identical logic using the agent registry.

@@ -4,7 +4,7 @@
 
 **Goal:** Update **two** skill directories to fully conform to Anthropic's official Claude agent skills specification:
 
-1. **`skills/`** — RustFox's own bot skills (loaded into the Telegram bot's LLM system prompt by `src/skills/loader.rs`). Currently uses flat `.md` files → convert to `skill-name/SKILL.md` folder format.
+1. **`skills/`** — HaosGreen's own bot skills (loaded into the Telegram bot's LLM system prompt by `src/skills/loader.rs`). Currently uses flat `.md` files → convert to `skill-name/SKILL.md` folder format.
 2. **`.claude/skills/`** — Claude Code development skills (used by Claude when working on this project). Already uses folder format but has minor compliance issues to fix.
 
 **Tech Stack:** Plain markdown, YAML frontmatter, Rust (no code changes needed — loader already supports folder format), Git
@@ -33,9 +33,9 @@ description: Use when...  # max 1024 chars; no XML tags; triggering conditions o
 
 ---
 
-## Part A: RustFox Bot Skills (`skills/`)
+## Part A: HaosGreen Bot Skills (`skills/`)
 
-### How RustFox Skills Work
+### How HaosGreen Skills Work
 
 `src/skills/loader.rs` loads skills from the directory configured in `config.toml` (`[skills] directory = "skills"`). `src/skills/mod.rs` builds a context string from them, injected into the LLM system prompt as:
 
@@ -48,7 +48,7 @@ The loader **already supports both formats**:
 - `skills/my-skill.md` — flat file (current, to be replaced)
 - `skills/my-skill/SKILL.md` — folder format (target)
 
-RustFox skills also support an optional `tags` field in frontmatter (RustFox extension, not in Claude spec).
+HaosGreen skills also support an optional `tags` field in frontmatter (HaosGreen extension, not in Claude spec).
 
 ### Current State Audit
 
@@ -198,7 +198,7 @@ git commit -m "docs: update CLAUDE.md to document folder-based skills format"
 
 ## Part B: Claude Code Skills (`.claude/skills/`)
 
-These are used by Claude Code when developing RustFox, not by the bot itself.
+These are used by Claude Code when developing HaosGreen, not by the bot itself.
 
 ### Current State Audit
 
@@ -325,7 +325,7 @@ Add a `hooks` section to `.claude/settings.json`:
 | Format check | `cargo fmt --check` / `prettier --check .` |
 | Multiple checks | Chain with `&&` |
 
-## Example: RustFox
+## Example: HaosGreen
 
 ```json
 {

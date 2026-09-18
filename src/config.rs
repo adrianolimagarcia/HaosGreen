@@ -1040,9 +1040,7 @@ impl Config {
             ensure_dirs, resolve_data_path, resolve_home, PathOrigin, ResolvedPaths,
         };
 
-        let env_home = std::env::var("HAOS_GREEN_HOME")
-            .or_else(|_| std::env::var("RUSTFOX_HOME"))
-            .ok();
+        let env_home = std::env::var("HAOS_GREEN_HOME").ok();
         let config_home = self.general.as_ref().and_then(|g| g.home.as_deref());
         let os_home = dirs::home_dir();
         let home = resolve_home(env_home.as_deref(), config_home, os_home.as_deref())?;

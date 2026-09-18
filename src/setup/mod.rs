@@ -54,7 +54,6 @@ pub fn parse_args() -> Option<Command> {
 
     if let Some(path) = config_path {
         std::env::set_var("HAOS_GREEN_CONFIG_PATH", &path);
-        std::env::set_var("RUSTFOX_CONFIG_PATH", path);
     }
 
     command

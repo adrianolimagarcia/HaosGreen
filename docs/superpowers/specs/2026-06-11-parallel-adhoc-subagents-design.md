@@ -11,7 +11,7 @@ The `invoke_agent` tool requires a predefined agent file (`agents/<name>/AGENT.m
 2. **Run multiple subagents in parallel** — all tool calls execute sequentially, `invoke_agent` blocks the main loop.
 3. **Give subagents system context** (date/time, user model) without manually passing it in `prompt`.
 
-The error `Failed to read directory: /home/kan/.rustfox/workspace/agents` occurred because the LLM tried to `list_files` in the sandbox to find agents — it had no way to create ad-hoc agents inline.
+The error `Failed to read directory: /home/kan/.haos-green/workspace/agents` occurred because the LLM tried to `list_files` in the sandbox to find agents — it had no way to create ad-hoc agents inline.
 
 ## Goals
 
@@ -199,7 +199,7 @@ let all_results: Vec<String> = [agent_results, other_results]
     .collect();
 ```
 
-Sequential non-agent calls prevent races on `.rustfox_plan.json` and other shared state. Subagent calls are the primary performance bottleneck (each runs a full LLM mini-loop) and benefit most from parallelization.
+Sequential non-agent calls prevent races on `.haos-green_plan.json` and other shared state. Subagent calls are the primary performance bottleneck (each runs a full LLM mini-loop) and benefit most from parallelization.
 
 **Observability note:** LangSmith run tracking and tool event notifications (`tool_event_tx`) must be preserved around each tool call in both the parallel and sequential paths. Each subagent call gets its own LangSmith trace as a child of the current chain run.
 
@@ -311,7 +311,7 @@ No special loop code needed — the verifier result is just another tool message
 
 ### Shared plans + memory
 
-Plans live in `.rustfox_plan.json` in the sandbox — already shared at the filesystem level. If a subagent has `plan_view`/`plan_update` in its whitelist, it can read/update the same plan as the main agent.
+Plans live in `.haos-green_plan.json` in the sandbox — already shared at the filesystem level. If a subagent has `plan_view`/`plan_update` in its whitelist, it can read/update the same plan as the main agent.
 
 Memory lives in `self.memory` (the Agent's knowledge store). Since subagent tool execution goes through the same `Agent::execute_tool`, whitelisting `recall`/`remember`/`search_memory` transparently shares the memory store.
 

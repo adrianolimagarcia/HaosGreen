@@ -1572,7 +1572,7 @@ git commit -m "chore: cargo fmt and clippy fixes"
 ## Task 11: Push branch
 
 ```bash
-git push -u origin claude/rustfox-scheduling-tool-nLhrR
+git push -u origin claude/haos-green-scheduling-tool-nLhrR
 ```
 
 ---

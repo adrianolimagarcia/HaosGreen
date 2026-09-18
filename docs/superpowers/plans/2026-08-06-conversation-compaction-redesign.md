@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Fix RustFox forgetting user requests on compaction — move compaction to per-user-turn, adopt a persisted running summary with a protected "latest intent" tail, token-based 85% trigger, USER.md memory flush, and a defer-don't-truncate fallback (ADR 0003, Q1–Q9).
+**Goal:** Fix HaosGreen forgetting user requests on compaction — move compaction to per-user-turn, adopt a persisted running summary with a protected "latest intent" tail, token-based 85% trigger, USER.md memory flush, and a defer-don't-truncate fallback (ADR 0003, Q1–Q9).
 
 **Architecture:** `ConversationManager` gains `summary: Option<String>` + `last_flush_turn: Option<usize>`; `compact_messages(ctx)` runs once per user turn from `process_message` (after `add_user_turn`, before the loop). The protected tail (last 2 user turns + active exchange, ≤20% of window, never mid-tool-pair) is selected by a pure `protected_tail_start` fn. Summary layers extend the running summary, are injected as a system message, and persist as `[SUMMARY]` rows (existing convention — `load_messages_with_limit` already loads them first). A flush turn banks durable facts into USER.md (reusing `learning.rs` machinery). On summary failure: defer with a `warn!` log; the emergency mask in `prepare_messages_for_llm` drops oldest non-protected messages only.
 
@@ -81,7 +81,7 @@ fn estimate_tokens_counts_cjk_and_latin() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox estimate_tokens_counts_cjk_and_latin --lib`
+Run: `cargo test -p haos-green estimate_tokens_counts_cjk_and_latin --lib`
 Expected: FAIL — `estimate_tokens` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -134,7 +134,7 @@ fn is_cjk(ch: char) -> bool {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p rustfox estimate_tokens_counts_cjk_and_latin --lib`
+Run: `cargo test -p haos-green estimate_tokens_counts_cjk_and_latin --lib`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -304,7 +304,7 @@ fn protected_tail_start_returns_zero_without_user_messages() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox protected_tail_start --lib`
+Run: `cargo test -p haos-green protected_tail_start --lib`
 Expected: FAIL — `protected_tail_start` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -401,7 +401,7 @@ pub fn protected_tail_start(messages: &[ChatMessage], window: usize) -> usize {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p rustfox protected_tail_start --lib`
+Run: `cargo test -p haos-green protected_tail_start --lib`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -540,7 +540,7 @@ async fn apply_summary_layer_rejects_empty() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox apply_summary_layer --lib` and `cargo test -p rustfox should_flush --lib`
+Run: `cargo test -p haos-green apply_summary_layer --lib` and `cargo test -p haos-green should_flush --lib`
 Expected: FAIL — new fields/functions missing.
 
 - [ ] **Step 3: Add the fields to the struct**
@@ -688,7 +688,7 @@ Add after `add_user_turn` in `src/conversation.rs`:
 
 - [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cargo test -p rustfox apply_summary_layer --lib && cargo test -p rustfox should_flush --lib`
+Run: `cargo test -p haos-green apply_summary_layer --lib && cargo test -p haos-green should_flush --lib`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -877,7 +877,7 @@ async fn compact_success_path_preserves_user_intent() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox compact_ --lib`
+Run: `cargo test -p haos-green compact_ --lib`
 Expected: FAIL — `CompactionContext` not found; `compact_messages` signature mismatch.
 
 - [ ] **Step 3: Add `CompactionContext`**
@@ -1044,7 +1044,7 @@ Replace the whole `compact_messages` body (lines ~127-243), `summarize_with_llm`
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p rustfox compact_ --lib`
+Run: `cargo test -p haos-green compact_ --lib`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -1147,7 +1147,7 @@ async fn test_flush_user_model_writes_valid_content() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox flush_user_model --lib`
+Run: `cargo test -p haos-green flush_user_model --lib`
 Expected: FAIL — `format_snippets` not found.
 
 - [ ] **Step 3: Add the shared helpers and `flush_user_model`**
@@ -1293,7 +1293,7 @@ async fn update_user_model_inner(
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p rustfox flush_user_model --lib && cargo test -p rustfox user_model --lib`
+Run: `cargo test -p haos-green flush_user_model --lib && cargo test -p haos-green user_model --lib`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -1400,7 +1400,7 @@ In `src/agent.rs` `process_message`:
 
 - [ ] **Step 3: Verify compile + tests**
 
-Run: `cargo check && cargo test -p rustfox compact_ --lib`
+Run: `cargo check && cargo test -p haos-green compact_ --lib`
 Expected: PASS.
 
 - [ ] **Step 4: Commit**
@@ -1454,7 +1454,7 @@ Note: this test uses the `chat_msg` helper added in Task 2.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustfox hard_cap_fallback --lib`
+Run: `cargo test -p haos-green hard_cap_fallback --lib`
 Expected: FAIL (current code keeps only sys/user + 2 newest, so `request 0` still present).
 
 - [ ] **Step 3: Rework the hard-cap branch**
@@ -1495,7 +1495,7 @@ In `prepare_messages_for_llm` (lines ~470-496), replace the hard-cap branch:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p rustfox hard_cap_fallback --lib`
+Run: `cargo test -p haos-green hard_cap_fallback --lib`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -1588,7 +1588,7 @@ fn compact_range_boundary_lands_after_tool_pair() {
 
 - [ ] **Step 2: Run the conversation + prompt test suites**
 
-Run: `cargo test -p rustfox --lib`
+Run: `cargo test -p haos-green --lib`
 Expected: PASS. Fix any stragglers by deleting tests that assert removed behavior (e.g. any remaining references to `compact_fraction` or `ConversationMeta` in `src/agent_prompt.rs` tests — remove them; the `estimate_prompt_bytes_counts_content_and_tool_arguments` test stays).
 
 - [ ] **Step 3: Commit**
@@ -1616,11 +1616,11 @@ git commit -m "test: adapt compaction tests to new API"
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustfox::config::ProviderType;
-use rustfox::conversation::{CompactionContext, ConversationManager};
-use rustfox::llm::{ChatMessage, LlmClient, MessageContent};
-use rustfox::memory::MemoryStore;
-use rustfox::provider::{OpenRouterProvider, ProviderConfig, ProviderRegistry};
+use haos-green::config::ProviderType;
+use haos-green::conversation::{CompactionContext, ConversationManager};
+use haos-green::llm::{ChatMessage, LlmClient, MessageContent};
+use haos-green::memory::MemoryStore;
+use haos-green::provider::{OpenRouterProvider, ProviderConfig, ProviderRegistry};
 
 fn failing_llm() -> LlmClient {
     let config = ProviderConfig {
@@ -1636,7 +1636,7 @@ fn failing_llm() -> LlmClient {
         context_window_cache: Arc::new(tokio::sync::RwLock::new(None)),
         parse_retry_limit: 0,
     };
-    let provider: Arc<dyn rustfox::provider::Provider> =
+    let provider: Arc<dyn haos-green::provider::Provider> =
         Arc::new(OpenRouterProvider::new(config));
     let mut providers = HashMap::new();
     providers.insert("test".to_string(), provider);
@@ -1672,10 +1672,10 @@ async fn compaction_never_loses_user_request() {
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: None,
-            tool_calls: Some(vec![rustfox::llm::ToolCall {
+            tool_calls: Some(vec![haos-green::llm::ToolCall {
                 id: format!("call_{i}"),
                 call_type: "function".to_string(),
-                function: rustfox::llm::FunctionCall {
+                function: haos-green::llm::FunctionCall {
                     name: "search".to_string(),
                     arguments: format!(r#"{{"q":"{}"}}"#, "y".repeat(120)),
                 },
@@ -1702,7 +1702,7 @@ async fn compaction_never_loses_user_request() {
         "telegram",
         "intent_u1",
         "system prompt".to_string(),
-        &rustfox::skills::SkillRegistry::new(),
+        &haos-green::skills::SkillRegistry::new(),
         &minimal_config(),
     )
     .await
@@ -1711,7 +1711,7 @@ async fn compaction_never_loses_user_request() {
     let original_len = cmgr.messages().len();
 
     let llm = failing_llm();
-    let window = rustfox::agent_prompt::estimate_tokens(cmgr.messages());
+    let window = haos-green::agent_prompt::estimate_tokens(cmgr.messages());
     let ctx = CompactionContext {
         llm: &llm,
         context_window: window,
@@ -1745,7 +1745,7 @@ async fn compaction_never_loses_user_request() {
     );
 }
 
-fn minimal_config() -> rustfox::config::Config {
+fn minimal_config() -> haos-green::config::Config {
     // into_path(): the temp dir must outlive the loaded config file.
     let dir = tempfile::tempdir().unwrap().into_path();
     let path = dir.join("config.toml");
@@ -1764,7 +1764,7 @@ allowed_directory = "."
 "#,
     )
     .unwrap();
-    rustfox::config::Config::load(&path).unwrap()
+    haos-green::config::Config::load(&path).unwrap()
 }
 ```
 

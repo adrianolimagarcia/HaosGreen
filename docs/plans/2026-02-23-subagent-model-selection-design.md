@@ -7,7 +7,7 @@
 
 ## Goal
 
-Enable the RustFox agent to:
+Enable the HaosGreen agent to:
 
 1. **Delegate tasks to a subagent** — a temporary, isolated mini-agentic loop that runs a skill's instructions with its own model, tool whitelist, and iteration budget
 2. **Select the model per-skill** — each skill's SKILL.md frontmatter can declare which LLM to use, separate from the main agent's default model

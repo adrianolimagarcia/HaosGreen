@@ -6,7 +6,7 @@
 
 **Architecture:** Keep final assistant answer streaming and tool progress rendering as separate paths. Add a pure notifier display model that parses planning tool arguments, renders a live checklist plus recent tool activity, and lets `ToolCallNotifier` edit its existing progress message into a completed persistent summary. Remove the agent-side code that sends formatted tool-status lines into the answer stream.
 
-**Tech Stack:** Rust 2021, Tokio, teloxide, serde_json, anyhow, tracing, existing RustFox agent/tool/notifier modules.
+**Tech Stack:** Rust 2021, Tokio, teloxide, serde_json, anyhow, tracing, existing HaosGreen agent/tool/notifier modules.
 
 ---
 

@@ -141,7 +141,7 @@ Append after the `# [agent]` block comment:
 # Get your API key at https://smith.langchain.com → Settings → API Keys
 # [langsmith]
 # api_key = "ls__..."
-# project = "rustfox"   # LangSmith project name (default: "default")
+# project = "haos-green"   # LangSmith project name (default: "default")
 ```
 
 **Step 6: Verify compilation**
@@ -622,7 +622,7 @@ let ls_project = self
 
 self.langsmith.start_run(crate::langsmith::RunParams {
     id: chain_run_id.clone(),
-    name: "rustfox_request".to_string(),
+    name: "haos-green_request".to_string(),
     run_type: crate::langsmith::RunType::Chain,
     parent_run_id: None,
     inputs: serde_json::json!({ "message": incoming.text }),
@@ -1085,7 +1085,7 @@ After deploying with `[langsmith]` configured in `config.toml`:
 
 1. Send a message to the bot in Telegram
 2. Open [https://smith.langchain.com](https://smith.langchain.com) → your project
-3. You should see a `rustfox_request` chain run with child `llm_call` and `tool_*` runs
+3. You should see a `haos-green_request` chain run with child `llm_call` and `tool_*` runs
 4. Each run shows inputs, outputs, start/end timestamps, and any errors
 
 To test the debug logging fix for silent failures:

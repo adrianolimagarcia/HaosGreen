@@ -109,7 +109,7 @@ Remove from default:
 let paths = ResolvedPaths {
     home: home.clone(),
     workspace: home.join("workspace"),
-    database: home.join("rustfox.db"),
+    database: home.join("haos-green.db"),
     skills: home.join("skills"),
     agents: home.join("agents"),
     artifacts: home.join("artifacts"),
@@ -144,7 +144,7 @@ git commit -m "feat: add soul file paths (SOUL.md, AGENTS.md, USER.md) to home r
 - [ ] **Step 1: Add `validate_home_path()` function**
 
 ```rust
-/// Validates that a path is within the RustFox home directory.
+/// Validates that a path is within the HaosGreen home directory.
 /// Returns the canonicalized path if valid.
 pub fn validate_home_path(home_dir: &Path, requested: &str) -> Result<PathBuf> {
     let home_canonical = home_dir
@@ -189,7 +189,7 @@ pub fn validate_home_path(home_dir: &Path, requested: &str) -> Result<PathBuf> {
 #[test]
 fn test_validate_home_path_allows_home_files() {
     let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join(".rustfox");
+    let home = dir.path().join(".haos-green");
     std::fs::create_dir_all(&home).unwrap();
     let soul = home.join("SOUL.md");
     std::fs::write(&soul, "# Soul").unwrap();
@@ -201,7 +201,7 @@ fn test_validate_home_path_allows_home_files() {
 #[test]
 fn test_validate_home_path_denies_outside() {
     let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join(".rustfox");
+    let home = dir.path().join(".haos-green");
     std::fs::create_dir_all(&home).unwrap();
     let outside = dir.path().join("outside.txt");
     std::fs::write(&outside, "data").unwrap();
@@ -214,7 +214,7 @@ fn test_validate_home_path_denies_outside() {
 - [ ] **Step 3: Run tests**
 
 ```bash
-cargo test -p rustfox -- tools::test_validate_home_path --nocapture
+cargo test -p haos-green -- tools::test_validate_home_path --nocapture
 ```
 Expected: PASS
 
@@ -874,7 +874,7 @@ And update `main.rs:253-261` call site from:
 register_builtin_tasks(
     &scheduler,
     memory.clone(),
-    rustfox::llm::LlmClient::new(config.openrouter.clone()),
+    haos-green::llm::LlmClient::new(config.openrouter.clone()),
     config.memory.summarize_cron.clone(),
     config.memory.summarize_threshold,
     config.learning.user_model_cron.clone(),
@@ -889,7 +889,7 @@ let home = config.resolved_home.clone().unwrap_or_else(|| PathBuf::from("."));
 register_builtin_tasks(
     &scheduler,
     memory.clone(),
-    rustfox::llm::LlmClient::new(config.openrouter.clone()),
+    haos-green::llm::LlmClient::new(config.openrouter.clone()),
     config.memory.summarize_cron.clone(),
     config.memory.summarize_threshold,
     config.learning.user_model_cron.clone(),
@@ -922,7 +922,7 @@ version: 1
 # Soul
 
 ## Who I Am
-I'm RustFox, a Telegram AI assistant. I use tools to help the user.
+I'm HaosGreen, a Telegram AI assistant. I use tools to help the user.
 
 ## My Values
 - Be genuinely helpful, not performatively helpful
@@ -1003,7 +1003,7 @@ Before:
 register_builtin_tasks(
     &scheduler,
     memory.clone(),
-    rustfox::llm::LlmClient::new(config.openrouter.clone()),
+    haos-green::llm::LlmClient::new(config.openrouter.clone()),
     config.memory.summarize_cron.clone(),
     config.memory.summarize_threshold,
     config.learning.user_model_cron.clone(),
@@ -1017,7 +1017,7 @@ let home = config.resolved_home.clone().unwrap_or_else(|| std::path::PathBuf::fr
 register_builtin_tasks(
     &scheduler,
     memory.clone(),
-    rustfox::llm::LlmClient::new(config.openrouter.clone()),
+    haos-green::llm::LlmClient::new(config.openrouter.clone()),
     config.memory.summarize_cron.clone(),
     config.memory.summarize_threshold,
     config.learning.user_model_cron.clone(),

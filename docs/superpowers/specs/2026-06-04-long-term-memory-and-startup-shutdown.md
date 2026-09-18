@@ -74,7 +74,7 @@ remains sufficient — `is_archived` filter only excludes archived rows
 
 ### Problem
 
-The bot starts and stops silently. Users don't know when RustFox restarts or
+The bot starts and stops silently. Users don't know when HaosGreen restarts or
 goes offline.
 
 ### Solution
@@ -87,7 +87,7 @@ goes offline.
 - Send to every user in `config.telegram.allowed_user_ids` (available in
   `main.rs` at that point).
 - Medium-level status message:
-  - "RustFox is online"
+  - "HaosGreen is online"
   - Model name: `config.openrouter.model`
   - MCP servers connected: count from `mcp_manager`
   - Skills loaded: count from `skills.len()`
@@ -98,7 +98,7 @@ goes offline.
   **before** calling `platform::telegram::run()` (which blocks).
 - The handler captures `bot: Arc<Bot>` and `allowed_user_ids: Vec<u64>` by
   cloning before dispatch.
-- On signal: send "RustFox going offline" to each allowed user.
+- On signal: send "HaosGreen going offline" to each allowed user.
 - Wait 2 seconds for delivery, then `std::process::exit(0)`.
 - Both startup and shutdown notifications are best-effort: log failures,
   never block startup/shutdown.
@@ -137,7 +137,7 @@ main.rs flow:
 Medium detail level as requested. Example:
 
 ```
-RustFox is online 🦊
+HaosGreen is online 🦊
 Model: moonshotai/kimi-k2.6
 MCP: 2 servers connected
 Skills: 15 loaded
