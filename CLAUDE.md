@@ -282,6 +282,20 @@ integration files in `tests/`). When adding tests:
   `#[ignore]`d **and** re-checked at runtime against `HAOS_GREEN_WEB_LIVE=1` and
   `RUSTFOX_A2A_LIVE=1` respectively, so plain `cargo test` passes with both
   unset — which is how CI runs it.
+- Both live tests talk to an OpenAI-compatible endpoint on
+  `127.0.0.1:8790` and ask for a specific model. Endpoint and model are
+  overridable with `HAOS_GREEN_LIVE_LLM_BASE_URL` and
+  `HAOS_GREEN_LIVE_LLM_MODEL`, so moving the gateway or replacing a model is an
+  env change rather than an edit to two files.
+- **The model must be one the endpoint actually serves** — check
+  `GET /v1/models`. These tests used `a6api_DeepSeek-V4-Flash-0731` until that
+  name left the gateway's routing pool, at which point every live run failed
+  with HTTP **503 `smart_route_no_active_candidates`**. That message describes
+  the gateway's marketplace having no active merchants, so it reads like broken
+  infrastructure rather than a stale model name; the endpoint and the model were
+  both fine, and a one-line `curl` against `/chat/completions` settles it in
+  seconds. Verify with `HAOS_GREEN_LIVE_LLM_MODEL=<candidate>` before changing
+  the default — that override failing is how you know it is wired.
 
 > **Mutation testing: never share `target/` between the repo and a scratch copy.**
 > Cargo does **not** key build artifacts by source directory — the unit hash

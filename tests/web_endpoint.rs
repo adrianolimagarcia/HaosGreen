@@ -3158,13 +3158,32 @@ async fn an_enormous_log_message_is_served_truncated_and_says_so() {
 // The provider is an OpenAI-compatible server at `LIVE_LLM_BASE_URL` accepting
 // any non-empty `Bearer` token.
 
-/// OpenAI-compatible endpoint the live test talks to.
+/// OpenAI-compatible endpoint the live test talks to, unless
+/// `HAOS_GREEN_LIVE_LLM_BASE_URL` overrides it.
 const LIVE_LLM_BASE_URL: &str = "http://127.0.0.1:8790/v1";
-/// Verified-working model on that endpoint.
-const LIVE_LLM_MODEL: &str = "a6api_DeepSeek-V4-Flash-0731";
+/// Model to ask that endpoint for, unless `HAOS_GREEN_LIVE_LLM_MODEL` overrides
+/// it.
+///
+/// It must be a model the endpoint actually **serves**. This used to be
+/// `a6api_DeepSeek-V4-Flash-0731`; once that name left the gateway's routing
+/// pool, the live run failed with HTTP 503 `smart_route_no_active_candidates`,
+/// which reads like a broken gateway rather than a stale model name.
+/// `GET /v1/models` lists what is served.
+const LIVE_LLM_MODEL: &str = "gemini-3.8-flash";
 /// Trivial prompt: no tool call is needed, so the loop terminates on its first
 /// iteration with a final text response.
 const LIVE_PROMPT: &str = "Reply with the single word: pong";
+
+/// [`LIVE_LLM_BASE_URL`], overridable so the gate can be pointed at another
+/// gateway without editing this file.
+fn live_llm_base_url() -> String {
+    std::env::var("HAOS_GREEN_LIVE_LLM_BASE_URL").unwrap_or_else(|_| LIVE_LLM_BASE_URL.to_string())
+}
+
+/// [`LIVE_LLM_MODEL`], overridable for the same reason.
+fn live_llm_model() -> String {
+    std::env::var("HAOS_GREEN_LIVE_LLM_MODEL").unwrap_or_else(|_| LIVE_LLM_MODEL.to_string())
+}
 
 /// A `PlatformSender` that drops everything on the floor.
 ///
@@ -3232,6 +3251,8 @@ fn write_live_config(dir: &std::path::Path) -> std::path::PathBuf {
     let home = dir.join("home");
     let workspace = home.join("workspace");
     let path = dir.join("config.toml");
+    let llm_base_url = live_llm_base_url();
+    let llm_model = live_llm_model();
     let toml = format!(
         r#"
 [general]
@@ -3243,8 +3264,8 @@ allowed_user_ids = [1]
 
 [openrouter]
 api_key = "test-key"
-base_url = "{LIVE_LLM_BASE_URL}"
-model = "{LIVE_LLM_MODEL}"
+base_url = "{llm_base_url}"
+model = "{llm_model}"
 max_tokens = 512
 
 [agent]
@@ -3389,8 +3410,10 @@ async fn a_live_chat_message_streams_tokens_and_exactly_one_done_event() {
     if std::env::var("HAOS_GREEN_WEB_LIVE").as_deref() != Ok("1") {
         println!(
             "SKIP: HAOS_GREEN_WEB_LIVE is not set to 1 — this test needs a live LLM at \
-             {LIVE_LLM_BASE_URL}.\nRun it with:\n    \
-             HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint -- --ignored --nocapture"
+             {} serving `{}`.\nRun it with:\n    \
+             HAOS_GREEN_WEB_LIVE=1 cargo test --test web_endpoint -- --ignored --nocapture",
+            live_llm_base_url(),
+            live_llm_model()
         );
         return;
     }

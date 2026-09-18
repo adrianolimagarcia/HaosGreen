@@ -27,7 +27,10 @@
 //! # Endpoint requirements
 //!
 //! An OpenAI-compatible server at [`LLM_BASE_URL`] accepting any non-empty
-//! `Bearer` token. `max_tokens` is always sent — it is a non-optional field of
+//! `Bearer` token, serving [`LLM_MODEL`]. Both are overridable through
+//! `HAOS_GREEN_LIVE_LLM_BASE_URL` and `HAOS_GREEN_LIVE_LLM_MODEL`, so a moved
+//! gateway or a model that has left its pool is an env change rather than an
+//! edit here. `max_tokens` is always sent — it is a non-optional field of
 //! `llm::ChatRequest` — and the config below sets 512 rather than a tiny budget
 //! so the assistant `content` is non-empty: a reasoning model spends a small
 //! allowance on `reasoning` and returns an empty `content`, which the agent
@@ -74,10 +77,32 @@ use haos_green::tool_registry::ToolRegistry;
 const PEER_NAME: &str = "laptop";
 /// Bearer token that peer must present.
 const PEER_TOKEN: &str = "s3cret-e2e";
-/// OpenAI-compatible endpoint under test.
+/// OpenAI-compatible endpoint under test, unless
+/// `HAOS_GREEN_LIVE_LLM_BASE_URL` overrides it.
 const LLM_BASE_URL: &str = "http://127.0.0.1:8790/v1";
-/// Verified-working model on that endpoint.
-const LLM_MODEL: &str = "a6api_DeepSeek-V4-Flash-0731";
+/// Model to ask the endpoint for, unless `HAOS_GREEN_LIVE_LLM_MODEL` overrides
+/// it.
+///
+/// It must be a model the endpoint actually **serves**. This used to be
+/// `a6api_DeepSeek-V4-Flash-0731`; when that name left the gateway's routing
+/// pool, every live run began failing with HTTP 503
+/// `smart_route_no_active_candidates` — an error that reads like a broken
+/// gateway rather than a model name the pool no longer carries, which is why
+/// the reason is written down here. `GET /v1/models` lists what is served, and
+/// a one-line probe against `/chat/completions` confirms a candidate before
+/// changing this.
+const LLM_MODEL: &str = "gemini-3.8-flash";
+
+/// [`LLM_BASE_URL`], overridable so the gate can be pointed at another gateway
+/// without editing this file.
+fn live_llm_base_url() -> String {
+    std::env::var("HAOS_GREEN_LIVE_LLM_BASE_URL").unwrap_or_else(|_| LLM_BASE_URL.to_string())
+}
+
+/// [`LLM_MODEL`], overridable for the same reason.
+fn live_llm_model() -> String {
+    std::env::var("HAOS_GREEN_LIVE_LLM_MODEL").unwrap_or_else(|_| LLM_MODEL.to_string())
+}
 /// Trivial prompt: no tool call is needed, so the loop terminates on the first
 /// iteration with a final text response.
 const PROMPT: &str = "Reply with the single word: pong";
@@ -219,6 +244,8 @@ fn write_config(dir: &Path) -> PathBuf {
     let home = dir.join("home");
     let workspace = home.join("workspace");
     let path = dir.join("config.toml");
+    let llm_base_url = live_llm_base_url();
+    let llm_model = live_llm_model();
     let toml = format!(
         r#"
 [general]
@@ -230,8 +257,8 @@ allowed_user_ids = [1]
 
 [openrouter]
 api_key = "unused-by-the-test-endpoint"
-base_url = "{LLM_BASE_URL}"
-model = "{LLM_MODEL}"
+base_url = "{llm_base_url}"
+model = "{llm_model}"
 max_tokens = 512
 
 [agent]
@@ -343,9 +370,11 @@ async fn build_agent(config_path: &Path, memory: &MemoryStore, a2a: A2aConfig) -
 async fn an_authenticated_peer_drives_a_send_message_to_completed() {
     if std::env::var("RUSTFOX_A2A_LIVE").as_deref() != Ok("1") {
         println!(
-            "SKIP: RUSTFOX_A2A_LIVE is not set to 1 — this test needs a live LLM at {LLM_BASE_URL}.\n\
+            "SKIP: RUSTFOX_A2A_LIVE is not set to 1 — this test needs a live LLM at {} serving `{}`.\n\
              Run it with:\n    \
-             RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture"
+             RUSTFOX_A2A_LIVE=1 cargo test --test a2a_e2e_live -- --ignored --nocapture",
+            live_llm_base_url(),
+            live_llm_model()
         );
         return;
     }
