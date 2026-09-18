@@ -1,13 +1,19 @@
 # Shell Backend Isolation Design
 
+> **Revision 2.** Revision 1 was reviewed and rejected as ready-to-implement on
+> eight points. Every correction below is backed by a measurement taken on this
+> host (bubblewrap 0.12.0, CachyOS, kernel 7.2.4-3-cachyos, running as uid 0),
+> not by assumption. Where a proposed correction turned out to be unnecessary,
+> or insufficient, that is recorded too.
+
 ## Objective
 
 Make the supervisor's `ShellBackend` containment **real**. Today it runs the
 operator's task text as a shell command with no containment at all, behind a
 three-substring check that `sh` semantics defeat. After this work a shell job
 runs inside a bubblewrap sandbox that cannot see the host's home directory,
-`/etc`, or the supervisor's environment — and when that sandbox is unavailable
-the operator is **asked**, not silently obeyed.
+`/etc`, the host's network, or the supervisor's environment — and when that
+sandbox is unavailable the operator is **asked**, not silently obeyed.
 
 ## The problem, with the evidence
 
@@ -42,7 +48,7 @@ the `sup_jobs` row, and the dashboard.
 
 A second leak nobody had recorded: `sh -c` **inherits the supervisor's
 environment**, so anything exported into the process is readable by every shell
-job.
+job. (The job's own stdin is already `Stdio::null()`, `shell.rs:86`.)
 
 ### Severity, stated honestly
 
@@ -63,222 +69,357 @@ It is a real vulnerability for three other reasons:
    `validate_sandbox_path()`" — **false** for this path, which never calls it;
 3. the A2A anti-recursion and wildcard invariants exist precisely to stop this
    class of drift, and a future "let peers delegate to the supervisor" feature
-   would turn this into remote shell with no second line of defence.
-
-## Constraints
-
-- Never run a shell job unisolated without an explicit operator decision.
-- The consent must be revocable and must not survive a process restart.
-- Preserve `Route -> Execute` and `/approve`: the state machine gains no state.
-- Keep the default configuration safe for an operator who changes nothing.
-- A host without bubblewrap must remain usable, but only with consent.
-- Do not widen what any A2A peer can reach.
-- Every containment property needs a mutation proving the test has teeth.
-- Never commit `config.toml`, `.env`, `.measure/`, or generated artifacts.
+   would turn this into a remote escape with no further code change.
 
 ## Verified environment facts
 
-Measured on the development host (CachyOS, kernel 7.2.4-3-cachyos,
-`bwrap` at `/usr/bin/bwrap`, `max_user_namespaces = 125706`). These are observed
-results, not assumptions, and the implementation depends on them.
+Measured, not assumed. `bwrap --version` on this host reports **0.12.0**, and
+every flag below is present in `bwrap --help`:
 
-| Probe | Observed |
+| Fact | Measurement |
 |---|---|
-| `bwrap --unshare-all … /bin/sh -c 'id -u'` | `uid=0` inside the userns, no root outside |
-| `$HOME` reachable inside? | **No** — the path does not exist in the namespace |
-| `/etc/passwd` inside? | **No** — `No such file or directory` |
-| Sandbox dir bound at its **real** path | visible, writable, absolute paths keep working |
-| `--clearenv` | exported variables are **empty** inside |
-| `--unshare-all` | only `lo` in `/proc/net/dev`; TCP to a local port refused |
-| `--unshare-all --share-net` | `lo enp2s0 wlan0 tailscale0 virbr0`; real TCP succeeds |
-| `cat /etc/hostname` inside | `No such file or directory` — the original attack fails |
-| DNS without `/etc` | resolved — mechanism **not** explained, so not relied upon |
-| `--ro-bind` of `resolv.conf` + `nsswitch.conf` + `hosts` | DNS resolves; `/etc/passwd` and `/etc/shadow` stay invisible |
+| bubblewrap version | `0.12.0` |
+| `--new-session`, `--disable-userns`, `--assert-userns-disabled`, `--hostname`, `--die-with-parent`, `--clearenv`, `--share-net` | all present |
+| `--unshare-all` composition | `man bwrap`: equivalent to `--unshare-user-try --unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup-try` — **user namespace is `-try`**, i.e. silently skipped on failure |
+| `--disable-userns` precondition | `man bwrap`: "This option requires `--unshare-user`" |
+| Nested user namespace, hardened argv | **blocked** (`unshare --user` fails inside) |
+| Nested user namespace, without `--disable-userns` | **permitted** — the gap is real, not theoretical |
+| `--hostname haos-sandbox` | inside `haos-sandbox`; host is `cachyos-x8664` |
+| Network, no `--share-net` | only `lo`; TCP to `127.0.0.1:8790` refused |
+| Network, with `--share-net` | `lo enp2s0 wlan0 tailscale0 virbr0 dnsstub`, and `127.0.0.1:8790` **reachable** |
+| `--die-with-parent` | killing bwrap leaves **0** of 3 sandboxed `sleep` processes |
+| Same, without `--die-with-parent` | **3** survivors — the grandchild leak |
+| `/etc/passwd` inside | invisible |
+| `--clearenv` placed **after** `--setenv` | wipes them (`HOME=` empty) |
+| `--symlink usr/lib64 /lib64` omitted | `execvp /bin/sh: No such file or directory` |
 
-The DNS row is the reason the design binds a named file set rather than relying
-on the resolver's fallback: an unexplained behaviour must not become a load-
-bearing assumption. Note `/etc/resolv.conf` is a symlink to
-`/run/systemd/resolve/stub-resolv.conf` on the host, and the bind follows it.
+Two of these change the design rather than merely confirming it:
+
+- **`--die-with-parent` closes the documented `kill_on_drop` gap.** `CLAUDE.md`
+  records that "`kill_on_drop` kills only the **direct** child — a backgrounded
+  grandchild of a compound `sh -c` can survive". With bwrap in front, killing
+  bwrap kills the whole tree: 4 → 1 (the 1 being a pre-existing unrelated
+  process), against 3 survivors without the flag. For sandboxed jobs this
+  documented bound **stops being true**.
+- **Argument order is load-bearing.** `--clearenv` must precede every
+  `--setenv`; reversed, the environment is wiped and `HOME` comes back empty.
+  This is exactly what the "smoke test with the production argv" requirement
+  exists to catch, and it was caught by it.
+
+## Constraints
+
+- Must work unprivileged. Measured: unprivileged user namespaces work here
+  (`max_user_namespaces = 125706`).
+- Must not weaken the existing lease/cancellation semantics
+  (`run_until_lease_loss`, `kill_on_drop`, `job.timeout_secs`).
+- Must fail closed: no silent fallback to an unconfined shell, ever.
+- `src/lib.rs` carries `#![deny(dead_code)]`, so nothing added may be unreachable.
 
 ## Architecture
 
-### 1. A new unit: `src/supervisor/backend/sandbox.rs`
+### 1. `src/supervisor/backend/sandbox.rs` — one unit, one argv
 
-One responsibility — decide how a command is isolated and build the invocation —
-kept out of `ShellBackend`, which stays about running jobs. This makes the
-policy testable without a backend, and keeps the containment contract readable
-in one place.
+A single module owns the probe and the argv construction, so the sandbox is
+described in exactly one place and the tests assert against the real thing.
+
+#### 1.1 Version floor: bubblewrap >= 0.12.0 (P0)
+
+bubblewrap below **0.12.0** is affected by **CVE-2026-87766 /
+GHSA-pxhw-h44j-8pfx** (CVSS 8.8): during setup, before any sandboxed process
+starts, a symlink traversal through `/oldroot` lets bubblewrap create files and
+directories **outside** the sandbox, on the host, with the launcher's
+privileges. 0.12.0 resolves paths with `openat2()` and `RESOLVE_IN_ROOT`.
+
+This is not generic hygiene for this design — it is directly reachable.
+bubblewrap performs that path resolution during **setup**, and the one
+attacker-writable path in our argv is the job's own sandbox directory, which a
+shell job can write to. A job can therefore plant a symlink that the **next**
+job's setup walks. The version floor is part of the boundary, not a
+recommendation.
+
+`probe()` therefore:
+
+1. locate `bwrap`;
+2. run `bwrap --version`;
+3. parse and require **>= 0.12.0**;
+4. treat an older version **exactly as if bubblewrap were absent** — same
+   `IsolationUnavailable` outcome, same fail-closed path, no distinct "insecure
+   but usable" state;
+5. only then run the functional smoke test.
+
+A version that cannot be parsed is a failure, not a pass.
+
+#### 1.2 The argv, in order
+
+Order is normative. `--clearenv` **before** `--setenv`; the `--symlink` entries
+are required or `execvp` cannot find the loader.
+
+```
+bwrap
+  --unshare-all
+  --unshare-user                 # explicit: --unshare-all only does -try
+  --disable-userns               # requires --unshare-user
+  --assert-userns-disabled       # fail unless it actually took effect
+  --new-session                  # detach the controlling terminal (TIOCSTI)
+  --die-with-parent
+  --hostname haos-sandbox        # --unshare-all gives us a UTS namespace
+  --clearenv
+  --setenv HOME  <job-sandbox>
+  --setenv PATH  /usr/bin:/bin
+  --ro-bind /usr /usr
+  --symlink usr/bin   /bin
+  --symlink usr/lib   /lib
+  --symlink usr/lib64 /lib64
+  --proc /proc
+  --dev  /dev
+  --ro-bind /etc/resolv.conf /etc/resolv.conf    # only if host_network
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
+  --ro-bind /etc/hosts /etc/hosts
+  --bind <job-sandbox> <job-sandbox>
+  --chdir <job-sandbox>
+  /bin/sh -c <command>
+```
+
+- **`--new-session`** (P0). Without it the sandboxed process keeps the
+  controlling terminal, and `TIOCSTI` lets it inject input into the operator's
+  terminal — which is execution outside the sandbox. Paired with
+  `stdin(Stdio::null())`, already present at `shell.rs:86`.
+- **`--unshare-user` + `--disable-userns` + `--assert-userns-disabled`** (P1).
+  `--unshare-all` alone is `--unshare-user-try`: on a host where the user
+  namespace cannot be created, it is **silently skipped** and the sandbox is
+  weaker with no signal. `--disable-userns` requires `--unshare-user` and stops
+  the sandbox creating further user namespaces (it sets
+  `user.max_user_namespaces = 1` and enters a nested namespace). It *asks*;
+  `--assert-userns-disabled` is what *verifies*, and it fails the run if the
+  restriction did not take effect. Both, or the boundary is advisory.
+- **`--hostname haos-sandbox`**. We already have a UTS namespace; leaving the
+  host's hostname visible hands the sandbox a free identity signal for no
+  benefit.
+
+#### 1.3 The writable directory (P1)
+
+The job sandbox is the **only** writable host path in the argv, which makes it
+the critical part of the boundary. It is resolved as:
+
+```
+sandbox_root = canonicalize(configured sandbox root)?
+job_sandbox  = sandbox_root / <task-id> / <job-id>
+```
+
+with these invariants, each a hard failure rather than a warning:
+
+- the resolved path is absolute;
+- it is **not** `/`;
+- it is a strict descendant of `sandbox_root` (after canonicalisation, so
+  `..` and symlink tricks are already resolved);
+- `sandbox_root` is not `/`, not the home directory, and not inside
+  `~/.haos-green`;
+- the directory is created if absent, and re-canonicalised **after** creation
+  (a pre-existing symlink at that path is caught here, which is also the
+  CVE-2026-87766 precondition).
+
+Per-job directories, not one shared sandbox: a shell job must not see a
+sibling's artifacts, and a symlink planted by job A must not sit in job B's
+setup path. This is the same reasoning as the version floor, applied to the
+only path we hand out.
+
+### 2. Fail-closed in two layers (unchanged from revision 1)
+
+- **Layer 1 — route time.** The gate asks the *same* planning path the executor
+  uses (plan the task, ask the registry) rather than duplicating a routing
+  predicate, so the gate and the executor cannot disagree. If a task would
+  select the shell backend and isolation is unavailable and no grant covers it,
+  the task is parked in `Route` via `RequireApproval`.
+- **Layer 2 — job time.** `ShellBackend::run` re-checks and **spawns nothing**
+  when isolation is unavailable and no grant covers this job. Layer 1 is a UX
+  affordance; Layer 2 is the boundary, because a task can move between the two
+  (approval, resume, a config reload, a revoked grant).
+
+### 3. Consent: two different decisions, two different commands (P0/P1)
+
+Revision 1 let a single `/approve <id>` grant unconfined shell **for the rest of
+the process**. That is a UX trap: the operator believes they are approving one
+job, and has in fact authorised every future shell job until restart. The two
+decisions are separated:
+
+| Command | Scope |
+|---|---|
+| `/approve <task-id>` | **this task only.** Does not authorise any other job. |
+| `/unsafe-shell on` | standing consent for the process, granted explicitly and named for what it is |
+| `/unsafe-shell off` | revokes standing consent immediately |
 
 ```rust
-pub enum SandboxMode { Bwrap, None }
-
-pub struct Sandbox {
-    mode: SandboxMode,
-    network: bool,
-    bwrap: Option<PathBuf>,   // None when the probe failed
-}
-
-impl Sandbox {
-    /// Probe once: `bwrap --version` **and** a functional smoke test.
-    pub fn probe(mode: SandboxMode, network: bool) -> Sandbox;
-    pub fn isolation_available(&self) -> bool;
-    pub fn command(&self, cmd: &str, dir: &Path) -> Command;
+enum UnsafeShellGrant {
+    None,
+    Job(TaskId),   // one-shot, consumed when that job runs
+    Process,       // standing, until revoked or restart
 }
 ```
 
-`probe` must run a real `bwrap … /bin/sh -c true`, because *present is not the
-same as working*: user namespaces can be disabled by sysctl or by a container
-policy, and `bwrap --version` would still succeed. The result is computed once
-at startup and cached.
+- The grant is in-memory (`Arc<AtomicBool>` for `Process`, a set of task ids for
+  `Job`) and **never persists across a restart**, matching the dashboard's
+  session model.
+- `Job` is consumed on use, so an approval cannot be replayed by a later run of
+  the same task id.
+- Every grant and every revocation writes a `sup_transitions` row naming the
+  actor and the scope, so the audit log distinguishes "approved this job" from
+  "enabled unsafe shell process-wide" — which revision 1's single row could not.
 
-### 2. The containment contract
-
-Exact argv for an isolated job:
-
-```
-bwrap --unshare-all [--share-net] --die-with-parent --clearenv
-      --ro-bind /usr /usr
-      --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64
-      --proc /proc --dev /dev --tmpfs /tmp
-      --ro-bind <resolv.conf> <resolv.conf>     # only when network = true and the file exists
-      --ro-bind <nsswitch.conf> <nsswitch.conf>
-      --ro-bind <hosts> <hosts>
-      --bind <sandbox> <sandbox>
-      --chdir <sandbox>
-      --setenv HOME <sandbox>
-      --setenv PATH /usr/bin:/bin
-      /bin/sh -c <cmd>
-```
-
-`--share-net` is added only when `network = true`; `--unshare-all` otherwise
-stands alone, which is what removes networking. `--die-with-parent` ties the
-sandbox to the supervisor so a lease-lost abort cannot leave it behind.
-
-The sandbox directory is bound at its **real** path rather than a `/work`
-alias, so a command that already refers to an absolute path inside the sandbox
-keeps working. The trade is that the namespace still needs the parent path to
-exist; `bwrap` creates it.
-
-### 3. Fail-closed in two layers
-
-**Layer 1 — before anything runs.** Classification already determines whether a
-task routes to the shell backend. When isolation is unavailable and no consent
-has been granted, the task is routed to `RequireApproval` and parks in `Route`.
-This reuses the existing machinery: `Route -> Execute` is already a legal edge
-and `/approve` already takes it, so the state machine is unchanged.
-
-This layer exists only in `sandbox = "bwrap"`. With `sandbox = "none"` the
-operator has already decided, so nothing is gated and nothing is asked — the
-mode is the standing consent.
-
-The predicate must **not** be a second copy of the routing logic, or the gate
-and the executor will drift apart. It is computed by planning the task
-(`Planner::new().plan(&task)`) and asking the registry which backend each job
-resolves to, through the same selection the orchestrator uses.
-
-**Layer 2 — at the job.** If a shell job reaches `ShellBackend` without
-isolation and without consent, it **refuses**: the job fails with a named error
-and no process is spawned. This is the backstop that makes "the pipeline never
-runs unisolated in silence" true regardless of how it got there.
-
-### 4. The consent
-
-A process-scoped, in-memory grant — `Arc<AtomicBool>` shared between the
-`Supervisor` (which gates and grants) and the `ShellBackend` (which enforces).
-`main.rs` creates it and hands it to both.
-
-- Granted by `/approve <id>` on a task parked for this reason, or by the
-  dashboard's approve button; the grant takes effect for the rest of the
-  process, so later tasks do not ask again.
-- Recorded in `sup_transitions`: the reason names that the operator consented to
-  running without isolation, so the audit trail shows it.
-- Revoked by a new `/unsafe-shell off` command and its dashboard equivalent,
-  and unconditionally by a restart. The restart-revokes property matches the
-  dashboard's existing session model.
-
-### 5. Configuration
+### 4. Configuration
 
 ```toml
 [supervisor.shell]
-sandbox = "bwrap"   # "bwrap" (default) | "none"
-network = true      # inside the sandbox; false removes networking entirely
+sandbox      = "bwrap"   # "bwrap" | "none"
+host_network = false     # default: share the HOST network namespace
 ```
 
-`"none"` is the explicit, documented opt-out for a host that cannot run
-bubblewrap and whose operator accepts the risk; it logs a startup warning and
-never asks. Any other value is refused at load, so a typo cannot silently
-disable isolation.
+**`host_network` defaults to `false`** (P0). The name is deliberate: `network =
+true` reads as "allow internet access", but what `--share-net` actually does is
+keep the **host's** network namespace. Measured exposure with it on: `lo enp2s0
+wlan0 tailscale0 virbr0 dnsstub`, with `127.0.0.1:8790` (the operator's own LLM
+gateway) reachable from inside the sandbox. That reaches loopback services, the
+LAN, Tailscale peers, VM bridges and any cloud metadata endpoint the host can
+reach. The config key now says so.
 
-`network` applies only to sandboxed jobs: with `sandbox = "none"` there is no
-namespace and therefore nothing to restrict, so the key is ignored rather than
-implying a protection it cannot provide.
+> **Open question, flagged rather than guessed.** The review that produced this
+> revision stated the network default twice and the two statements contradict:
+> the priority table and the section arguing the point both say change it to
+> `false`, while the concluding line of the duplicated message says
+> `network = TRUE padrao`. This revision implements **`false`**, on the weight of
+> the reviewer's own reasoning, and treats the lone `TRUE` as a typo. If it was
+> not a typo, this is a one-line change and the sandboxed job simply keeps the
+> host namespace by default.
+
+With `sandbox = "none"` nothing is gated: that mode **is** the operator's
+consent, and Layer 1 does not apply. `host_network` is ignored under `"none"`.
+
+An unknown value for `sandbox` is refused at load rather than defaulted.
+
+### 5. Resource containment (P1)
+
+bubblewrap is a **namespace** tool, not a resource sandbox. It does not bound
+CPU, memory, process count or output. The review asked for this to be explicit;
+here is exactly what exists today in `shell.rs` and what this change adds:
+
+| Bound | Today | This change |
+|---|---|---|
+| Wall-clock timeout | **exists** — `tokio::time::timeout(job.timeout_secs, …)`, `shell.rs:91` | unchanged |
+| stdin | **exists** — `Stdio::null()`, `shell.rs:86` | unchanged |
+| Cancellation | **exists** — `kill_on_drop`, direct child only | **improved**: bwrap's `--die-with-parent` makes it the whole tree |
+| stdout bytes | **missing** — `wait_with_output` buffers without limit | **added**: cap, and the job fails with a clear error |
+| stderr bytes | **missing** | **added**: cap |
+| Child process count | **missing** | **added**: `RLIMIT_NPROC` via `pre_exec`, best-effort, documented as such |
+| CPU / memory | missing | **explicitly out of scope**; needs cgroups, deferred with a written reason |
+| Sandbox filesystem fill | missing | bounded by the wall clock only; documented, not solved |
+
+The caps are enforced by reading the child's pipes with a bounded reader rather
+than `wait_with_output`, so a `yes` job is stopped by the byte cap and not only
+by the deadline. The output cap is enforced **before** the text reaches the job
+row or the artifact, so a runaway producer cannot inflate the database.
+
+### 6. The probe's smoke test uses the production argv (P1)
+
+`probe()` does not run `bwrap --unshare-all /bin/sh -c true`. It runs the
+**same argv builder** the executor uses, against a scratch job directory, and
+asserts the properties the boundary claims:
+
+- the shell starts (proves `/usr`, `/bin`, `/lib`, `/lib64` and the loader);
+- `$HOME` is the job sandbox and `$PATH` is the set value (proves the
+  `--clearenv`/`--setenv` **ordering**);
+- the sandbox directory is writable and `--chdir` took effect;
+- `hostname` is `haos-sandbox`;
+- `/etc/passwd` is not readable;
+- a TCP connect to the host's loopback fails (unless `host_network`);
+- creating a nested user namespace fails (proves `--disable-userns` and
+  `--assert-userns-disabled` actually took effect on this kernel).
+
+A failure at any step is `IsolationUnavailable`, with the failing step named in
+the error. The probe runs once at startup and its result is cached.
 
 ## Error handling
 
-- The probe failing is not fatal to startup: the supervisor still runs, the
-  reason is logged once, and shell tasks park for approval instead.
-- A refused job returns `JobStatus::Failed` with an error naming the missing
-  isolation, and spawns nothing.
-- A missing `resolv.conf`/`nsswitch.conf`/`hosts` degrades name resolution but
-  must never fail open on isolation — the file set is best-effort, the
-  namespace is not.
-- A non-zero `bwrap` exit is reported as the job's failure with its stderr, the
-  same way a failing command is today.
+- `IsolationUnavailable` is one variant carrying the failing step, so the
+  operator sees *why* (no bwrap / version too old / nested userns still possible
+  / network not isolated), not just "unavailable".
+- Layer 2 returns a `JobStatus::Failed` with an error naming the command that
+  would grant consent; it never falls back to `sh -c`.
+- A sandbox-directory invariant failure is a hard error, never a warning, and
+  never a fallback to the configured root.
 
 ## Testing and verification
 
-- **Isolation proofs (real `bwrap`, integration).** A job that reads a file
-  outside the sandbox fails and its output does not contain the secret. `$HOME`
-  and `/etc/passwd` are unreachable. The sandbox directory stays writable. The
-  network matches `network`: a TCP attempt succeeds with `true` and fails with
-  `false`.
-- **Environment proof.** A variable exported into the test process is **not**
-  visible to a sandboxed job.
-- **Fail-closed proofs.** With the probe forced to fail, a shell task parks in
-  `Route`; no job row reports success; after consent it runs and the audit row
-  records the consent; after `/unsafe-shell off` it parks again.
-- **Mutations, each with observed output, in a `/tmp` copy with its own
-  `CARGO_TARGET_DIR`:** removing `--unshare-all` must make the escape test fail;
-  removing `--clearenv` must make the environment test fail; removing the
-  sandbox `--bind` must make the writable-sandbox test fail; removing the
-  Layer-2 refusal must make the fail-closed test fail.
-- **Absence handling.** If `bwrap` is genuinely unavailable, the isolation tests
-  skip with a loud reason rather than passing silently, and the fail-closed
-  tests still run — they are the ones that must hold on such a host.
-- Full gates before commit: `cargo fmt --all -- --check`,
-  `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+### Mutation tests (each must be shown to fail)
+
+From revision 1, kept:
+
+- remove `--unshare-all` → escape test fails
+- remove `--clearenv` → environment-leak test fails
+- remove the `--bind` → sandbox-write test fails
+- remove the Layer-2 refusal → unconfined-execution test fails
+
+Added, one per correction in this revision:
+
+- **stub `bwrap --version` at `0.11.x`** → `probe()` must refuse, and must
+  refuse *as* `IsolationUnavailable`, not as a distinct "insecure" state
+- remove `--new-session` → the PTY/TIOCSTI test must detect it
+- remove `--disable-userns` (or `--assert-userns-disabled`) → nested-userns test
+  must detect it
+- remove `--unshare-user` while keeping `--disable-userns` → the run must fail,
+  not silently downgrade
+- move `--clearenv` after `--setenv` → `HOME` must come back empty
+- `host_network = false` → loopback and LAN unreachable
+- remove `--hostname` → the host's hostname must be visible
+- set the sandbox root to `/` → config load must refuse
+- revoke the grant between Layer 1 and Layer 2 → Layer 2 must still refuse
+- kill the supervisor → no sandbox process or descendant survives
+- infinite stdout → the byte cap ends the job before the wall clock
+
+### Tests that run against real bubblewrap
+
+Marked `#[ignore]`d and re-checked at runtime against an env gate, matching the
+existing live-test convention (`HAOS_GREEN_A2A_LIVE`, `HAOS_GREEN_WEB_LIVE`), so
+plain `cargo test` stays green on a host without bubblewrap:
+
+- the original attack (`run x; cat /etc/hostname`) fails inside the sandbox;
+- `~/.haos-green/config.toml` is unreachable;
+- the environment leak is closed;
+- the two-layer gate parks a task in `Route` and `/unsafe-shell on` releases it;
+- `/approve <id>` does **not** release a *different* task.
+
+Every await on spawned work goes through `supervisor::bounded("what", handle)`,
+per the hang rule in `CLAUDE.md`.
 
 ## Documentation corrections
 
-- `CLAUDE.md:208` — the claim that command operations are contained by
-  `validate_sandbox_path()` is false for this path; replace it with the actual
-  contract and name the paths it does and does not cover.
-- `shell.rs:19` — remove the TODO; the new comment states that `validate()` is a
-  heuristic, not containment, and points at the sandbox for the real boundary.
-- `CLAUDE.md` Supervisor section — document `[supervisor.shell]`, the consent
-  model, its session scope, and the revoke command.
-- `config.example.toml` — add the `[supervisor.shell]` keys.
+- `CLAUDE.md:208` claims file and command operations are contained by
+  `validate_sandbox_path()`; true for the tools, **false** for this backend.
+- `shell.rs:19-23`'s TODO is satisfied and must be replaced, not deleted
+  silently.
+- The `"sandbox-violation"` error string is replaced by a message that
+  describes what was actually checked.
+- `CLAUDE.md`'s `kill_on_drop` bound gains the exception: sandboxed shell jobs
+  kill their whole tree via `--die-with-parent`.
 
 ## Non-goals
 
-- No seccomp, no container runtime, no root, no `chroot`.
-- No new state in the supervisor state machine.
-- No change to how tasks are classified or routed to the shell backend. The
-  shell backend still runs the task text as a command; isolation bounds the
-  damage, it does not make natural-language-as-shell sensible. Removing that
-  route is a separate decision.
-- No sandboxing of `claude_code`, `codex`, or `script`. They spawn processes
-  too, but none is registered in production (`main.rs` registers only reasoning
-  and shell), so they are a follow-up rather than part of this change.
+- seccomp, container runtimes, chroot — bubblewrap's namespace model is the
+  boundary here.
+- CPU and memory limits (cgroups); deferred explicitly, with the gap recorded in
+  the table above rather than left implicit.
+- Sandboxing `claude_code`, `codex`, or `script`. They spawn processes too, but
+  none is registered in production (`main.rs` registers only reasoning and
+  shell), so they are a follow-up rather than part of this change.
+- Making natural-language-as-shell sensible. Isolation bounds the damage; it
+  does not make the route a good idea. Removing it is a separate decision.
 
 ## Delivery sequence
 
-1. `sandbox.rs` with the probe and the argv builder, plus unit tests for the
-   argument construction.
-2. Wire the sandbox into `ShellBackend` and prove isolation with real-bwrap
-   tests, including the mutation round.
-3. Add the config keys and the startup probe/warning.
-4. Add the Layer-1 route-time gate and the Layer-2 refusal.
-5. Add the consent, its audit row, `/approve` integration, and
-   `/unsafe-shell off` plus the dashboard equivalent.
-6. Correct the documentation, then run the full gates.
+1. `sandbox.rs`: version probe, argv builder, sandbox-directory invariants, plus
+   unit tests for the argument construction and its **ordering**.
+2. Wire into `ShellBackend`; real-bwrap tests; first mutation round.
+3. Config keys (`sandbox`, `host_network`), startup probe and warning.
+4. Output caps and `RLIMIT_NPROC`; runaway-producer tests.
+5. Layer-1 gate and Layer-2 refusal.
+6. Consent (`UnsafeShellGrant`), audit rows, `/approve` scoping,
+   `/unsafe-shell on|off` and the dashboard equivalent.
+7. Documentation corrections, then the full gates.
