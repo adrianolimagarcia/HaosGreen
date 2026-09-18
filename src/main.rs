@@ -618,9 +618,19 @@ async fn main() -> Result<()> {
     let dispatch_agent = Arc::clone(&agent);
     let dispatch_user_ids = config.telegram.allowed_user_ids.clone();
     let dispatch_bot = Arc::clone(&bot);
+    // The **same** supervisor the dashboard holds — one `Supervisor`, one SQLite
+    // store, one cross-process lease owner per run. A second one here would
+    // share `haos-green.db` while believing it owned it alone.
+    let dispatch_supervisor = Arc::clone(&_supervisor);
 
     let mut dispatch_handle = tokio::spawn(async move {
-        platform::telegram::run(dispatch_agent, dispatch_user_ids, dispatch_bot).await
+        platform::telegram::run(
+            dispatch_agent,
+            dispatch_user_ids,
+            dispatch_bot,
+            dispatch_supervisor,
+        )
+        .await
     });
 
     // Set up signal handlers (SIGINT via ctrl_c for portability, SIGTERM via unix signal)

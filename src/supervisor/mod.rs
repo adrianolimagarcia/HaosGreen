@@ -35,6 +35,16 @@ use crate::supervisor::store::TaskStore;
 use crate::supervisor::task::TaskStatus;
 use crate::supervisor::verification::{VerificationEngine, VerificationOutcome};
 
+/// Longest free-text task input the supervisor accepts from a chat command, in
+/// **characters** (not bytes).
+///
+/// One bound, read by [`Supervisor::clarify`] and by the Telegram dispatcher's
+/// `/supervise` and `/clarify` argument validation, so the two ends of the
+/// command surface cannot disagree about what "too long" means. It bounds the
+/// text before it reaches the classifier, the artifact store and the audit row;
+/// it is deliberately generous — a task description, not a document.
+pub const MAX_TASK_TEXT_CHARS: usize = 2000;
+
 /// A supervisor refusal, as opposed to an internal fault.
 ///
 /// # Why this is a type and not a message
@@ -572,6 +582,7 @@ fn new_lease_owner_id() -> String {
     format!("pid-{}-{}", std::process::id(), uuid::Uuid::new_v4())
 }
 
+#[derive(Debug)]
 pub enum SubmitOutcome {
     AutoExecutePlanned { task_id: String },
     NeedsClarification { task_id: String, question: String },
@@ -1169,6 +1180,69 @@ impl Supervisor {
         self.execute_now(task_id).await
     }
 
+    /// Answer a `Clarify` prompt: record the answer and resume the existing
+    /// pipeline.
+    ///
+    /// `submit` parks a `PolicyDecision::Clarify` task in `Clarify` (see the
+    /// `Clarify` arm above, which returns [`SubmitOutcome::NeedsClarification`]
+    /// without recording any further transition), so `Clarify -> Execute` is the
+    /// edge this method takes before handing the task to
+    /// [`Supervisor::execute_now`] — the same shape [`Supervisor::resume`] and
+    /// [`Supervisor::approve`] have, so there is no second execution path.
+    ///
+    /// `Execute` and not `Plan` is the intermediate state: `execute_now` records
+    /// `task.status -> Plan` as its first transition, so a `Plan -> Plan` step
+    /// would be illegal. `Clarify -> Execute` is a legal edge.
+    ///
+    /// # The gate is stricter than the state table, deliberately
+    ///
+    /// `Clarify -> Execute` and `Clarify -> Plan` are both legal edges, but only
+    /// a task that is actually in `Clarify` may be clarified — exactly the
+    /// argument [`Supervisor::resume`] makes for `Paused`. Without the exact
+    /// check, a task parked in `Route` awaiting approval would be run by
+    /// `/clarify`, i.e. an approval in disguise.
+    ///
+    /// The answer is validated **before** the task is read, so a blank or
+    /// oversized one is refused without touching the store at all, and it is
+    /// stored as the transition's `reason` after
+    /// [`crate::supervisor::redact::redact`], because it is operator-supplied
+    /// text that lands in the audit trail.
+    pub async fn clarify(&self, task_id: &str, text: &str) -> anyhow::Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            anyhow::bail!("the clarification text must not be empty");
+        }
+        if text.chars().count() > MAX_TASK_TEXT_CHARS {
+            anyhow::bail!(
+                "the clarification text must be at most {MAX_TASK_TEXT_CHARS} characters"
+            );
+        }
+        let task = self
+            .store
+            .get(task_id)
+            .await?
+            .ok_or_else(|| SupervisorError::not_found(task_id))?;
+        if task.status != TaskStatus::Clarify {
+            return Err(SupervisorError::state_refusal(
+                task.status,
+                TaskStatus::Execute,
+            ));
+        }
+        // Redacted before it reaches the audit row: `record_transition` stores
+        // the reason verbatim, and this is free text a human typed.
+        let reason = crate::supervisor::redact::redact(text);
+        self.store
+            .record_transition(
+                task_id,
+                TaskStatus::Clarify,
+                TaskStatus::Execute,
+                "user",
+                Some(&reason),
+            )
+            .await?;
+        self.execute_now(task_id).await
+    }
+
     pub async fn submit(
         &self,
         platform: &str,
@@ -1631,6 +1705,178 @@ mod tests {
         assert!(sup.pause(&id).await.is_err());
         assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Done);
         assert_eq!(sup.store().transitions(&id).await.unwrap().len(), before);
+    }
+
+    // ── clarify ─────────────────────────────────────────────────────────────
+
+    /// A task parked in `Clarify`.
+    ///
+    /// Written through the store rather than through `submit`, so no test here
+    /// depends on the heuristic classifier deciding a request is ambiguous — the
+    /// fixture states the precondition instead of hoping for it.
+    async fn task_awaiting_clarification(sup: &Supervisor) -> String {
+        let t = Task::new("do the thing", "do the thing");
+        sup.store().create(&t, "web", "u1", None).await.unwrap();
+        for (from, to) in [
+            (TaskStatus::Intake, TaskStatus::Classify),
+            (TaskStatus::Classify, TaskStatus::Route),
+            (TaskStatus::Route, TaskStatus::Clarify),
+        ] {
+            sup.store()
+                .record_transition(&t.id, from, to, "test", None)
+                .await
+                .unwrap();
+        }
+        t.id
+    }
+
+    #[tokio::test]
+    async fn clarify_records_the_answer_and_runs_a_task_parked_for_clarification() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = plain_supervisor(dir.path(), &memory);
+        let id = task_awaiting_clarification(&sup).await;
+
+        let report = sup
+            .clarify(&id, "  it is about the parser  ")
+            .await
+            .unwrap();
+        assert!(report.contains("ran:"), "unexpected report: {report}");
+        assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Done);
+
+        let trail = sup.store().transitions(&id).await.unwrap();
+        let row = trail
+            .iter()
+            .find(|r| r.from == TaskStatus::Clarify && r.to == TaskStatus::Execute)
+            .expect("clarify must take Clarify -> Execute");
+        // Trimmed before it is recorded, so the audit row holds the answer the
+        // user meant rather than the whitespace they typed around it.
+        assert_eq!(row.reason.as_deref(), Some("it is about the parser"));
+    }
+
+    /// The exact-state gate, and the reason it exists: `Clarify -> Execute` is a
+    /// legal edge, so without the `task.status != Clarify` check a task parked in
+    /// `Route` awaiting approval would be run by `clarify` — an approval in
+    /// disguise, which is the same failure `resume` was fixed for.
+    #[tokio::test]
+    async fn clarify_refuses_a_task_that_is_not_in_clarify() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = plain_supervisor(dir.path(), &memory);
+
+        let id = sup
+            .submit("web", "u1", None, "summarize the readme")
+            .await
+            .unwrap()
+            .task_id();
+        assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Route);
+        let before = sup.store().transitions(&id).await.unwrap().len();
+
+        let error = sup.clarify(&id, "just do it").await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::StateRefusal { .. })
+            ),
+            "clarify must raise a typed refusal, got {error:?}"
+        );
+        assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Route);
+        assert_eq!(
+            sup.store().transitions(&id).await.unwrap().len(),
+            before,
+            "a refused clarify must write nothing"
+        );
+    }
+
+    /// The text is validated **before** the task is read, so a blank or
+    /// oversized answer costs no store access at all.
+    #[tokio::test]
+    async fn clarify_refuses_blank_and_oversized_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = plain_supervisor(dir.path(), &memory);
+        let id = task_awaiting_clarification(&sup).await;
+        let before = sup.store().transitions(&id).await.unwrap().len();
+
+        // Whitespace-only is blank. (A zero-width space is *not* whitespace by
+        // `char::is_whitespace`, so a `"\u{200b}"`-only answer is accepted as
+        // text — it is one character the user typed, not an empty answer.)
+        for answer in ["", "   ", "\n\t ", "\r\n"] {
+            let error = sup.clarify(&id, answer).await.unwrap_err();
+            assert!(
+                error.to_string().contains("must not be empty"),
+                "unexpected error for {answer:?}: {error}"
+            );
+        }
+
+        let too_long = "x".repeat(MAX_TASK_TEXT_CHARS + 1);
+        let error = sup.clarify(&id, &too_long).await.unwrap_err();
+        assert!(
+            error.to_string().contains("at most"),
+            "unexpected error for an oversized answer: {error}"
+        );
+
+        // Every refusal left the task exactly where it was: still parked, with
+        // no audit row and no execution.
+        assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Clarify);
+        assert_eq!(
+            sup.store().transitions(&id).await.unwrap().len(),
+            before,
+            "a refused clarify must write nothing"
+        );
+
+        // Exactly the limit is accepted and really runs the task.
+        assert!(sup
+            .clarify(&id, &"x".repeat(MAX_TASK_TEXT_CHARS))
+            .await
+            .is_ok());
+        assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn clarify_refuses_an_unknown_task_as_a_typed_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = plain_supervisor(dir.path(), &memory);
+
+        let error = sup.clarify("no-such-task", "an answer").await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<SupervisorError>(),
+                Some(SupervisorError::NotFound { .. })
+            ),
+            "clarify must raise a typed not-found, got {error:?}"
+        );
+    }
+
+    /// The answer is free text a human typed and `record_transition` stores the
+    /// reason verbatim, so it is scrubbed before it reaches the audit row.
+    #[tokio::test]
+    async fn clarify_redacts_the_answer_before_it_reaches_the_audit_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = plain_supervisor(dir.path(), &memory);
+        let id = task_awaiting_clarification(&sup).await;
+
+        // Assembled at runtime so the contiguous `key=value` spelling is not in
+        // this file's source.
+        let answer = format!("{}={}", "api_key", "zz9leaky9value");
+        sup.clarify(&id, &answer).await.unwrap();
+
+        let trail = sup.store().transitions(&id).await.unwrap();
+        let row = trail
+            .iter()
+            .find(|r| r.from == TaskStatus::Clarify && r.to == TaskStatus::Execute)
+            .expect("clarify must take Clarify -> Execute");
+        let reason = row.reason.as_deref().unwrap_or_default();
+        assert!(
+            !reason.contains("zz9leaky9value"),
+            "the audit reason must be redacted: {reason:?}"
+        );
+        assert!(
+            reason.contains("***"),
+            "the mask must be present: {reason:?}"
+        );
     }
 
     // ── Concurrency ─────────────────────────────────────────────────────────

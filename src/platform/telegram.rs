@@ -17,6 +17,9 @@ use crate::platform::sender::{
 };
 use crate::platform::{Attachment, AttachmentKind, IncomingMessage};
 use crate::provider::Provider;
+use crate::supervisor::state::transition_allowed;
+use crate::supervisor::task::TaskStatus;
+use crate::supervisor::{SubmitOutcome, Supervisor, SupervisorError};
 use crate::tool_registry::ToolUiMode;
 use crate::utils::markdown_entities::{markdown_to_entities, split_entities};
 use crate::utils::rich_sender;
@@ -137,7 +140,7 @@ pub(crate) fn parse_command(s: &str) -> Option<(String, String)> {
 /// publishes their existence to the Telegram client.
 pub(crate) fn supported_commands() -> Vec<teloxide::types::BotCommand> {
     use teloxide::types::BotCommand;
-    vec![
+    let mut commands = vec![
         BotCommand::new("start", "Show the welcome message and command help"),
         BotCommand::new(
             "clear",
@@ -159,7 +162,568 @@ pub(crate) fn supported_commands() -> Vec<teloxide::types::BotCommand> {
             "format",
             "Switch message format: rich (native), markdown (web), auto",
         ),
+    ];
+    commands.extend(supervisor_commands());
+    commands
+}
+
+/// The BotFather entries for the supervisor commands.
+///
+/// One list, read by both [`supported_commands`] and
+/// [`dispatch_supervisor_command`], so the published menu and the router cannot
+/// drift apart — a command advertised here and not routed (or the reverse) is
+/// the exact failure this replaces.
+fn supervisor_commands() -> Vec<teloxide::types::BotCommand> {
+    use teloxide::types::BotCommand;
+    vec![
+        BotCommand::new("supervise", "Submit a task to the autonomous supervisor"),
+        BotCommand::new("tasks", "List recent supervisor tasks with their states"),
+        BotCommand::new("resume", "Resume a paused supervisor task: /resume <id>"),
+        BotCommand::new("cancel", "Cancel a supervisor task: /cancel <id>"),
+        BotCommand::new(
+            "approve",
+            "Approve a supervisor task awaiting approval: /approve <id>",
+        ),
+        BotCommand::new(
+            "clarify",
+            "Answer a supervisor clarification prompt: /clarify <id> <text>",
+        ),
     ]
+}
+
+// ── Supervisor commands ─────────────────────────────────────────────────────
+
+/// The command names [`dispatch_supervisor_command`] routes, without the slash.
+///
+/// Kept in step with [`supervisor_commands`] by the test
+/// `the_published_menu_and_the_router_name_the_same_commands`, which compares
+/// the two lists rather than restating either.
+pub(crate) const SUPERVISOR_COMMANDS: [&str; 6] = [
+    "supervise",
+    "tasks",
+    "resume",
+    "cancel",
+    "approve",
+    "clarify",
+];
+
+/// Longest `/supervise` task text the dispatcher forwards, in characters. The
+/// same bound `Supervisor::clarify` applies to a `/clarify` answer.
+pub(crate) const MAX_SUPERVISE_TEXT_CHARS: usize = crate::supervisor::MAX_TASK_TEXT_CHARS;
+
+/// Longest task id the dispatcher will look up or echo.
+///
+/// Ids are UUIDs (`Task::new`), so 64 characters is already far past anything
+/// legitimate; the point is that a malformed id is **refused**, never truncated
+/// and echoed.
+pub(crate) const MAX_TASK_ID_CHARS: usize = 64;
+
+/// Longest task title rendered on a `/tasks` line, in characters. Titles are
+/// already capped at 80 by `IntakeRouter::normalize`; this is the display cap.
+const MAX_TASK_TITLE_CHARS: usize = 60;
+
+/// Hard cap on a supervisor reply, in characters.
+///
+/// Telegram's limit is 4096 and the rest of this file splits longer text
+/// (`split_message`, `send_entities_message`). The supervisor dispatcher
+/// deliberately sends **one** message per command, so it bounds the text itself
+/// — a reply that arrives in pieces is not a reply a user can act on.
+pub(crate) const MAX_SUPERVISOR_REPLY_CHARS: usize = 3500;
+
+/// How many tasks `/tasks` lists. `TaskStore::list_recent` clamps to
+/// `MAX_RECENT_TASKS` (20) regardless; this is the smaller display budget.
+pub(crate) const MAX_TASKS_LISTED: usize = 10;
+
+/// The answer to a task id that is not shaped like one.
+const INVALID_TASK_ID: &str = "That is not a valid supervisor task id.";
+
+/// The answer to a genuine supervisor fault. Fixed, like the dashboard's 500
+/// body: an `anyhow` chain from `rusqlite` carries the failing statement and an
+/// artifact error carries an absolute path.
+const SUPERVISOR_FAULT: &str = "The supervisor could not complete that request.";
+
+/// Who asked for a supervisor action, and where the answer goes.
+///
+/// `user_id` is the Telegram user id, and it is the **only** identity the
+/// authorization check reads. `chat_id` is the destination, never an authority:
+/// a private chat's id happens to equal the user id, a group's does not.
+pub(crate) struct SupervisorActor {
+    pub user_id: u64,
+    pub chat_id: String,
+}
+
+/// Route one parsed supervisor command and send its single reply.
+///
+/// Returns `Ok(true)` when `cmd` names a supervisor command — **including** the
+/// unauthorized case, which answers nothing at all — and `Ok(false)` for every
+/// other command, so the caller's fall-through is unchanged.
+///
+/// # Authorization
+///
+/// The allowed-user check is the **first** statement, before the argument is
+/// parsed, before the supervisor is touched and before anything is sent. An
+/// unauthorized sender therefore gets no supervisor action, no supervisor data
+/// and no reply: not even an error, because a reply is itself an oracle about
+/// which commands exist.
+///
+/// This is the second of two checks, not the only one. The first is the
+/// `filter_map` on the `dptree` message handler in [`run`], which drops a
+/// message from a user outside `telegram.allowed_user_ids` before
+/// `handle_message` is called at all — for *every* command, supervisor or not.
+/// That filter is the production gate; this one is what makes the dispatcher
+/// safe to call directly, and it is the one the tests exercise.
+///
+/// # Bounded replies
+///
+/// Every reply is redacted (`supervisor::redact`), because task titles, submit
+/// outcomes and clarification text are user- or model-derived, and then bounded
+/// by [`bounded_reply`]. No path echoes an `anyhow` chain, and the whole chain
+/// is logged instead.
+pub(crate) async fn dispatch_supervisor_command(
+    cmd: &str,
+    arg: &str,
+    actor: &SupervisorActor,
+    allowed_user_ids: &[u64],
+    supervisor: &Supervisor,
+    sender: &dyn PlatformSender,
+) -> Result<bool> {
+    if !SUPERVISOR_COMMANDS.contains(&cmd) {
+        return Ok(false);
+    }
+
+    if !allowed_user_ids.contains(&actor.user_id) {
+        warn!(
+            user_id = actor.user_id,
+            command = cmd,
+            "Refused a supervisor command from a user outside telegram.allowed_user_ids"
+        );
+        return Ok(true);
+    }
+
+    let reply = match cmd {
+        "supervise" => supervise_command(arg, actor, supervisor).await,
+        "tasks" => tasks_command(supervisor).await,
+        "resume" => lifecycle_command(arg, supervisor, LifecycleAction::Resume).await,
+        "cancel" => lifecycle_command(arg, supervisor, LifecycleAction::Cancel).await,
+        "approve" => lifecycle_command(arg, supervisor, LifecycleAction::Approve).await,
+        "clarify" => clarify_command(arg, supervisor).await,
+        // Unreachable while `SUPERVISOR_COMMANDS` and this match agree. A
+        // bounded answer rather than a panic keeps the two honest.
+        other => format!("Unknown supervisor command: /{other}"),
+    };
+
+    let reply = bounded_reply(&crate::supervisor::redact::redact(&reply));
+    // Plain text: `TelegramAdapter` applies no parse mode for `Rich`, so the
+    // bytes composed here are the bytes delivered. The replies contain task
+    // titles and ids, and MarkdownV2 would reject an unescaped `_` or `*` in
+    // either — a formatting convention is not worth a failed send.
+    sender
+        .send_message(&actor.chat_id, &reply, PlatformMsgFormat::Rich)
+        .await
+        .context("send a supervisor command reply")?;
+    Ok(true)
+}
+
+/// `/supervise <text>` — create and route a supervisor task.
+///
+/// Like `POST /api/supervisor/tasks`, this **creates and routes** the task; it
+/// does not run the pipeline. `submit` classifies, applies policy and stops, and
+/// a task that policy auto-executes is still left in `Route` — running it here
+/// would be a second execution path beside `/approve` and `/resume`, and would
+/// block the bot's message handler for the length of a plan.
+///
+/// Because nothing runs, the reply is the whole hand-off: it names the state and
+/// the exact command that moves the task on ([`submit_reply`]). A reply that
+/// only said "created" would leave the user with a task that never runs and no
+/// way to find out why.
+async fn supervise_command(arg: &str, actor: &SupervisorActor, supervisor: &Supervisor) -> String {
+    let text = arg.trim();
+    if text.is_empty() {
+        return "Usage: /supervise <task text>".to_string();
+    }
+    let chars = text.chars().count();
+    if chars > MAX_SUPERVISE_TEXT_CHARS {
+        return format!(
+            "The task text is {chars} characters; the limit is {MAX_SUPERVISE_TEXT_CHARS}."
+        );
+    }
+
+    // `platform`/`user_id`/`chat_id` are the origin recorded in `sup_tasks`,
+    // so a task submitted from Telegram is distinguishable from a dashboard one
+    // and attributable to the user who asked for it.
+    let outcome = match supervisor
+        .submit(
+            "telegram",
+            &actor.user_id.to_string(),
+            Some(&actor.chat_id),
+            text,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return fault("submit a supervisor task", &e),
+    };
+
+    let task_id = outcome.task_id();
+    let state = match supervisor.state(&task_id).await {
+        Ok(state) => state_name(&state),
+        Err(e) => return fault("read a supervisor task's state", &e),
+    };
+
+    submit_reply(&outcome, &state)
+}
+
+/// The reply for a `submit` that succeeded.
+///
+/// Every arm names the state and the command that moves the task forward, so
+/// the command surface is complete without executing anything: `submit` parks
+/// the task (`Route` for a planned or approval-pending one, `Clarify` for an
+/// ambiguous one) and only `/approve`, `/resume` or `/clarify` ever run it.
+///
+/// # The two policy decisions that arrive as `NeedsApproval`
+///
+/// `PolicyDecision::UseFallbackBackend` and `PolicyDecision::StopAndReport` are
+/// funnelled by `submit` into `SubmitOutcome::NeedsApproval` with their `Debug`
+/// spelling as the `reason` (see the `other =>` arm of `submit`), so their
+/// replies name the reason verbatim and offer **both** available actions rather
+/// than guessing which one applies. Splitting them into their own outcome
+/// variants would mean changing `SubmitOutcome`, which is a change to the
+/// supervisor's contract and out of scope here.
+fn submit_reply(outcome: &SubmitOutcome, state: &str) -> String {
+    let task_id = outcome.task_id();
+    match outcome {
+        SubmitOutcome::AutoExecutePlanned { .. } => format!(
+            "Supervisor task {task_id} created (state {state}).\n\
+             Nothing runs until you ask: /approve {task_id}"
+        ),
+        SubmitOutcome::NeedsClarification { question, .. } => format!(
+            "Supervisor task {task_id} needs clarification (state {state}): {question}\n\
+             Answer with /clarify {task_id} <text>"
+        ),
+        SubmitOutcome::NeedsApproval { reason, .. } => format!(
+            "Supervisor task {task_id} needs approval (state {state}): {reason}\n\
+             Approve with /approve {task_id}, or drop it with /cancel {task_id}"
+        ),
+    }
+}
+
+/// `/tasks` — the most recent supervisor tasks, newest first.
+///
+/// Bounded twice: [`MAX_TASKS_LISTED`] rows, and [`MAX_TASK_TITLE_CHARS`] per
+/// title, so the reply is a predictable size whatever is in the store.
+async fn tasks_command(supervisor: &Supervisor) -> String {
+    let tasks = match supervisor.store().list_recent(MAX_TASKS_LISTED).await {
+        Ok(tasks) => tasks,
+        Err(e) => return fault("list supervisor tasks", &e),
+    };
+    if tasks.is_empty() {
+        return "No supervisor tasks.".to_string();
+    }
+
+    let mut lines = vec![format!(
+        "Supervisor tasks ({} most recent, newest first):",
+        tasks.len()
+    )];
+    for task in &tasks {
+        // Redact **before** truncating. The other order can cut a credential in
+        // half and leave the leading part of the value in the reply, which is
+        // still a leak — and the reply is redacted again as a whole by the
+        // dispatcher, so a value that straddles the row boundary is caught too.
+        let title = crate::supervisor::redact::redact(task.title.trim());
+        lines.push(format!(
+            "- {}  {}  {}",
+            task.id,
+            state_name(&task.status),
+            truncate_chars(&title, MAX_TASK_TITLE_CHARS)
+        ));
+    }
+    lines.join("\n")
+}
+
+/// A lifecycle action, expressed as the precondition the state machine puts on
+/// the task's current state.
+///
+/// The same three actions and the same pre-checks the dashboard's
+/// `routes::supervisor::Action` applies, so a task refused from Telegram is
+/// refused from the dashboard for the same reason.
+#[derive(Debug, Clone, Copy)]
+enum LifecycleAction {
+    Resume,
+    Cancel,
+    Approve,
+}
+
+impl LifecycleAction {
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Resume => "Usage: /resume <task id>",
+            Self::Cancel => "Usage: /cancel <task id>",
+            Self::Approve => "Usage: /approve <task id>",
+        }
+    }
+
+    /// Whether a task in `current` may take this action.
+    ///
+    /// `resume` is deliberately stricter than the table: `Paused -> Execute` is
+    /// a legal edge, but `Supervisor::resume` refuses any task that is not
+    /// `Paused`, and a task parked in `Route` awaiting approval must not run
+    /// without one.
+    fn permitted_from(self, current: &TaskStatus) -> bool {
+        match self {
+            Self::Resume => *current == TaskStatus::Paused,
+            Self::Cancel => transition_allowed(current.clone(), TaskStatus::Cancelled),
+            Self::Approve => transition_allowed(current.clone(), TaskStatus::Execute),
+        }
+    }
+
+    /// The conflict text. It names the task's current state and nothing else —
+    /// no path, no error chain.
+    fn refusal(self, current: &TaskStatus) -> String {
+        let state = state_name(current);
+        match self {
+            Self::Resume => format!(
+                "Cannot resume: the task is in state {state}, and only a PAUSED task can be resumed."
+            ),
+            Self::Cancel => format!("Cannot cancel: the task is in state {state}."),
+            Self::Approve => format!("Cannot approve: the task is in state {state}."),
+        }
+    }
+
+    /// The success text, in the past tense of the action.
+    fn done(self, id: &str, state: &str) -> String {
+        match self {
+            Self::Resume => format!("Task {id} resumed; it is now {state}."),
+            Self::Cancel => format!("Task {id} cancelled; it is now {state}."),
+            Self::Approve => format!("Task {id} approved; it is now {state}."),
+        }
+    }
+
+    async fn apply(self, supervisor: &Supervisor, id: &str) -> Result<()> {
+        match self {
+            Self::Cancel => supervisor.cancel(id).await,
+            // `resume` and `approve` run the plan and return its report, which
+            // is persisted as the task's `result` artifact — the reply does not
+            // echo it.
+            Self::Resume => supervisor.resume(id).await.map(|_report| ()),
+            Self::Approve => supervisor.approve(id).await.map(|_report| ()),
+        }
+    }
+}
+
+/// `/resume <id>`, `/cancel <id>`, `/approve <id>`.
+///
+/// # Conflict is decided before the supervisor is called
+///
+/// A refusal is a fact about the task's current state, so this reads that state
+/// first and answers without attempting the operation — the same shape the
+/// dashboard route has. Only an error that survives the pre-check can be a
+/// fault, and the three kinds are answered with three different sentences: a
+/// missing task, a state conflict, and a genuine fault.
+///
+/// The pre-check cannot cover a task that moves between it and the call; there
+/// the error **type** is the signal left, read with `anyhow::Error::downcast_ref`
+/// on [`SupervisorError`] rather than by matching error text.
+async fn lifecycle_command(arg: &str, supervisor: &Supervisor, action: LifecycleAction) -> String {
+    let id = match validated_task_id(arg) {
+        Some(id) => id,
+        None if arg.trim().is_empty() => return action.usage().to_string(),
+        None => return INVALID_TASK_ID.to_string(),
+    };
+
+    let task = match supervisor.store().get(id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return not_found(id),
+        Err(e) => return fault("read a supervisor task", &e),
+    };
+
+    if !action.permitted_from(&task.status) {
+        return action.refusal(&task.status);
+    }
+
+    if let Err(e) = action.apply(supervisor, id).await {
+        return classify_lifecycle_failure(action, id, &e);
+    }
+
+    match supervisor.state(id).await {
+        Ok(state) => action.done(id, &state_name(&state)),
+        Err(e) => fault("read a supervisor task's state", &e),
+    }
+}
+
+/// `/clarify <id> <text>` — answer a `Clarify` prompt and resume the task.
+///
+/// The state is checked here as well as inside `Supervisor::clarify`, for the
+/// same reason the lifecycle actions are: a task in the wrong state must be
+/// answered as a conflict without touching the audit trail. `clarify` keeps its
+/// own check because it is a public method, not because this one is trusted.
+async fn clarify_command(arg: &str, supervisor: &Supervisor) -> String {
+    let arg = arg.trim();
+    let Some(separator) = arg.find(char::is_whitespace) else {
+        return "Usage: /clarify <id> <text>".to_string();
+    };
+    let Some(id) = validated_task_id(&arg[..separator]) else {
+        return INVALID_TASK_ID.to_string();
+    };
+    let text = arg[separator..].trim();
+    if text.is_empty() {
+        return "Usage: /clarify <id> <text>".to_string();
+    }
+    let chars = text.chars().count();
+    if chars > MAX_SUPERVISE_TEXT_CHARS {
+        return format!(
+            "The clarification text is {chars} characters; the limit is {MAX_SUPERVISE_TEXT_CHARS}."
+        );
+    }
+
+    match supervisor.store().get(id).await {
+        Ok(Some(task)) if task.status != TaskStatus::Clarify => {
+            return format!(
+                "Cannot clarify: the task is in state {}, and only a task in CLARIFY can be clarified.",
+                state_name(&task.status)
+            );
+        }
+        Ok(None) => return not_found(id),
+        Err(e) => return fault("read a supervisor task", &e),
+        Ok(Some(_)) => {}
+    }
+
+    match supervisor.clarify(id, text).await {
+        // The report is persisted as the task's `result` artifact; the reply
+        // names the resulting state instead of echoing it.
+        Ok(_report) => match supervisor.state(id).await {
+            Ok(state) => format!(
+                "Clarification recorded; task {id} is now {}.",
+                state_name(&state)
+            ),
+            Err(e) => fault("read a supervisor task's state", &e),
+        },
+        Err(e) => classify_lifecycle_failure_typed(id, &e),
+    }
+}
+
+/// The reply for a supervisor call that failed.
+///
+/// Not-found, conflict and fault are three different sentences, and the
+/// difference is read from the error's **type**, never from its text: rewording
+/// a `bail!` in `supervisor/mod.rs` must not silently reclassify a refusal as a
+/// fault. A `StateRefusal` names the state the store actually holds, so a raced
+/// refusal reads the same as one caught by the pre-check.
+fn classify_lifecycle_failure(action: LifecycleAction, id: &str, error: &anyhow::Error) -> String {
+    match error.downcast_ref::<SupervisorError>() {
+        Some(SupervisorError::StateRefusal { from, .. }) => action.refusal(from),
+        _ => classify_lifecycle_failure_typed(id, error),
+    }
+}
+
+/// The same classification for a call with no [`LifecycleAction`] (`/clarify`,
+/// and any future caller), which has no per-action phrasing to fall back on.
+fn classify_lifecycle_failure_typed(id: &str, error: &anyhow::Error) -> String {
+    match error.downcast_ref::<SupervisorError>() {
+        Some(SupervisorError::NotFound { .. }) => not_found(id),
+        Some(SupervisorError::StateRefusal { from, .. }) => format!(
+            "Cannot do that: task {id} is in state {}, which does not allow it.",
+            state_name(from)
+        ),
+        Some(SupervisorError::AlreadyRunning { .. }) => {
+            format!("Task {id} is already running.")
+        }
+        // Cause-neutral on purpose: `LeaseLost` is raised both when another
+        // owner really took the task over and when the lease store could not be
+        // reached, and this error does not carry the distinction.
+        Some(SupervisorError::LeaseLost { .. }) => format!(
+            "The execution lease for task {id} is no longer held by this run; the task was not run."
+        ),
+        None => fault("apply a supervisor lifecycle action", error),
+    }
+}
+
+/// The reply for a task id that resolved to no row.
+fn not_found(id: &str) -> String {
+    format!("No supervisor task with id {id}.")
+}
+
+/// Log the **whole** `anyhow` chain and answer with the fixed sentence.
+///
+/// `error = %error` would print only the outermost context, so a failure whose
+/// real cause is `no such table: sup_transitions` would be logged as nothing but
+/// `insert sup_tasks` — undiagnosable, and the log view renders exactly this
+/// line. The body stays fixed: a `rusqlite` error carries the failing statement
+/// and an artifact error carries an absolute path.
+fn fault(what: &str, error: &anyhow::Error) -> String {
+    error!(
+        error = %format!("{error:#}"),
+        what = %what,
+        "telegram: supervisor command failed"
+    );
+    SUPERVISOR_FAULT.to_string()
+}
+
+/// The task id in `raw`, or `None` when it is missing, oversized, or shaped like
+/// something that is not an id.
+///
+/// Ids are UUIDs, so anything outside `[A-Za-z0-9_-]` is a typo or an attempt to
+/// smuggle a path, a newline or a mention into a reply. Bounded here rather than
+/// echoed and truncated later: a malformed id is refused, never repeated.
+fn validated_task_id(raw: &str) -> Option<&str> {
+    let id = raw.trim();
+    if id.is_empty() || id.chars().count() > MAX_TASK_ID_CHARS {
+        return None;
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(id)
+}
+
+/// The persisted name of a state — the spelling `sup_tasks.state` holds and the
+/// dashboard renders (`serde`'s `UPPERCASE` renaming), not `Debug`'s.
+///
+/// Total: `TaskStatus` is a plain enum that always serializes, and the fallback
+/// exists so a future variant with a custom serializer degrades to `Debug`
+/// rather than panicking in a reply.
+fn state_name(state: &TaskStatus) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{state:?}"))
+}
+
+/// Cut `text` to at most `max` characters, on a character boundary, appending an
+/// ellipsis when anything was dropped.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Bound a reply to [`MAX_SUPERVISOR_REPLY_CHARS`] characters.
+///
+/// The cut lands on the last line break inside the budget when there is one, so
+/// `/tasks` cannot be truncated mid-word — the failure mode a byte-offset cut
+/// produces, and the one that makes a listing unreadable.
+fn bounded_reply(reply: &str) -> String {
+    const SUFFIX: &str = "\n…(truncated)";
+    if reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS {
+        return reply.to_string();
+    }
+    // The suffix is part of the reply, so it is spent out of the budget rather
+    // than appended on top of it: taking the full budget here and then pushing
+    // the suffix returned up to `MAX_SUPERVISOR_REPLY_CHARS + 13` characters,
+    // i.e. more than the bound this function exists to enforce.
+    let head: String = reply
+        .chars()
+        .take(MAX_SUPERVISOR_REPLY_CHARS - SUFFIX.chars().count())
+        .collect();
+    let cut = head.rfind('\n').map(|at| at + 1).unwrap_or(head.len());
+    let mut out = head[..cut].to_string();
+    out.push_str(SUFFIX);
+    out
 }
 
 /// Send startup notification to all allowed users.
@@ -210,11 +774,29 @@ pub async fn notify_shutdown(bot: &teloxide::Bot, allowed_user_ids: &[u64]) {
     }
 }
 
+/// The non-`Agent` dependencies the message handler needs, injected through the
+/// `dptree` so `handle_message` stays a plain function.
+///
+/// Both values are the ones `main.rs` already holds: the same
+/// `telegram.allowed_user_ids` the `dptree` filter uses, and the process's
+/// **single** `Arc<Supervisor>` — the one the web dashboard also holds. No
+/// second supervisor and no second SQLite store is constructed for Telegram;
+/// a second one would be a second `sup_execution_leases` owner for the same
+/// database, which is exactly what the cross-process lease exists to refuse.
+#[derive(Clone)]
+pub struct TelegramDispatch {
+    /// Re-checked inside [`dispatch_supervisor_command`], after the `dptree`
+    /// filter has already dropped unauthorized messages.
+    pub allowed_user_ids: Arc<Vec<u64>>,
+    pub supervisor: Arc<Supervisor>,
+}
+
 /// Run the Telegram bot platform
 pub async fn run(
     agent: Arc<Agent>,
     allowed_user_ids: Vec<u64>,
     bot: Arc<teloxide::Bot>,
+    supervisor: Arc<Supervisor>,
 ) -> Result<()> {
     let bot = (*bot).clone();
 
@@ -239,6 +821,11 @@ pub async fn run(
         Ok(_) => info!("Registered {} Telegram commands", count),
         Err(e) => warn!(error = %e, "Failed to register Telegram commands"),
     }
+
+    let dispatch = TelegramDispatch {
+        allowed_user_ids: Arc::new(allowed_user_ids.clone()),
+        supervisor,
+    };
 
     let message_handler = Update::filter_message()
         .filter_map({
@@ -286,7 +873,7 @@ pub async fn run(
         .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![agent])
+        .dependencies(dptree::deps![agent, dispatch])
         // Commands (like /btw) bypass per-chat serialization for true concurrency.
         // Regular messages keep per-chat ordering to avoid race conditions.
         .distribution_function(|upd: &Update| {
@@ -666,7 +1253,12 @@ async fn set_model_and_reply(
     Ok(())
 }
 
-async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseResult<()> {
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    agent: Arc<Agent>,
+    dispatch: TelegramDispatch,
+) -> ResponseResult<()> {
     let user = match msg.from.as_ref() {
         Some(user) => user,
         None => return Ok(()),
@@ -1029,6 +1621,36 @@ async fn handle_message(bot: Bot, msg: Message, agent: Arc<Agent>) -> ResponseRe
         });
 
         return Ok(());
+    }
+
+    // Supervisor commands, before the /self-upgrade and /models dispatch below
+    // so no later `starts_with` branch can shadow them. `dispatch_supervisor_command`
+    // returns `false` for every other command, so this is transparent to them.
+    if let Some((cmd, arg)) = parse_command(&text) {
+        let actor = SupervisorActor {
+            user_id,
+            chat_id: msg.chat.id.0.to_string(),
+        };
+        match dispatch_supervisor_command(
+            &cmd,
+            &arg,
+            &actor,
+            &dispatch.allowed_user_ids,
+            &dispatch.supervisor,
+            &TelegramAdapter::new(bot.clone()),
+        )
+        .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                // A failed *send* is not worth failing the update over: the
+                // supervisor action (if any) has already happened, and the
+                // dispatcher's error handler logs the rest.
+                error!(error = %format!("{e:#}"), "Failed to answer a supervisor command");
+                return Ok(());
+            }
+        }
     }
 
     // Combined parse_command dispatch for /self-upgrade and /models.
@@ -2246,5 +2868,1073 @@ mod tests {
                 c.command
             );
         }
+    }
+
+    // ── Supervisor commands ─────────────────────────────────────────────────
+
+    use crate::supervisor::task::Task;
+
+    /// The one user id every test authorizes.
+    const ALLOWED_USER_ID: u64 = 42;
+
+    /// A chat id deliberately **different** from the user id, so a test that
+    /// asserts the recorded origin proves the dispatcher used the chat and not
+    /// the user (a private chat's two ids are equal, which hides the bug).
+    const ACTOR_CHAT_ID: &str = "1001";
+
+    fn actor() -> SupervisorActor {
+        SupervisorActor {
+            user_id: ALLOWED_USER_ID,
+            chat_id: ACTOR_CHAT_ID.to_string(),
+        }
+    }
+
+    fn intruder() -> SupervisorActor {
+        SupervisorActor {
+            user_id: 7,
+            chat_id: "7".to_string(),
+        }
+    }
+
+    /// A value that must never survive into a reply or an audit row.
+    ///
+    /// Deliberately not secret-shaped itself: the point is that it is *the value
+    /// after a credential key*, which is what `supervisor::redact` scrubs. A
+    /// literal that already looked like a credential would be scrubbed by any
+    /// tooling that reads this file, which would hide the test's own needle.
+    const LEAKY_VALUE: &str = "zz9leaky9value";
+
+    /// A `PlatformSender` that records what was sent.
+    ///
+    /// The dispatcher is only observable through its sender, so this is the
+    /// seam every assertion below reads: the reply text, the destination, and
+    /// whether anything was sent at all.
+    #[derive(Default)]
+    struct RecordingSender {
+        sent: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingSender {
+        fn texts(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect()
+        }
+
+        /// The single reply, asserting there is exactly one.
+        fn only_text(&self) -> String {
+            let texts = self.texts();
+            assert_eq!(texts.len(), 1, "expected exactly one reply, got {texts:?}");
+            texts[0].clone()
+        }
+
+        fn chats(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(chat, _)| chat.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl PlatformSender for RecordingSender {
+        async fn send_message(
+            &self,
+            chat_id: &str,
+            text: &str,
+            _format: PlatformMsgFormat,
+        ) -> Result<PlatformMessageId> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
+            Ok(format!("{chat_id}:1"))
+        }
+
+        async fn send_file(
+            &self,
+            _chat_id: &str,
+            _path: &Path,
+            _caption: Option<&str>,
+        ) -> Result<PlatformMessageId> {
+            anyhow::bail!("RecordingSender does not send files")
+        }
+
+        async fn show_cancel_button(
+            &self,
+            _chat_id: &str,
+            _text: &str,
+            _cancel_id: &str,
+        ) -> Result<PlatformMessageId> {
+            anyhow::bail!("RecordingSender does not send buttons")
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &PlatformMessageId,
+            _text: &str,
+        ) -> Result<()> {
+            anyhow::bail!("RecordingSender does not edit messages")
+        }
+
+        async fn delete_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &PlatformMessageId,
+        ) -> Result<()> {
+            anyhow::bail!("RecordingSender does not delete messages")
+        }
+
+        async fn notify_shutdown(&self, _chat_id: &str) -> Result<()> {
+            anyhow::bail!("RecordingSender does not notify shutdown")
+        }
+    }
+
+    /// An isolated supervisor over an in-memory store and a tempdir for
+    /// artifacts — never the user's home, and never the real `haos-green.db`.
+    ///
+    /// The `TempDir` and `MemoryStore` are returned so the caller keeps them
+    /// alive for the length of the test.
+    fn test_supervisor() -> (tempfile::TempDir, crate::memory::MemoryStore, Supervisor) {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut supervisor =
+            Supervisor::new_for_test(dir.path().to_path_buf(), memory.connection());
+        // Without a backend `execute_now` fails with "backend not found", and
+        // every `resume` / `approve` / `clarify` success path would be a fault.
+        supervisor
+            .register_test_reasoning_backend(|prompt| async move { Ok(format!("ran:{prompt}")) });
+        (dir, memory, supervisor)
+    }
+
+    /// Drive a fresh task to `state` through legal edges and return its id.
+    ///
+    /// Written through `record_transition` rather than through `submit`, so no
+    /// test depends on a classifier decision or on the policy engine's
+    /// thresholds.
+    async fn task_in(supervisor: &Supervisor, state: TaskStatus) -> String {
+        use TaskStatus::*;
+        let task = Task::new("a task", "do the thing");
+        supervisor
+            .store()
+            .create(&task, "telegram", &ALLOWED_USER_ID.to_string(), None)
+            .await
+            .unwrap();
+        let path: &[(TaskStatus, TaskStatus)] = match state {
+            Intake => &[],
+            Route => &[(Intake, Classify), (Classify, Route)],
+            Clarify => &[(Intake, Classify), (Classify, Route), (Route, Clarify)],
+            Paused => &[
+                (Intake, Classify),
+                (Classify, Route),
+                (Route, Plan),
+                (Plan, Paused),
+            ],
+            Done => &[
+                (Intake, Classify),
+                (Classify, Route),
+                (Route, Plan),
+                (Plan, Execute),
+                (Execute, Verify),
+                (Verify, Report),
+                (Report, Archive),
+                (Archive, Done),
+            ],
+            other => panic!("task_in does not know how to reach {other:?}"),
+        };
+        for (from, to) in path {
+            supervisor
+                .store()
+                .record_transition(&task.id, from.clone(), to.clone(), "test", None)
+                .await
+                .unwrap();
+        }
+        task.id
+    }
+
+    /// `(platform, user_id, chat_id)` as persisted in `sup_tasks`.
+    async fn task_origin(
+        memory: &crate::memory::MemoryStore,
+        id: &str,
+    ) -> (String, String, Option<String>) {
+        let conn = memory.connection();
+        let conn = conn.lock().await;
+        conn.query_row(
+            "SELECT platform, user_id, chat_id FROM sup_tasks WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// The `owner_id` of the live execution-lease row for `id`, or `None`.
+    async fn lease_owner(memory: &crate::memory::MemoryStore, id: &str) -> Option<String> {
+        let conn = memory.connection();
+        let conn = conn.lock().await;
+        conn.query_row(
+            "SELECT owner_id FROM sup_execution_leases WHERE task_id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    /// Dispatch one command as the authorized actor and return whether the
+    /// dispatcher claimed it.
+    async fn run_command(
+        supervisor: &Supervisor,
+        sender: &RecordingSender,
+        cmd: &str,
+        arg: &str,
+    ) -> bool {
+        dispatch_supervisor_command(cmd, arg, &actor(), &[ALLOWED_USER_ID], supervisor, sender)
+            .await
+            .unwrap()
+    }
+
+    /// The published BotFather menu and the router's match arms must name the
+    /// same six commands. This compares the two lists rather than restating
+    /// either, so adding a command to one and not the other fails here.
+    #[test]
+    fn the_published_menu_and_the_router_name_the_same_commands() {
+        let mut published: Vec<String> = supervisor_commands()
+            .iter()
+            .map(|c| c.command.clone())
+            .collect();
+        let mut routed: Vec<String> = SUPERVISOR_COMMANDS.iter().map(|c| c.to_string()).collect();
+        assert!(!published.is_empty());
+        published.sort();
+        routed.sort();
+        assert_eq!(published, routed);
+
+        let all: Vec<String> = supported_commands()
+            .iter()
+            .map(|c| c.command.clone())
+            .collect();
+        for name in SUPERVISOR_COMMANDS {
+            assert!(
+                all.contains(&name.to_string()),
+                "supported_commands must publish /{name}: got {all:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervise_creates_a_task_and_records_the_telegram_origin() {
+        let (_dir, memory, supervisor) = test_supervisor();
+        let sender = RecordingSender::default();
+
+        assert!(run_command(&supervisor, &sender, "supervise", "summarize the readme").await);
+
+        let reply = sender.only_text();
+        assert!(
+            reply.contains("Supervisor task"),
+            "unexpected reply: {reply}"
+        );
+        assert!(
+            reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+            "reply must be bounded: {reply}"
+        );
+        assert_eq!(sender.chats(), vec![ACTOR_CHAT_ID.to_string()]);
+
+        let tasks = supervisor.store().list_recent(10).await.unwrap();
+        assert_eq!(tasks.len(), 1, "supervise must create exactly one task");
+        assert!(
+            reply.contains(&tasks[0].id),
+            "the reply must name the task: {reply}"
+        );
+        // Nothing runs on `/supervise`, so the reply must name the command that
+        // does. "summarize the readme" is `GeneralAssistant`/`Low`, which the
+        // default policy auto-executes — and `submit` still parks it in `Route`.
+        assert_eq!(
+            supervisor.state(&tasks[0].id).await.unwrap(),
+            TaskStatus::Route
+        );
+        assert!(
+            reply.contains(&format!("/approve {}", tasks[0].id)),
+            "the reply must name the next step: {reply}"
+        );
+
+        // The origin is the actor, and the chat is the actor's chat — not the
+        // user id, which this test deliberately made different.
+        let (platform, user_id, chat_id) = task_origin(&memory, &tasks[0].id).await;
+        assert_eq!(platform, "telegram");
+        assert_eq!(user_id, ALLOWED_USER_ID.to_string());
+        assert_eq!(chat_id.as_deref(), Some(ACTOR_CHAT_ID));
+    }
+
+    /// The ambiguous path end to end: "do the thing" is `Unknown`/`Low`, which
+    /// the default policy routes to `Clarify`, and the reply must hand the user
+    /// the `/clarify` command rather than leaving the task parked silently.
+    #[tokio::test]
+    async fn supervise_names_the_clarify_command_for_an_ambiguous_request() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let sender = RecordingSender::default();
+
+        assert!(run_command(&supervisor, &sender, "supervise", "do the thing").await);
+        let reply = sender.only_text();
+
+        let tasks = supervisor.store().list_recent(10).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            supervisor.state(&tasks[0].id).await.unwrap(),
+            TaskStatus::Clarify,
+            "the premise: an ambiguous request is parked in Clarify"
+        );
+        assert!(
+            reply.contains(&format!("/clarify {}", tasks[0].id)),
+            "the reply must name /clarify: {reply}"
+        );
+        assert!(
+            reply.contains("CLARIFY"),
+            "the reply must name the state: {reply}"
+        );
+        assert!(
+            reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+            "the reply must be bounded: {reply}"
+        );
+    }
+
+    /// Every `SubmitOutcome` variant names the command that moves the task on.
+    ///
+    /// The three variants are constructed here rather than driven through
+    /// `submit`, because `NeedsApproval` is unreachable with the default policy
+    /// thresholds the test supervisor uses (the heuristic classifier never emits
+    /// `High` risk) — and the point of this test is the reply for each variant,
+    /// not how a variant is reached. The two reachable variants are covered end
+    /// to end by the tests above.
+    #[test]
+    fn every_submit_outcome_names_the_command_that_moves_it_forward() {
+        let cases = [
+            (
+                SubmitOutcome::AutoExecutePlanned {
+                    task_id: "t-1".into(),
+                },
+                "/approve t-1",
+            ),
+            (
+                SubmitOutcome::NeedsClarification {
+                    task_id: "t-2".into(),
+                    question: "which parser?".into(),
+                },
+                "/clarify t-2",
+            ),
+            (
+                SubmitOutcome::NeedsApproval {
+                    task_id: "t-3".into(),
+                    reason: "high-risk task requires approval".into(),
+                },
+                "/approve t-3",
+            ),
+        ];
+
+        for (outcome, command) in cases {
+            let reply = submit_reply(&outcome, "ROUTE");
+            assert!(
+                reply.contains(command),
+                "the reply for {outcome:?} must name `{command}`: {reply}"
+            );
+            assert!(
+                reply.contains(&outcome.task_id()),
+                "the reply must name the task: {reply}"
+            );
+            assert!(
+                reply.contains("ROUTE"),
+                "the reply must name the state: {reply}"
+            );
+            assert!(
+                reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+                "the reply must be bounded: {reply}"
+            );
+            assert!(
+                !reply.contains("anyhow") && !reply.contains("/home/"),
+                "the reply must not carry a chain or a path: {reply}"
+            );
+        }
+
+        // The approval variant also offers the way out, because `submit` funnels
+        // `UseFallbackBackend` and `StopAndReport` policy decisions into it and
+        // the dispatcher cannot tell which one it is holding.
+        let reply = submit_reply(
+            &SubmitOutcome::NeedsApproval {
+                task_id: "t-4".into(),
+                reason: "StopAndReport(\"nothing to do\")".into(),
+            },
+            "ROUTE",
+        );
+        assert!(reply.contains("/cancel t-4"), "got {reply}");
+        assert!(reply.contains("StopAndReport"), "got {reply}");
+    }
+
+    /// Why [`bounded_reply`] exists even though no reachable reply is long.
+    ///
+    /// Every reply the dispatcher composes from the store is built from capped
+    /// parts, so `bounded_reply` cannot fire on those paths and deleting its call
+    /// from `dispatch_supervisor_command` leaves the suite green. This test pins
+    /// the one input that is *not* capped by the dispatcher — a `SubmitOutcome`'s
+    /// `question`/`reason`, which is policy text — and shows both halves: the raw
+    /// reply really does overflow Telegram's budget, and the composition the
+    /// dispatcher applies (`bounded_reply(&redact(reply))`) brings it back inside
+    /// it. It is deliberately a unit test over the reply builders: the policy the
+    /// test supervisor uses cannot emit long text, so the dispatcher line itself
+    /// is not drivable today, and this is the closest honest pin.
+    #[test]
+    fn a_long_submit_outcome_would_overflow_the_reply_budget() {
+        let outcome = SubmitOutcome::NeedsClarification {
+            task_id: "t-long".into(),
+            question: "why? ".repeat(1000),
+        };
+        let raw = submit_reply(&outcome, "CLARIFY");
+        assert!(
+            raw.chars().count() > MAX_SUPERVISOR_REPLY_CHARS,
+            "an uncapped question must be able to overflow the budget, got {}",
+            raw.chars().count()
+        );
+
+        let sent = bounded_reply(&crate::supervisor::redact::redact(&raw));
+        assert!(
+            sent.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+            "the dispatcher's composition must clip it, got {}",
+            sent.chars().count()
+        );
+        assert!(
+            sent.ends_with("…(truncated)"),
+            "the clipped reply must say so: {}",
+            &sent[sent.len().saturating_sub(40)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_lists_each_id_with_its_state_and_caps_the_listing() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        for _ in 0..(MAX_TASKS_LISTED + 5) {
+            let task = Task::new("a task", "req");
+            supervisor
+                .store()
+                .create(&task, "telegram", "42", None)
+                .await
+                .unwrap();
+        }
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "tasks", "").await);
+        let reply = sender.only_text();
+
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(
+            lines.len(),
+            MAX_TASKS_LISTED + 1,
+            "one header plus at most MAX_TASKS_LISTED rows: {reply}"
+        );
+        // Every row shows an id and a state, and the listing stops short of the
+        // store's 20-task ceiling.
+        let listed: Vec<String> = supervisor
+            .store()
+            .list_recent(MAX_TASKS_LISTED)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        for (row, id) in lines[1..].iter().zip(listed.iter()) {
+            assert!(row.contains(id.as_str()), "row must carry its id: {row}");
+            assert!(row.contains("INTAKE"), "row must carry its state: {row}");
+        }
+        assert!(
+            reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+            "the listing must stay inside the reply budget: {}",
+            reply.chars().count()
+        );
+    }
+
+    /// A store row whose title is far longer than `IntakeRouter::normalize`
+    /// would ever produce. The title cap is 80 characters at intake; this
+    /// exercises the *display* cap, which must hold for any row the store holds
+    /// rather than only for rows this process wrote.
+    ///
+    /// The two caps compose: [`MAX_TASKS_LISTED`] rows of
+    /// [`MAX_TASK_TITLE_CHARS`] titles fit inside
+    /// [`MAX_SUPERVISOR_REPLY_CHARS`] with room to spare, so a `/tasks` reply is
+    /// never truncated at all — the outcome requirement 5 asks for.
+    ///
+    /// # `bounded_reply` is a backstop, not a guard on a live path
+    ///
+    /// Every reply this dispatcher can currently build is composed only of
+    /// capped parts: task ids at most [`MAX_TASK_ID_CHARS`], titles at most
+    /// [`MAX_TASK_TITLE_CHARS`] after redaction, [`MAX_TASKS_LISTED`] rows, a
+    /// fixed fault sentence, and the fixed usage/refusal sentences. The largest
+    /// reachable reply is therefore well inside
+    /// [`MAX_SUPERVISOR_REPLY_CHARS`], which means the `bounded_reply` call in
+    /// `dispatch_supervisor_command` cannot fire today and no test can drive a
+    /// real reply past the budget — deleting that call leaves the suite green.
+    /// It is kept because it is the only thing standing between a future reply
+    /// and Telegram's 4096-character limit: the one unbounded input is a
+    /// `SubmitOutcome`'s `question`/`reason`, which
+    /// `a_long_submit_outcome_would_overflow_the_reply_budget` shows does exceed
+    /// the budget when it is long, and which only policy text currently keeps
+    /// short. If a later change removes one of the caps above, that test is the
+    /// one that fails first.
+    #[tokio::test]
+    async fn a_full_listing_with_maximal_titles_stays_inside_the_reply_budget() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        for n in 0..MAX_TASKS_LISTED {
+            let task = Task::new(&format!("task {n} {}", "x".repeat(600)), "req");
+            supervisor
+                .store()
+                .create(&task, "telegram", "42", None)
+                .await
+                .unwrap();
+        }
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "tasks", "").await);
+        let reply = sender.only_text();
+
+        assert!(
+            reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+            "a full listing must fit the budget, got {} characters",
+            reply.chars().count()
+        );
+        assert!(
+            !reply.ends_with("…(truncated)"),
+            "a full listing must not need truncating: {reply}"
+        );
+        assert_eq!(
+            reply.lines().count(),
+            MAX_TASKS_LISTED + 1,
+            "every listed task must be shown in full"
+        );
+        // Each row carries a bounded title, so no row is unbounded. The row is
+        // `- {id}  {state}  {title}`; the id is a UUID and the state name is at
+        // most `PREPAREWORKSPACE`.
+        let row_budget = 2 + MAX_TASK_ID_CHARS + 2 + 20 + 2 + MAX_TASK_TITLE_CHARS + 1;
+        for row in reply.lines().skip(1) {
+            assert!(
+                row.chars().count() <= row_budget,
+                "row is too long ({} > {row_budget}): {row}",
+                row.chars().count()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_runs_a_paused_task_and_releases_its_lease() {
+        let (_dir, memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Paused).await;
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "resume", &id).await);
+        let reply = sender.only_text();
+        assert!(reply.contains("resumed"), "unexpected reply: {reply}");
+        assert!(reply.contains(&id), "the reply must name the task: {reply}");
+
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Done);
+        let trail = supervisor.store().transitions(&id).await.unwrap();
+        assert!(
+            trail
+                .iter()
+                .any(|r| r.from == TaskStatus::Paused && r.to == TaskStatus::Execute),
+            "resume must record Paused -> Execute, got {trail:?}"
+        );
+        // `execute_now` released its execution lease on the normal path.
+        assert!(lease_owner(&memory, &id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_a_pending_task_cancelled() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Route).await;
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "cancel", &id).await);
+        let reply = sender.only_text();
+        assert!(reply.contains("cancelled"), "unexpected reply: {reply}");
+
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn approve_runs_a_task_awaiting_approval() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Route).await;
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "approve", &id).await);
+        let reply = sender.only_text();
+        assert!(reply.contains("approved"), "unexpected reply: {reply}");
+
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Done);
+        let trail = supervisor.store().transitions(&id).await.unwrap();
+        assert!(
+            trail
+                .iter()
+                .any(|r| r.from == TaskStatus::Route && r.to == TaskStatus::Execute),
+            "approve must record Route -> Execute, got {trail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clarify_records_the_reason_and_resumes_a_clarify_task() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Clarify).await;
+
+        let sender = RecordingSender::default();
+        assert!(
+            run_command(
+                &supervisor,
+                &sender,
+                "clarify",
+                &format!("{id} it is about the parser")
+            )
+            .await
+        );
+        let reply = sender.only_text();
+        assert!(
+            reply.contains("Clarification recorded"),
+            "unexpected reply: {reply}"
+        );
+
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Done);
+        let trail = supervisor.store().transitions(&id).await.unwrap();
+        let row = trail
+            .iter()
+            .find(|r| r.from == TaskStatus::Clarify && r.to == TaskStatus::Execute)
+            .expect("clarify must record Clarify -> Execute");
+        assert_eq!(row.reason.as_deref(), Some("it is about the parser"));
+    }
+
+    /// The half of `/clarify` that matters most: a task that is **not** in
+    /// `Clarify` is refused without running anything. Without the exact-state
+    /// gate, `/clarify` would be an approval in disguise for a task parked in
+    /// `Route`.
+    #[tokio::test]
+    async fn clarify_refuses_a_task_that_is_not_in_clarify() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Route).await;
+        let before = supervisor.store().transitions(&id).await.unwrap().len();
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "clarify", &format!("{id} just do it")).await);
+        let reply = sender.only_text();
+        assert!(
+            reply.contains("CLARIFY") && reply.contains("ROUTE"),
+            "the conflict must name the real state: {reply}"
+        );
+
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Route);
+        assert_eq!(
+            supervisor.store().transitions(&id).await.unwrap().len(),
+            before,
+            "a refused clarify must write nothing"
+        );
+    }
+
+    /// A `Done` task is refused by every lifecycle command, and each refusal
+    /// names the state — so a user can tell "wrong state" from "no such task".
+    #[tokio::test]
+    async fn a_finished_task_is_refused_by_every_lifecycle_command() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        for cmd in ["resume", "cancel", "approve"] {
+            let id = task_in(&supervisor, TaskStatus::Done).await;
+            let before = supervisor.store().transitions(&id).await.unwrap().len();
+
+            let sender = RecordingSender::default();
+            assert!(run_command(&supervisor, &sender, cmd, &id).await);
+            let reply = sender.only_text();
+            assert!(
+                reply.contains("DONE"),
+                "/{cmd} must name the state, got {reply}"
+            );
+            assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Done);
+            assert_eq!(
+                supervisor.store().transitions(&id).await.unwrap().len(),
+                before,
+                "/{cmd} must not write on a refusal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_cancel_of_a_cancelled_task_writes_nothing_extra() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Route).await;
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "cancel", &id).await);
+        let after_first = supervisor.store().transitions(&id).await.unwrap().len();
+
+        assert!(run_command(&supervisor, &sender, "cancel", &id).await);
+        let texts = sender.texts();
+        assert_eq!(texts.len(), 2, "one reply per invocation: {texts:?}");
+        assert!(
+            texts[1].contains("CANCELLED"),
+            "the second cancel is a conflict: {}",
+            texts[1]
+        );
+        assert_eq!(
+            supervisor.store().transitions(&id).await.unwrap().len(),
+            after_first,
+            "a refused cancel must not add an audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_user_gets_no_supervisor_action_and_no_reply() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Route).await;
+        let before = supervisor.store().transitions(&id).await.unwrap().len();
+        let sender = RecordingSender::default();
+
+        for (cmd, arg) in [
+            ("supervise", "exfiltrate the config"),
+            ("tasks", ""),
+            ("resume", id.as_str()),
+            ("cancel", id.as_str()),
+            ("approve", id.as_str()),
+            ("clarify", "some-id answer"),
+        ] {
+            let handled = dispatch_supervisor_command(
+                cmd,
+                arg,
+                &intruder(),
+                &[ALLOWED_USER_ID],
+                &supervisor,
+                &sender,
+            )
+            .await
+            .unwrap();
+            assert!(
+                handled,
+                "/{cmd} must still be claimed as a supervisor command"
+            );
+        }
+
+        assert!(
+            sender.texts().is_empty(),
+            "an unauthorized user must receive nothing at all: {:?}",
+            sender.texts()
+        );
+        assert_eq!(
+            supervisor.store().list_recent(10).await.unwrap().len(),
+            1,
+            "no task may have been submitted"
+        );
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Route);
+        assert_eq!(
+            supervisor.store().transitions(&id).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_arguments_and_malformed_ids_are_refused_with_a_bounded_reply() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let long_id = "a".repeat(MAX_TASK_ID_CHARS + 1);
+
+        for (cmd, arg, needle) in [
+            ("supervise", "", "Usage: /supervise"),
+            ("supervise", "   \n  ", "Usage: /supervise"),
+            ("resume", "", "Usage: /resume"),
+            ("cancel", "", "Usage: /cancel"),
+            ("approve", "", "Usage: /approve"),
+            ("clarify", "", "Usage: /clarify"),
+            ("clarify", "abc", "Usage: /clarify"),
+            ("clarify", "abc   ", "Usage: /clarify"),
+            ("resume", "../../etc/passwd", INVALID_TASK_ID),
+            ("cancel", "id;rm -rf /", INVALID_TASK_ID),
+            ("approve", "with space", INVALID_TASK_ID),
+            ("resume", long_id.as_str(), INVALID_TASK_ID),
+            ("clarify", "../../etc/passwd answer", INVALID_TASK_ID),
+        ] {
+            let sender = RecordingSender::default();
+            assert!(run_command(&supervisor, &sender, cmd, arg).await);
+            let reply = sender.only_text();
+            assert!(
+                reply.starts_with(needle),
+                "/{cmd} {arg:?} answered {reply:?}, expected it to start with {needle:?}"
+            );
+            assert!(
+                reply.chars().count() < 200,
+                "/{cmd} must answer concisely, got {reply:?}"
+            );
+            assert!(
+                !reply.contains(&long_id),
+                "/{cmd} must not echo an oversized id"
+            );
+        }
+
+        assert!(
+            supervisor.store().list_recent(10).await.unwrap().is_empty(),
+            "no malformed invocation may reach the supervisor"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_text_is_refused_without_echoing_it() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let too_long = "s".repeat(MAX_SUPERVISE_TEXT_CHARS + 1);
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "supervise", &too_long).await);
+        let reply = sender.only_text();
+        assert!(
+            reply.contains(&MAX_SUPERVISE_TEXT_CHARS.to_string()),
+            "the refusal must state the limit: {reply}"
+        );
+        assert!(
+            !reply.contains("ssssss"),
+            "the refusal must not echo the text: {reply}"
+        );
+        assert!(reply.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS);
+        assert!(supervisor.store().list_recent(10).await.unwrap().is_empty());
+
+        // `/clarify` carries the same bound.
+        let id = task_in(&supervisor, TaskStatus::Clarify).await;
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "clarify", &format!("{id} {too_long}")).await);
+        let reply = sender.only_text();
+        assert!(!reply.contains("ssssss"), "got {reply}");
+        assert_eq!(
+            supervisor.state(&id).await.unwrap(),
+            TaskStatus::Clarify,
+            "an oversized answer must not resume the task"
+        );
+    }
+
+    /// The boundary itself: exactly the limit is accepted, one character more is
+    /// not.
+    #[tokio::test]
+    async fn text_at_exactly_the_limit_is_accepted() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let at_limit = "s".repeat(MAX_SUPERVISE_TEXT_CHARS);
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "supervise", &at_limit).await);
+        assert!(
+            sender.only_text().contains("Supervisor task"),
+            "text at the limit must be accepted"
+        );
+        assert_eq!(supervisor.store().list_recent(10).await.unwrap().len(), 1);
+    }
+
+    /// Not-found, conflict and fault are three different sentences. A user who
+    /// cannot tell them apart cannot tell a typo from a race from a broken
+    /// deployment.
+    #[tokio::test]
+    async fn not_found_conflict_and_fault_are_three_different_answers() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+
+        let sender = RecordingSender::default();
+        assert!(
+            run_command(
+                &supervisor,
+                &sender,
+                "resume",
+                "0f1c2d3e-0000-4000-8000-000000000000"
+            )
+            .await
+        );
+        let missing = sender.only_text();
+        assert!(
+            missing.starts_with("No supervisor task with id"),
+            "{missing}"
+        );
+
+        let id = task_in(&supervisor, TaskStatus::Done).await;
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "resume", &id).await);
+        let conflict = sender.only_text();
+        assert!(conflict.starts_with("Cannot resume"), "{conflict}");
+
+        let fault = fault(
+            "read a supervisor task",
+            &anyhow::anyhow!("no such table: sup_tasks at /home/op/.haos-green/haos-green.db"),
+        );
+        assert_eq!(fault, SUPERVISOR_FAULT);
+
+        assert_ne!(missing, conflict);
+        assert_ne!(missing, fault);
+        assert_ne!(conflict, fault);
+        // The fault is a fixed sentence: no error chain, no path.
+        assert!(!fault.contains("sup_tasks"), "{fault}");
+        assert!(!fault.contains("/home/op"), "{fault}");
+        assert!(!fault.contains(".db"), "{fault}");
+    }
+
+    /// Task text is user-supplied and lands in a reply, so it goes through
+    /// `supervisor::redact` — the same scrubber every artifact write uses.
+    #[tokio::test]
+    async fn task_text_in_a_reply_is_redacted() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        // Assembled at runtime, so the contiguous `key=value` spelling never
+        // appears in this file's source: a future grep for the needle must not
+        // trip on the test that defines it.
+        let title = format!("deploy with {}={} now", "api_key", LEAKY_VALUE);
+        let task = Task::new(&title, "req");
+        supervisor
+            .store()
+            .create(&task, "telegram", "42", None)
+            .await
+            .unwrap();
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "tasks", "").await);
+        let reply = sender.only_text();
+        assert!(
+            !reply.contains(LEAKY_VALUE),
+            "a credential-shaped value must be redacted: {reply}"
+        );
+        assert!(reply.contains(&task.id), "the id is still listed: {reply}");
+    }
+
+    /// The clarification text is free text a human typed, and
+    /// `record_transition` stores the reason verbatim — so it is redacted
+    /// before it reaches the audit row.
+    #[tokio::test]
+    async fn a_clarification_answer_is_redacted_before_it_is_recorded() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Clarify).await;
+
+        let sender = RecordingSender::default();
+        let answer = format!("{id} {}={}", "token", LEAKY_VALUE);
+        assert!(run_command(&supervisor, &sender, "clarify", &answer).await);
+
+        let trail = supervisor.store().transitions(&id).await.unwrap();
+        let row = trail
+            .iter()
+            .find(|r| r.from == TaskStatus::Clarify && r.to == TaskStatus::Execute)
+            .expect("clarify must record Clarify -> Execute");
+        assert!(
+            !row.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(LEAKY_VALUE),
+            "the audit reason must be redacted: {:?}",
+            row.reason
+        );
+    }
+
+    /// Extra whitespace is normal input, not a malformed argument: Telegram
+    /// users type it, and `parse_command` already trims the outer edges.
+    #[tokio::test]
+    async fn surrounding_whitespace_is_tolerated() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let id = task_in(&supervisor, TaskStatus::Route).await;
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "cancel", &format!("   {id}   ")).await);
+        assert_eq!(supervisor.state(&id).await.unwrap(), TaskStatus::Cancelled);
+
+        let sender = RecordingSender::default();
+        assert!(run_command(&supervisor, &sender, "supervise", "  trim   me  ").await);
+        assert!(sender.only_text().contains("Supervisor task"));
+    }
+
+    /// The dispatcher is transparent to every other command: it answers
+    /// `false` and sends nothing, so `handle_message` falls through to the
+    /// branches that own them.
+    #[tokio::test]
+    async fn every_other_command_falls_through_untouched() {
+        let (_dir, _memory, supervisor) = test_supervisor();
+        let sender = RecordingSender::default();
+
+        for (cmd, arg) in [
+            ("start", ""),
+            ("clear", ""),
+            ("tools", ""),
+            ("models", "claude"),
+            ("selfupgrade", "main"),
+            ("stop", ""),
+            ("supervis", "typo"),
+            ("", ""),
+        ] {
+            assert!(
+                !run_command(&supervisor, &sender, cmd, arg).await,
+                "/{cmd} must not be claimed by the supervisor dispatcher"
+            );
+        }
+        assert!(sender.texts().is_empty());
+    }
+
+    #[test]
+    fn bounded_reply_keeps_short_text_and_cuts_long_text_on_a_line() {
+        assert_eq!(bounded_reply("short"), "short");
+
+        // Each row is a distinct whole line, so a cut that lands mid-row is
+        // visible rather than merely shorter.
+        let rows: Vec<String> = (0..200)
+            .map(|n| format!("- row {n} {}", "y".repeat(60)))
+            .collect();
+        let long = rows.join("\n");
+        assert!(
+            long.chars().count() > MAX_SUPERVISOR_REPLY_CHARS * 2,
+            "the fixture must be well over the budget, got {}",
+            long.chars().count()
+        );
+
+        let bounded = bounded_reply(&long);
+        assert!(bounded.ends_with("…(truncated)"), "{bounded}");
+        let kept = bounded.trim_end_matches("…(truncated)");
+        assert!(
+            kept.chars().count() <= MAX_SUPERVISOR_REPLY_CHARS,
+            "the kept part must fit the budget, got {}",
+            kept.chars().count()
+        );
+        assert!(!kept.is_empty());
+        for line in kept.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                rows.contains(&line.to_string()),
+                "whole rows only: {line:?}"
+            );
+        }
+        // Multi-byte input must not panic and must not split a character.
+        let accented = "é".repeat(MAX_SUPERVISOR_REPLY_CHARS * 2);
+        let bounded = bounded_reply(&accented);
+        assert!(bounded.ends_with("…(truncated)"));
+        assert!(bounded.starts_with('é'));
+    }
+
+    #[test]
+    fn truncate_chars_counts_characters_not_bytes() {
+        assert_eq!(truncate_chars("abc", 5), "abc");
+        // Multi-byte input must not panic and must not split a character.
+        let accented = "é".repeat(10);
+        let cut = truncate_chars(&accented, 4);
+        assert_eq!(cut.chars().count(), 5);
+        assert!(cut.starts_with("éééé"));
+    }
+
+    #[test]
+    fn state_name_uses_the_persisted_spelling() {
+        assert_eq!(state_name(&TaskStatus::Clarify), "CLARIFY");
+        assert_eq!(
+            state_name(&TaskStatus::PrepareWorkspace),
+            "PREPAREWORKSPACE"
+        );
+        assert_eq!(state_name(&TaskStatus::Done), "DONE");
+    }
+
+    #[test]
+    fn validated_task_id_accepts_uuids_and_refuses_everything_else() {
+        let uuid = "0f1c2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f";
+        assert_eq!(validated_task_id(uuid), Some(uuid));
+        assert_eq!(validated_task_id(&format!("  {uuid}  ")), Some(uuid));
+        assert_eq!(validated_task_id(""), None);
+        assert_eq!(validated_task_id("   "), None);
+        assert_eq!(validated_task_id("with space"), None);
+        assert_eq!(validated_task_id("../etc/passwd"), None);
+        assert_eq!(validated_task_id("id\nmore"), None);
+        assert_eq!(validated_task_id("id@mention"), None);
+        assert_eq!(validated_task_id(&"a".repeat(MAX_TASK_ID_CHARS + 1)), None);
+        assert_eq!(
+            validated_task_id(&"a".repeat(MAX_TASK_ID_CHARS)),
+            Some("a".repeat(MAX_TASK_ID_CHARS).as_str())
+        );
     }
 }
