@@ -4440,6 +4440,25 @@ run `cargo clean -p haos-green` before trusting any later result — the
 | apply the cap on the `Unconfined` arm only, leaving the sandboxed arm unbounded | live test 9 — Task 6's unit test stays green, which is why the live test exists |
 | make the `Unconfined` arm of Layer 1 fall through to the grant term | `an_unconfined_shell_task_declaring_an_ungranted_capability_is_not_gated` (Task 8). Task 7's `a_shell_task_is_not_gated_when_the_operator_chose_none` stays green — it declares nothing |
 
+**Results (run in a scratch copy with its own `CARGO_TARGET_DIR`, per the
+`CLAUDE.md` rule).** Every row is caught once the right test is run. Two rows
+named the wrong test, two named tests that do not exist, and four are stale:
+
+| Row | Outcome |
+|---|---|
+| `--version` floor, `--clearenv` order, `--disable-userns`, `--unshare-user`, `/lib64` symlink, both certificate binds, `/etc/ca-certificates` alone, `--die-with-parent`, `--share-net` under a grant, byte cap, Layer-2 refusal, `SupervisorConfig::validate`, `ShellSandboxConfig::validate` | caught, as named |
+| `drop --hostname` | caught — `the_host_hostname_is_not_readable` fails, and **only** that one |
+| `drop --die-with-parent` | caught — `killing_the_supervisor_leaves_no_descendant` fails, and **only** that one |
+| `drop both certificate binds` / `drop /etc/ca-certificates only` | both caught by `https_works_under_a_network_grant`, which is what proves the second bind is load-bearing rather than redundant |
+| `drop --new-session` → "live test 1" | **the live suite does not catch this** (0 failures). The static argv test `argv_detaches_the_terminal_and_dies_with_the_parent` does. The row names the wrong test; there is no coverage gap. |
+| set the sandbox root to `/` | caught by `refuses_the_filesystem_root_as_the_root`, but the guard is the explicit `root == Path::new("/")` check in `resolve_job_dir` — **not** `Grants::resolve_path`, where this row was first applied. `containment_refusal`'s `IsTheRoot` arm is a second, distinct guard covered by `containment_is_decided_by_path_components_not_by_text`. |
+| `/deny` after `/allow` → `deny_revokes_immediately` | **that test does not exist.** The property is covered by `the_grant_commands_refuse_grant_list_and_revoke` (telegram). |
+| write the grant without the audit row → `every_grant_and_revocation_writes_a_sup_transitions_row` | **that test does not exist.** Covered by `a_grant_writes_an_audit_row_that_belongs_to_no_task`. |
+| `grant /var/lib, then declare a write to /var/lib/docker/x` | **stale** — `declared_grants` was deleted (revision 6). |
+| `remove the Layer-2 coverage refusal` | **stale** — the refusal was deleted with it. |
+| `Isolation::needs_approval()` | **stale** — the predicate was deleted in Task 8, as the row itself says. |
+| `Unconfined` arm falls through to the grant term | **stale** — the grant term is gone. |
+
 - [ ] **Step 4: Correct the documentation**
 
 - `CLAUDE.md`: the security section's claim that file and command operations are
