@@ -66,6 +66,21 @@ async fn run_sandboxed(cmd: &str, grants: Grants) -> JobOutput {
         .expect("the sandboxed run returned an error rather than a JobOutput")
 }
 
+/// A token the command echoes **last**, so an assertion can tell "the sandbox
+/// refused to read this" from "nothing ever ran".
+///
+/// Every test below that asserts only the *absence* of a string needs this.
+/// Without it a completely broken launch — no `bwrap`, a bad argv, a refused
+/// job directory — produces an error message containing none of the forbidden
+/// strings, and the test reports `ok` while proving nothing. Five of the nine
+/// tests here were in exactly that state.
+///
+/// The token deliberately contains none of the names test 3 greps for
+/// (`HAOS_GREEN`, `OPENROUTER`, `TELEGRAM`, `A2A`): the first spelling was
+/// `HAOS_GREEN_LIVE_RAN=yes`, and test 3 caught it as a leak — which is the
+/// new assertion doing exactly its job.
+const RAN: &str = "LIVE_RAN=yes";
+
 /// Everything the sandbox produced, so an assertion can search output *and*
 /// errors without caring which stream a message arrived on.
 fn all_text(out: &JobOutput) -> String {
@@ -88,7 +103,15 @@ async fn the_host_hostname_is_not_readable() {
         "this test needs /etc/hostname on the host"
     );
 
-    let out = run_sandboxed("cat /etc/hostname; hostname", Grants::default()).await;
+    let out = run_sandboxed(
+        &format!("cat /etc/hostname; hostname; echo {RAN}"),
+        Grants::default(),
+    )
+    .await;
+    assert!(
+        all_text(&out).contains(RAN),
+        "the command never ran, so this test proves nothing: {out:?}"
+    );
     assert!(
         !all_text(&out).contains(host),
         "the sandbox leaked the host hostname {host:?}: {out:?}"
@@ -101,12 +124,37 @@ async fn the_host_hostname_is_not_readable() {
 #[ignore = "requires HAOS_GREEN_SHELL_LIVE=1 and a working bubblewrap >= 0.12.0"]
 async fn the_supervisor_config_is_unreachable() {
     skip_unless_live!();
-    let out = run_sandboxed(
-        "cat ~/.haos-green/config.toml 2>&1; cat /root/.haos-green/config.toml 2>&1",
-        Grants::default(),
+    // A **canary** rather than the real config: this host may have no
+    // `~/.haos-green/config.toml`, and a test that proves a non-existent file is
+    // unreadable proves nothing. The canary sits at the sandbox root, which the
+    // argv does not bind, and its existence on the host is asserted first — so
+    // the failure it detects is a real one.
+    let root = tempfile::tempdir().unwrap();
+    let canary = root.path().join("config.toml");
+    std::fs::write(
+        &canary,
+        "api_key = \"CANARY-NOT-A-REAL-KEY\"\nbot_token = \"x\"\n",
     )
-    .await;
+    .unwrap();
+    assert!(canary.exists(), "the canary must exist on the host");
+
+    let mut job = Job::new("live", JobType::ShellJob, "shell", "live");
+    job.prompt = Some(format!("cat '{}' 2>&1; echo {RAN}", canary.display()));
+    job.timeout_secs = 60;
+    let backend = ShellBackend::new(root.path().into()).with_isolation(Isolation::Sandboxed);
+    let out = tokio::time::timeout(TEST_BOUND, backend.run(&mut job, &RunContext::new()))
+        .await
+        .expect("the sandboxed run did not finish within the test bound")
+        .expect("the sandboxed run returned an error rather than a JobOutput");
     let text = all_text(&out);
+    assert!(
+        text.contains(RAN),
+        "the command never ran, so this test proves nothing: {out:?}"
+    );
+    assert!(
+        !text.contains("CANARY-NOT-A-REAL-KEY"),
+        "the sandbox read a file at its own root: {out:?}"
+    );
     assert!(
         !text.contains("api_key") && !text.contains("bot_token"),
         "the sandbox reached the supervisor config: {out:?}"
@@ -118,8 +166,12 @@ async fn the_supervisor_config_is_unreachable() {
 #[ignore = "requires HAOS_GREEN_SHELL_LIVE=1 and a working bubblewrap >= 0.12.0"]
 async fn the_supervisor_environment_is_not_inherited() {
     skip_unless_live!();
-    let out = run_sandboxed("env", Grants::default()).await;
+    let out = run_sandboxed(&format!("env; echo {RAN}"), Grants::default()).await;
     let text = all_text(&out);
+    assert!(
+        text.contains(RAN),
+        "the command never ran, so this test proves nothing: {out:?}"
+    );
     for leaked in ["HAOS_GREEN", "OPENROUTER", "TELEGRAM", "A2A"] {
         assert!(
             !text.contains(leaked),
@@ -134,9 +186,29 @@ async fn the_supervisor_environment_is_not_inherited() {
 #[ignore = "requires HAOS_GREEN_SHELL_LIVE=1 and a working bubblewrap >= 0.12.0"]
 async fn nested_user_namespaces_are_refused() {
     skip_unless_live!();
-    let out = run_sandboxed("unshare --user true 2>&1; echo exit=$?", Grants::default()).await;
+    // `command -v` first: without it an absent `unshare` makes `$?` 127, which
+    // is not 0 either, so the test would pass on a sandbox that never ran the
+    // probe. `NO_UNSHARE` turns that into a visible failure instead.
+    let out = run_sandboxed(
+        &format!("command -v unshare >/dev/null 2>&1 && {{ unshare --user true 2>&1; echo exit=$?; }} || echo NO_UNSHARE; echo {RAN}"),
+        Grants::default(),
+    )
+    .await;
+    let text = all_text(&out);
     assert!(
-        !all_text(&out).contains("exit=0"),
+        text.contains(RAN),
+        "the command never ran, so this test proves nothing: {out:?}"
+    );
+    assert!(
+        !text.contains("NO_UNSHARE"),
+        "the probe could not run, so this test proves nothing: {out:?}"
+    );
+    assert!(
+        text.contains("exit="),
+        "the probe produced no exit status: {out:?}"
+    );
+    assert!(
+        !text.contains("exit=0"),
         "a nested user namespace succeeded inside the sandbox: {out:?}"
     );
 }
@@ -203,9 +275,26 @@ async fn loopback_is_unreachable_without_the_network_grant_and_reachable_with_it
 #[ignore = "requires HAOS_GREEN_SHELL_LIVE=1 and a working bubblewrap >= 0.12.0"]
 async fn the_host_passwd_file_is_unreadable() {
     skip_unless_live!();
-    let out = run_sandboxed("cat /etc/passwd 2>&1", Grants::default()).await;
+    // The precondition matters here too: `root:x:0:0` is the *host's* first
+    // line, so the test only means something if the host has that line.
+    let host = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
     assert!(
-        !all_text(&out).contains("root:x:0:0"),
+        host.contains("root:x:0:0"),
+        "this test needs /etc/passwd with a root entry on the host"
+    );
+
+    let out = run_sandboxed(
+        &format!("cat /etc/passwd 2>&1; echo {RAN}"),
+        Grants::default(),
+    )
+    .await;
+    let text = all_text(&out);
+    assert!(
+        text.contains(RAN),
+        "the command never ran, so this test proves nothing: {out:?}"
+    );
+    assert!(
+        !text.contains("root:x:0:0"),
         "the sandbox read the host /etc/passwd: {out:?}"
     );
 }
@@ -218,7 +307,12 @@ async fn killing_the_supervisor_leaves_no_descendant() {
     skip_unless_live!();
     let count_sleeps = || {
         std::process::Command::new("pgrep")
-            .args(["-c", "-x", "sleep"])
+            // `-f` with an anchored pattern, not `-x sleep`: counting every
+            // `sleep` on the host makes the test fail when an unrelated one
+            // starts, and — worse — pass when an unrelated one exits while the
+            // sandboxed `sleep 300` survives, which is the exact property the
+            // test exists to pin.
+            .args(["-c", "-f", "^sleep 300$"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default()
