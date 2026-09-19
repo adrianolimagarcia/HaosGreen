@@ -1672,9 +1672,33 @@ mod tests {
         );
     }
 
+    /// A **companion** to `supervisor_validate_refuses_an_unknown_sandbox_mode`
+    /// above, not a check of its own.
+    ///
+    /// `validate()` returning `Ok(())` is exactly what a `validate()` that had
+    /// stopped delegating to the shell block — or that never called it at all —
+    /// also returns, so this test passes under that mutant and pins nothing
+    /// about the delegation. The property it looks like it guards is only
+    /// observable from the **refusing** side, which is the test above.
+    ///
+    /// It is kept, and strengthened to the whole documented domain, because it
+    /// is the only place both accepted modes are shown to pass through
+    /// `SupervisorConfig::validate` rather than `ShellSandboxConfig::validate`
+    /// directly — i.e. that the delegating entry point does not reject a value
+    /// the shell block accepts.
     #[test]
     fn supervisor_validate_accepts_the_shipped_default() {
         assert!(SupervisorConfig::default().validate().is_ok());
+        for m in ["bwrap", "none"] {
+            let cfg = SupervisorConfig {
+                shell: ShellSandboxConfig { sandbox: m.into() },
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "{m} is a documented mode and must pass SupervisorConfig::validate"
+            );
+        }
     }
 
     /// The wiring test — the point of this task.
@@ -1719,6 +1743,19 @@ mod tests {
         assert!(
             err.contains("chroot"),
             "the error must quote the offending value, got: {err}"
+        );
+        // The **ordering** is the property, not the message. `Config::load`
+        // validates before `resolve()`, and `resolve()` is what creates the home
+        // tree — so a refusal that happens after it leaves a half-built home
+        // behind on a config this build cannot honour. Moving the
+        // `config.supervisor.validate()?` call below `config.resolve()?` keeps
+        // every other assertion in this file green and every message identical,
+        // which is why the ordering needs an assertion of its own: nothing else
+        // here observes it. `home` is the `[general].home` written above and is
+        // not created by the test.
+        assert!(
+            !home.exists(),
+            "load must refuse before resolve() creates anything"
         );
     }
 

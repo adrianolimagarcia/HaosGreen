@@ -1772,9 +1772,24 @@ git commit -m "feat(supervisor): validate the per-job sandbox directory"
 
 - [ ] **Step 1: Write the failing test**
 
+> **Refreshed to match what shipped (review finding F4).** This block used to
+> carry three of the eleven tests Task 4 actually added, and
+> `an_unknown_sandbox_mode_is_refused` asserted only `is_err()` where the
+> shipped test asserts the message names the key **and** quotes the offending
+> value. The two `Config::load` tests are the ones that pin the *wiring*, and
+> neither was in the draft — so a re-run of this task from the old block
+> reproduced the defect the task exists to fix: a `validate()` nothing calls.
+
 Add to the `tests` module in `src/config.rs`:
 
 ```rust
+    // ── [supervisor.shell] ──────────────────────────────────────────────────
+    //
+    // One key, and it decides whether a supervisor shell job runs inside a
+    // sandbox at all. It has exactly two ways to be taken wrongly: silently
+    // accepted when misspelled, and read as the operator's consent to run
+    // unconfined when misspelled. The tests below pin both.
+
     #[test]
     fn shell_sandbox_defaults_to_bwrap_with_an_empty_grant_set() {
         let c = ShellSandboxConfig::default();
@@ -1789,12 +1804,25 @@ Add to the `tests` module in `src/config.rs`:
     }
 
     #[test]
+    fn shell_sandbox_defaults_when_the_section_is_missing() {
+        // The overwhelming majority of installs have no `[supervisor.shell]`
+        // block. They must get the sandbox, not an unconfined default.
+        let cfg: Config = toml::from_str(base_toml()).unwrap();
+        assert_eq!(cfg.supervisor.shell.sandbox, "bwrap");
+        assert!(!cfg.supervisor.shell.is_unconfined());
+    }
+
+    #[test]
     fn an_unknown_sandbox_mode_is_refused() {
-        // No `..Default::default()`: `ShellSandboxConfig` has one field, so the
-        // update is a no-op and `clippy --all-targets -- -D warnings` rejects it
-        // (`needless_update`).
-        let c = ShellSandboxConfig { sandbox: "chroot".into() };
-        assert!(c.validate().is_err());
+        let c = ShellSandboxConfig {
+            sandbox: "chroot".into(),
+        };
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("sandbox"), "unexpected error: {err}");
+        assert!(
+            err.contains("chroot"),
+            "the error must quote the offending value, got: {err}"
+        );
     }
 
     #[test]
@@ -1803,6 +1831,188 @@ Add to the `tests` module in `src/config.rs`:
             let c = ShellSandboxConfig { sandbox: m.into() };
             assert!(c.validate().is_ok(), "{m} must be accepted");
         }
+    }
+
+    /// The failure mode this key must never have: a typo read as the operator's
+    /// standing consent to run shell jobs unconfined.
+    ///
+    /// `"none"` is consent to *nothing being gated* (spec §4), so the predicate
+    /// that answers "is this the consent?" has to be an equality against the
+    /// literal — never a `_` arm, and never `!= "bwrap"`, which is the same
+    /// mistake with the branches swapped.
+    #[test]
+    fn an_unknown_sandbox_mode_is_not_consent_to_run_unconfined() {
+        for m in [
+            "chroot", "None", "NONE", "none ", " none", "bwrap2", "no", "", "off", "false",
+        ] {
+            let c = ShellSandboxConfig { sandbox: m.into() };
+            assert!(
+                !c.is_unconfined(),
+                "{m:?} must not select the unconfined mode"
+            );
+        }
+        // And the literal does select it, or the key would be inert and the
+        // assertion above would hold for a predicate that is always false.
+        let c = ShellSandboxConfig {
+            sandbox: "none".into(),
+        };
+        assert!(c.is_unconfined());
+    }
+
+    #[test]
+    fn supervisor_validate_refuses_an_unknown_sandbox_mode() {
+        let cfg = SupervisorConfig {
+            shell: ShellSandboxConfig {
+                sandbox: "chroot".into(),
+            },
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("[supervisor.shell].sandbox"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A **companion** to `supervisor_validate_refuses_an_unknown_sandbox_mode`
+    /// above, not a check of its own.
+    ///
+    /// `validate()` returning `Ok(())` is exactly what a `validate()` that had
+    /// stopped delegating to the shell block — or that never called it at all —
+    /// also returns, so this test passes under that mutant and pins nothing
+    /// about the delegation. The property it looks like it guards is only
+    /// observable from the **refusing** side, which is the test above.
+    ///
+    /// It is kept, and strengthened to the whole documented domain, because it
+    /// is the only place both accepted modes are shown to pass through
+    /// `SupervisorConfig::validate` rather than `ShellSandboxConfig::validate`
+    /// directly — i.e. that the delegating entry point does not reject a value
+    /// the shell block accepts.
+    #[test]
+    fn supervisor_validate_accepts_the_shipped_default() {
+        assert!(SupervisorConfig::default().validate().is_ok());
+        for m in ["bwrap", "none"] {
+            let cfg = SupervisorConfig {
+                shell: ShellSandboxConfig { sandbox: m.into() },
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "{m} is a documented mode and must pass SupervisorConfig::validate"
+            );
+        }
+    }
+
+    /// The wiring test — the point of this task.
+    ///
+    /// `ShellSandboxConfig::validate()` existing is not the property; being
+    /// *called* is. A misspelled mode in `config.toml` must stop the process at
+    /// load, before any shell job can be routed, and it must never be resolved
+    /// to one of the two modes.
+    #[test]
+    fn config_load_refuses_an_unknown_shell_sandbox_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+                [telegram]
+                bot_token = "tok"
+                allowed_user_ids = [1]
+                [openrouter]
+                api_key = "key"
+                [general]
+                home = "{}"
+                [supervisor.shell]
+                sandbox = "chroot"
+                "#,
+                home.display()
+            ),
+        )
+        .unwrap();
+
+        // `{:#}` is anyhow's whole-chain rendering, which is what `main` prints
+        // when the `?` above it reaches `fn main()`. The plain `Display` shows
+        // only the outermost context ("Invalid config in …") and would let the
+        // operator's typo go unnamed.
+        let err = format!("{:#}", Config::load(&cfg_path).unwrap_err());
+        assert!(
+            err.contains("[supervisor.shell].sandbox"),
+            "loading must fail, naming the key, got: {err}"
+        );
+        assert!(
+            err.contains("chroot"),
+            "the error must quote the offending value, got: {err}"
+        );
+        // The **ordering** is the property, not the message. `Config::load`
+        // validates before `resolve()`, and `resolve()` is what creates the home
+        // tree — so a refusal that happens after it leaves a half-built home
+        // behind on a config this build cannot honour. Moving the
+        // `config.supervisor.validate()?` call below `config.resolve()?` keeps
+        // every other assertion in this file green and every message identical,
+        // which is why the ordering needs an assertion of its own: nothing else
+        // here observes it. `home` is the `[general].home` written above and is
+        // not created by the test.
+        assert!(
+            !home.exists(),
+            "load must refuse before resolve() creates anything"
+        );
+    }
+
+    #[test]
+    fn config_load_accepts_both_documented_shell_sandbox_modes() {
+        for m in ["bwrap", "none"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let cfg_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &cfg_path,
+                format!(
+                    r#"
+                    [telegram]
+                    bot_token = "tok"
+                    allowed_user_ids = [1]
+                    [openrouter]
+                    api_key = "key"
+                    [general]
+                    home = "{}"
+                    [supervisor.shell]
+                    sandbox = "{m}"
+                    "#,
+                    home.display()
+                ),
+            )
+            .unwrap();
+
+            let cfg = Config::load(&cfg_path).unwrap_or_else(|e| panic!("{m} must load: {e}"));
+            assert_eq!(cfg.supervisor.shell.sandbox, m);
+        }
+    }
+
+    #[test]
+    fn the_example_config_ships_the_shell_sandbox_on() {
+        // `config.example.toml` is what users copy. If it ever ships
+        // `sandbox = "none"` — or drops the block so a reader never sees the
+        // key — an operator gets unconfined shell jobs without having decided
+        // anything. Same reasoning as `web_disabled_by_default`.
+        let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert_eq!(cfg.supervisor.shell.sandbox, "bwrap");
+        assert!(!cfg.supervisor.shell.is_unconfined());
+        assert!(cfg.supervisor.validate().is_ok());
+    }
+
+    #[test]
+    fn an_empty_shell_sandbox_table_still_defaults_to_bwrap() {
+        // An operator who writes the table and comments the key out — the most
+        // likely way to "leave it alone" — must get the sandbox, not `""`.
+        // `""` is not consent (`is_unconfined` is an equality), but it would
+        // still be refused at load, so the default is what keeps a harmless
+        // edit harmless.
+        let cfg: Config =
+            toml::from_str(&format!("{}\n[supervisor.shell]\n", base_toml())).unwrap();
+        assert_eq!(cfg.supervisor.shell.sandbox, "bwrap");
     }
 ```
 
@@ -1827,45 +2037,188 @@ fn default_shell_sandbox() -> String {
 /// by whoever edits `config.toml`, while the escape path it opens is exercised
 /// per job. A writable host path is a grant for the same reason (`/allow
 /// <path>`). So neither is configured here (spec §4).
-///
-/// `Deserialize` only, matching every other struct in `config.rs`: nothing
-/// serializes the config back out, and `config.rs` imports `serde::Deserialize`
-/// alone, so the draft's `Serialize` would not have compiled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShellSandboxConfig {
     /// `"bwrap"` (sandboxed) or `"none"` (unsandboxed, the operator's explicit
     /// consent, and nothing else is gated). An unknown value is refused rather
-    /// than defaulted.
+    /// than defaulted — see [`Self::validate`] and [`Self::is_unconfined`].
     #[serde(default = "default_shell_sandbox")]
     pub sandbox: String,
 }
 
 impl Default for ShellSandboxConfig {
     fn default() -> Self {
-        Self { sandbox: default_shell_sandbox() }
+        Self {
+            sandbox: default_shell_sandbox(),
+        }
     }
 }
 
 impl ShellSandboxConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// Refuse any mode this build cannot honour.
+    ///
+    /// There is no safe default for an unrecognised value. Reading it as
+    /// `"bwrap"` refuses shell jobs an operator may have meant to allow; reading
+    /// it as `"none"` removes the sandbox because of a typo, which is the worst
+    /// outcome this key can have. So the value is neither guessed at nor
+    /// silently accepted: it stops the load (see [`Config::load`]).
+    pub fn validate(&self) -> Result<()> {
         match self.sandbox.as_str() {
             "bwrap" | "none" => Ok(()),
             other => {
-                anyhow::bail!(
-                    "[supervisor.shell].sandbox must be \"bwrap\" or \"none\", got {other:?}"
-                )
+                bail!("[supervisor.shell].sandbox must be \"bwrap\" or \"none\", got {other:?}")
             }
         }
+    }
+
+    /// Is this the operator's standing consent to run shell jobs unconfined?
+    ///
+    /// **Equality against the literal `"none"`, never a `_` arm and never
+    /// `!= "bwrap"`.** This predicate is the one place the unconfined mode is
+    /// selected, so any other shape is a fail-open: a typo — `"None"`,
+    /// `"none "`, `"chroot"` — would read as consent and run a shell job with
+    /// no boundary at all (spec §4). `validate()` refuses those values at load;
+    /// this returns `false` for them anyway, so the decision is fail-closed even
+    /// if a caller never validated.
+    pub fn is_unconfined(&self) -> bool {
+        self.sandbox == "none"
     }
 }
 ```
 
-Add the field to `SupervisorConfig`:
+Add the field to `SupervisorConfig` and give it a `validate()` that **delegates**
+— `ShellSandboxConfig::validate()` existing is not the property; being *called*
+is:
 
 ```rust
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    pub telegram: TelegramConfig,
+    pub openrouter: OpenRouterConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(default = "default_memory_config")]
+    pub memory: MemoryConfig,
+    #[serde(default = "default_skills_config")]
+    pub skills: SkillsConfig,
+    #[serde(default = "default_agents_config")]
+    pub agents: AgentsConfig,
+    #[serde(default)]
+    pub general: Option<GeneralConfig>,
+    #[serde(default = "default_agent_config")]
+    pub agent: AgentConfig,
+    pub embedding: Option<EmbeddingApiConfig>,
+    #[serde(default)]
+    pub langsmith: Option<LangSmithConfig>,
+    #[serde(default = "default_learning_config")]
+    pub learning: LearningConfig,
+    #[serde(default)]
+    pub supervisor: SupervisorConfig,
+    #[serde(default)]
+    pub subagents: SubagentsConfig,
+    #[serde(default)]
+    pub a2a: A2aConfig,
+    #[serde(default)]
+    pub web: WebConfig,
+    /// Explicit provider sections (multi-provider mode). Optional —
+    /// when empty, `build_providers()` synthesizes a single OpenRouter
+    /// provider from the legacy `[openrouter]` section.
+    #[serde(default)]
+    pub provider: Vec<ProviderSection>,
+    /// Fallback chain — additional provider/model names tried when
+    /// the primary call fails.
+    #[serde(default)]
+    pub fallback: FallbackConfig,
+    /// Absolute home root resolved at load time (not read from TOML).
+    #[serde(skip)]
+    pub resolved_home: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SupervisorConfig {
+    #[serde(default = "default_autonomy_mode")]
+    pub default_autonomy_mode: String,
+    #[serde(default)]
+    pub artifacts_dir: std::path::PathBuf,
+    #[serde(default)]
+    pub risk: RiskThresholdsConfig,
     #[serde(default)]
     pub shell: ShellSandboxConfig,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            default_autonomy_mode: default_autonomy_mode(),
+            artifacts_dir: default_artifacts_dir(),
+            risk: RiskThresholdsConfig::default(),
+            shell: ShellSandboxConfig::default(),
+        }
+    }
+}
+
+impl SupervisorConfig {
+    /// Validate the `[supervisor]` block.
+    ///
+    /// Every field here also fails closed at use time; the point of checking up
+    /// front is that the failure is *loud* and happens once at load instead of
+    /// silently per job. Unlike the `[web]` and `[a2a]` blocks there is no
+    /// listener to skip: the supervisor's shell backend is always registered, so
+    /// a value this build cannot interpret is not something to carry on with.
+    pub fn validate(&self) -> Result<()> {
+        self.shell.validate()
+    }
+}
 ```
+
+Then call it from `Config::load`, **before** `resolve()`:
+
+```rust
+    /// Read and validate `config.toml`.
+    ///
+    /// Validation happens here, before [`Self::resolve`] creates any directory,
+    /// because this is the single choke point every entry point goes through: a
+    /// validator that each caller has to remember to invoke is one that will
+    /// eventually not be invoked.
+    ///
+    /// [`SupervisorConfig::validate`] is the one check that is *fatal*. The
+    /// `[web]` and `[a2a]` blocks are validated where their listeners start,
+    /// because a misconfiguration there costs a listener and not the bot — but
+    /// `[supervisor.shell].sandbox` selects whether a shell job runs inside a
+    /// sandbox, and an unrecognised value has no safe reading. Refusing to start
+    /// is the only answer that cannot be wrong.
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let mut config: Config =
+            toml::from_str(&content).with_context(|| "Failed to parse config file")?;
+
+        config
+            .supervisor
+            .validate()
+            .with_context(|| format!("Invalid config in {}", path.display()))?;
+
+        let warnings = config
+            .resolve()
+            .with_context(|| "Failed to resolve home directory paths")?;
+        for w in &warnings {
+            tracing::warn!("{}", w.render());
+        }
+
+        Ok(config)
+    }
+```
+
+The ordering is the property, not the message. `resolve()` is what creates the
+home tree, so a refusal that happens after it leaves a half-built home behind on
+a config this build cannot honour — and the property is otherwise invisible:
+moving the call below `resolve()` keeps every message identical and every other
+test in this file green.
+`config_load_refuses_an_unknown_shell_sandbox_mode` therefore ends with
+`assert!(!home.exists(), "load must refuse before resolve() creates anything")`,
+which is the only assertion in the suite that observes the order.
 
 - [ ] **Step 4: Run the tests**
 
@@ -1882,15 +2235,40 @@ Expected: PASS.
 > order as `CLAUDE.md`. Add:
 
 ```toml
+# ── Supervisor (optional; defaults apply if section omitted) ────────────────
+#
+# The autonomous task runner. Its other keys — `artifacts_dir` and the
+# `[supervisor.risk]` gates (CLAUDE.md) — are left out here; only the shell
+# sandbox is written out.
+#
+# `default_autonomy_mode` is also left out, and not only for brevity: it is
+# parsed and defaulted but no code reads it yet, so writing it here would
+# document a key that changes nothing.
+#
+# It is written out, rather than commented like the sections below, on purpose:
+# this is the one key that decides whether a shell job has a boundary at all,
+# and an operator should have to see it to change it. `"bwrap"` is the same
+# value a config with no `[supervisor.shell]` table gets.
+
 [supervisor.shell]
 # "bwrap" runs shell jobs inside a bubblewrap sandbox (requires bwrap >= 0.12.0).
 # "none" runs them unconfined, and IS your consent — nothing else is gated.
+#
+# Any other value is refused when the config is loaded: the process will not
+# start. A misspelled mode must never be read as consent to run unconfined.
 sandbox = "bwrap"
 
 # Nothing else is configured here on purpose. A writable host path and the host
 # network namespace are not settings but runtime grants the operator names at the
-# moment they are used — /allow <path> and /allow-net — standing until /deny or
+# moment they are used — /allow <path> and /allow-net, standing until /deny or
 # /deny-net, and revoked by a restart. Neither substitutes for a missing sandbox.
+#
+# PLANNED, NOT IMPLEMENTED IN THIS BUILD: /allow, /deny, /allow-net and
+# /deny-net are specified but not wired up yet — no code reads a grant, so there
+# is currently no command that releases one. Until they land a shell job runs
+# with the empty grant set: its own job directory, no host path, no network.
+# The commands are named here so the intent is visible, not as a claim that they
+# work today.
 ```
 
 - [ ] **Step 6: Commit**
@@ -1900,9 +2278,31 @@ git add src/config.rs config.example.toml
 git commit -m "feat(config): add [supervisor.shell] sandbox"
 ```
 
-> **Added during execution, beyond this task's draft.** Two things the draft
-> left as "defined, never called", which is the defect this plan has now hit
-> four times:
+> **Where the invariant actually lives, and what it does not cover (review
+> finding M10).** "An unrecognised `sandbox` value cannot reach the consenting
+> branch" is enforced in two places, and neither of them is the **type**:
+> `Config::load` refuses it, and `is_unconfined()` is an equality against the
+> literal `"none"` so an unvalidated value still fails closed. `Config` is `pub`
+> and derives `Deserialize`, so
+> `toml::from_str::<Config>(…).unwrap().resolve()` — or any future caller that
+> builds a `Config` without `load` — skips the validation entirely. That path
+> cannot reach the consenting branch (the second guarantee holds), but it does
+> skip the *loud* refusal, and a `"chroot"` that arrives that way is carried
+> silently until a shell job is attempted.
+>
+> No production path does this today: every entry point goes through
+> `Config::load`. The invariant is a property of the **loader**, not of the type,
+> and this note exists so a future caller adding a second construction path knows
+> it is bypassing a check rather than reusing a safe constructor. Closing it
+> properly would mean a validated newtype or a `#[serde(try_from)]` on
+> `ShellSandboxConfig`; that is a change to the config surface, not to this task,
+> and it is deliberately not made here.
+
+> **Added during execution, beyond this task's draft.** Two things the draft left
+> as "defined, never called", which is the defect this plan has now hit four
+> times. Both are **in the Step 3 code blocks above**, not only in this note: a
+> note is not a snippet, and the first version of this note was the only place
+> either one existed, which is exactly how the defect reproduced.
 >
 > 1. **`ShellSandboxConfig::validate()` had no caller.** A typo
 >    (`sandbox = "chroot"`) was silently accepted. Fixed with
@@ -1922,13 +2322,35 @@ git commit -m "feat(config): add [supervisor.shell] sandbox"
 >    (`an_unknown_sandbox_mode_is_not_consent_to_run_unconfined`) rather than a
 >    branch inside `main.rs` that no test can reach.
 >
-> Tests added: `shell_sandbox_defaults_when_the_section_is_missing`,
+> **Tests added — all eleven, matching the Step 1 block above:**
+> `shell_sandbox_defaults_to_bwrap_with_an_empty_grant_set`,
+> `shell_sandbox_defaults_when_the_section_is_missing`,
+> `an_unknown_sandbox_mode_is_refused`,
+> `both_documented_modes_are_accepted`,
 > `an_unknown_sandbox_mode_is_not_consent_to_run_unconfined`,
 > `supervisor_validate_refuses_an_unknown_sandbox_mode`,
 > `supervisor_validate_accepts_the_shipped_default`,
 > `config_load_refuses_an_unknown_shell_sandbox_mode`,
 > `config_load_accepts_both_documented_shell_sandbox_modes`,
-> `the_example_config_ships_the_shell_sandbox_on`.
+> `the_example_config_ships_the_shell_sandbox_on`,
+> `an_empty_shell_sandbox_table_still_defaults_to_bwrap`.
+>
+> The draft's list named seven and omitted
+> `an_empty_shell_sandbox_table_still_defaults_to_bwrap` — the one that keeps an
+> operator's commented-out key harmless instead of fatal. Two more notes on the
+> eleven:
+>
+> - `supervisor_validate_accepts_the_shipped_default` is a **companion** to the
+>   refusal test, not a check: `Ok(())` is what a `validate()` that stopped
+>   delegating also returns, so it passes under that mutant and pins nothing.
+>   The delegation is only observable from the refusing side, which is where
+>   `supervisor_validate_refuses_an_unknown_sandbox_mode` asserts it. It is kept
+>   because it is the only place both accepted modes are shown to pass through
+>   the delegating entry point.
+> - `config_load_refuses_an_unknown_shell_sandbox_mode` carries the ordering
+>   assertion. Its mutant is **moving `config.supervisor.validate()?` below
+>   `config.resolve()?`**: identical error text, identical exit code, and a fully
+>   created home tree — caught by the `!home.exists()` line and by nothing else.
 
 ---
 
@@ -1936,7 +2358,7 @@ git commit -m "feat(config): add [supervisor.shell] sandbox"
 
 **Files:**
 - Modify: `src/supervisor/backend/shell.rs`
-- Modify: `src/main.rs:519-523`
+- Modify: `src/main.rs:513-517` (`ShellBackend::new`, inside its `register(Arc::new(…))`)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2115,6 +2537,11 @@ impl Isolation {
     /// consent, so nothing is gated (spec §4) — and this is the whole of what
     /// Task 7 needs from this type, which is why it is a method here rather
     /// than a second read of the config key there.
+    ///
+    /// **Task 8 deletes this.** Once the gate carries a second term it `match`es
+    /// on the mode directly, so this predicate would have no production caller
+    /// left and would be a second representation of a decision that must have
+    /// exactly one.
     pub fn needs_approval(&self) -> bool {
         matches!(self, Isolation::Unavailable(_))
     }
@@ -2292,8 +2719,10 @@ Expected: PASS, and no `dead_code` error.
 
 - [ ] **Step 5: Wire startup**
 
-In `src/main.rs:519-523`, build the backend from the configured mode and the
-probe result.
+In `src/main.rs:513-517`, build the backend from the configured mode and the
+probe result. That is the `ShellBackend::new(…)` argument inside the
+`sup_registry.register(std::sync::Arc::new(…))` statement — **not** the
+`Supervisor::new` block at `519-524`, which this step does not touch.
 
 > **Corrected.** This step used to derive `isolation` from the probe alone and
 > never read `[supervisor.shell].sandbox` — Task 4 shipped the key, the grep for
@@ -2317,9 +2746,37 @@ let grants: Arc<std::sync::RwLock<crate::supervisor::backend::sandbox::Grants>> 
 // is an equality against the literal.
 //
 // `probe` is async, so this is in an async context (`main` is).
-let isolation =
-    crate::supervisor::backend::sandbox::Isolation::resolve(&config.supervisor.shell, &grants)
-        .await;
+//
+// `Isolation::resolve` takes a `&Grants`, and `grants` here is the
+// `Arc<RwLock<Grants>>` shared with every `ShellBackend` — so it is handed a
+// **snapshot**, taken by name:
+//
+//   - `&grants` is `&Arc<RwLock<Grants>>` and does not compile
+//     (`error[E0308]: mismatched types … expected &Grants, found
+//     &Arc<RwLock<Grants>>`). This is not a coercion subtlety: `RwLock<T>`
+//     implements no `Deref` at all, so there is no deref step to take, transitive
+//     or otherwise — the only way from `&Arc<RwLock<Grants>>` to `&Grants` is a
+//     read.
+//   - The binding is a separate statement, not `&grants.read().unwrap().clone()`
+//     inline: the guard is a temporary that lives to the end of its statement, so
+//     inlined it is held **across the await** — which makes this future non-`Send`
+//     and, in tail position, does not compile at all
+//     (`error[E0597]: grants does not live long enough`). Bound first, the guard
+//     is released before the probe runs, so the probe spawns bwrap without the
+//     grant set locked.
+//   - `resolve` keeps taking `&Grants` rather than the `Arc`. Taking the `Arc`
+//     would move the lock inside `resolve`, where the `probe(grants).await` call
+//     needs a `&Grants` anyway — so it would still clone, just one frame further
+//     down — and it would put a `std::sync` lock in the hands of a function whose
+//     job is to describe the sandbox. It would also force the two unit tests in
+//     Step 3a (`Isolation::resolve(&none, &Grants::default())`) to build an
+//     `Arc<RwLock<_>>` they have no use for.
+let held_at_startup = grants.read().unwrap().clone();
+let isolation = crate::supervisor::backend::sandbox::Isolation::resolve(
+    &config.supervisor.shell,
+    &held_at_startup,
+)
+.await;
 match &isolation {
     crate::supervisor::backend::sandbox::Isolation::Unavailable(e) => tracing::warn!(
         reason = %e,
@@ -2335,10 +2792,28 @@ match &isolation {
     crate::supervisor::backend::sandbox::Isolation::Sandboxed => {}
 }
 
-let shell = ShellBackend::new(sandbox_path)
+// The backend replaces the one registered at `src/main.rs:513-517` — this is
+// that statement, kept in place and kept wrapped in the `register(Arc::new(…))`
+// that puts it in the registry. Building a `ShellBackend` and not registering it
+// is the "defined and never wired" defect this plan has hit four times, and the
+// root is `config.sandbox.allowed_directory` (the resolved sandbox root), not a
+// free variable.
+sup_registry.register(std::sync::Arc::new(
+    haos_green::supervisor::backend::shell::ShellBackend::new(
+        config.sandbox.allowed_directory.clone(),
+    )
     .with_isolation(isolation.clone())
-    .with_grants(grants.clone());
+    .with_grants(grants.clone()),
+));
 ```
+
+> **Corrected twice.** The line range this step named, `src/main.rs:519-523`, is
+> the `Supervisor::new` block — `ShellBackend::new` is at **`src/main.rs:514-517`**,
+> inside `sup_registry.register(std::sync::Arc::new(…))` at `513-517`. And the
+> snippet's `sandbox_path` was a variable that appears nowhere in `main.rs`; the
+> real argument is `config.sandbox.allowed_directory.clone()`, which is what
+> `resolve()` has already made absolute. The snippet is now the statement it
+> replaces, rather than a fragment that would not compile in its place.
 
 The same `isolation` value goes into the `Supervisor` in Task 7, so Layer 1 and
 Layer 2 can never disagree about the mode. `Isolation::needs_approval()` is the
@@ -2445,13 +2920,13 @@ git commit -m "feat(supervisor): refuse shell jobs without a real sandbox"
     #[tokio::test]
     async fn an_infinite_producer_is_stopped_by_the_byte_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let b = ShellBackend::new(dir.path().into())
-            .with_isolation(Isolation::Sandboxed)
-            // No grant held: the sandbox is filesystem-only, which is the
-            // shipped default.
-            .with_grants(std::sync::Arc::new(std::sync::RwLock::new(
-                crate::supervisor::backend::sandbox::Grants::default(),
-            )));
+        // `Unconfined`, deliberately — see the note below the test. The cap lives
+        // in the shared capture block *after* the two-launch `match`, so this
+        // test does not need a real `bwrap` on the host to have teeth, and under
+        // `Sandboxed` it would be a test of the host's tooling rather than of the
+        // cap. No grant is held either way: the shipped grant set is empty, and
+        // the unconfined launch reads no grants at all.
+        let b = ShellBackend::new(dir.path().into()).with_isolation(Isolation::Unconfined);
         let mut job = crate::supervisor::job::Job::new(
             "t", crate::supervisor::job::JobType::ShellJob, "shell", "yes",
         );
@@ -2460,10 +2935,46 @@ git commit -m "feat(supervisor): refuse shell jobs without a real sandbox"
             .await
             .unwrap()
             .unwrap();
+        // The cap must be the *reason* the job ended, not merely a bound its
+        // output happened to fit under. `yes` produces without limit, so a run
+        // that ended any other way — the child failed to start, the deadline
+        // fired, the pipe closed — must not satisfy this test, and a bare
+        // `bytes <= cap` assertion would let all three through. `byte cap` is
+        // the wording Step 3 mandates for this error.
+        assert!(
+            out.errors.iter().any(|e| e.contains("byte cap")),
+            "the byte cap must be what stopped the job, got {:?}",
+            out.errors
+        );
         let bytes: usize = out.summary.len() + out.errors.iter().map(|e| e.len()).sum::<usize>();
+        assert!(
+            bytes >= MAX_OUTPUT_BYTES,
+            "the cap must have been reached before the kill, got {bytes}"
+        );
         assert!(bytes <= MAX_OUTPUT_BYTES + 4096, "cap not enforced: {bytes}");
     }
 ```
+
+> **Why `Unconfined` and not `Sandboxed` (review finding M9).** The draft ran this
+> under `Sandboxed`, which makes it depend on a real `bwrap >= 0.12.0` on the
+> test host: `with_isolation` bypasses the version check, so on a host without
+> bubblewrap the `bwrap` spawn fails and the test fails with a spawn error rather
+> than skipping. That is a test of the host, not of the cap. The property under
+> test — an unbounded producer is stopped by the byte cap rather than by the wall
+> clock — is entirely in the capture block that both launches share, so it does
+> not need the sandbox to be real, and `Unconfined` runs the same `sh -c` path
+> the backend used before the sandbox existed.
+>
+> The third option the draft did not consider (a stubbed `bwrap` on `PATH`) was
+> rejected: a stub is a second implementation of the thing under test, and the
+> assertions it would have to satisfy are the argv assertions Task 2 already
+> makes against the real builder.
+>
+> **What this gives up, and where it is recovered.** No Task 6 unit test then
+> exercises the *sandboxed* launch's capture path, so a change that moved the cap
+> into the `Unconfined` arm alone would not be caught here. Task 9's live file
+> recovers it with item 9 below, which is exactly where a real `bwrap` is allowed
+> to be required.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2554,11 +3065,25 @@ git commit -m "feat(supervisor): bound shell job output and process count"
 > must not have one.** Spec §4: *"With `sandbox = "none"` nothing is gated: that
 > mode **is** the operator's consent, and Layer 1 does not apply."* The gate is
 > `needs_approval()` on the `Isolation` value Task 5 resolved, which is `false`
-> for `Unconfined`, so the exemption is already carried by the value — a second
-> read of the config key here would be a second place the mode is decided, and
-> two reads can drift. The gate still has to be *tested* under `"none"` (Step 1
-> below), because "the type makes it impossible" is exactly the kind of claim
-> this plan has been wrong about four times.
+> for `Unconfined`, so the exemption is carried by the value — a second read of
+> the config key here would be a second place the mode is decided, and two reads
+> can drift. The gate still has to be *tested* under `"none"` (Step 1 below),
+> because "the type makes it impossible" is exactly the kind of claim this plan
+> has been wrong about four times.
+>
+> **Scope of that claim (review finding F3).** "The exemption is carried by the
+> value" is exactly true of this step, where the isolation term **is** the whole
+> gate. It stops being true in Task 8, which adds a second term — a declared
+> capability the grant set does not cover — and that term is not a property of
+> the `Isolation` value at all. Under `Unconfined` the second term would park a
+> shell task for a grant the unconfined launch never consults, which contradicts
+> spec §4 and buys nothing. Task 8 therefore moves the exemption to the **outer**
+> decision (`match &self.shell_isolation { Isolation::Unconfined => None, … }`)
+> rather than leaving it on the isolation term, and adds a test that declares a
+> grant so the exemption has teeth. `needs_approval()` is still the whole gate
+> at this step, and this step's test still asserts it; Task 8 then replaces the
+> predicate with the `match` and deletes it, because one decision must have one
+> representation.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2637,6 +3162,21 @@ git commit -m "feat(supervisor): bound shell job output and process count"
 > which is how the existing tests read the id. Destructuring
 > `NeedsApproval { task_id }` does not compile — the variant also carries
 > `reason`.
+>
+> **`a_shell_task_is_not_gated_when_the_operator_chose_none` is deliberately
+> superseded by Task 8, and it is worth being explicit about why.** It pins spec
+> §4 against the gate *as this task writes it*, where the only term is
+> `needs_approval()` — so at this point in the plan it has teeth. Task 8 adds a
+> second term (a declared capability the grant set does not cover), and this test
+> cannot see it: the task it submits through `submit` declares **nothing**, so
+> `missing` is empty and the test returns `AutoExecutePlanned` whether or not the
+> gate exempts `Unconfined`. It becomes a test that passes for the wrong reason
+> at exactly the moment the property it names gets harder to hold. Task 8
+> therefore adds
+> `an_unconfined_shell_task_declaring_an_ungranted_capability_is_not_gated`, which
+> declares a grant, and extracts the gate into `shell_gate_reason` so that test
+> can reach it. **Keep this test** — it is the `submit`-level integration check —
+> but do not treat it as the coverage for §4 after Task 8.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2734,6 +3274,14 @@ park reason this task can decide. Task 8 adds the second one (a declaration the
 grant set does not cover) and replaces the forced `RequireApproval` reason, which
 at this point still comes from the risk-level match below and would tell the
 operator "high-risk task requires approval" when the real cause is the sandbox.
+
+Task 8 also **extracts this gate into `fn shell_gate_reason(&self, task: &Task) ->
+Option<String>`** and calls it from `submit` as
+`let gate_reason = self.shell_gate_reason(&task);`. That is not tidying: with two
+terms, `submit` is no longer a way to test the gate, because `submit` cannot give
+a task a `declared_grants` declaration — see the note under Step 1's
+`a_shell_task_is_not_gated_when_the_operator_chose_none`. The inline form above
+stays as the shape this step writes; Task 8 replaces it.
 
 **There is no job-scoped consent object to consult.** `/approve <id>` is the
 existing lifecycle command: it moves a task out of `Route` (`Route -> Execute`,
@@ -3454,39 +4002,159 @@ pub fn park_reason(held: &Grants, declared: &Grants, task_id: &str, request: &st
 ```
 
 ```rust
-        // LAYER 1 — route-time gate. This asks the same registry the executor
-        // uses, rather than duplicating a routing predicate that could drift.
-        let gate_reason = if self.would_use_shell(&task) {
-            let held = self.grants.read().unwrap().clone();
-            let missing = held.missing(&task.declared_grants);
-            if let Isolation::Unavailable(reason) = &self.shell_isolation {
-                Some(format!(
-                    "shell isolation is unavailable, so a task that would select the shell \
-                     backend is parked: {reason}. Fix bubblewrap (>= 0.12.0) or set \
-                     [supervisor.shell].sandbox = \"none\". A grant cannot replace a missing \
-                     sandbox; `/allow <path>` and `/allow-net` release a capability."
-                ))
-            } else if !missing.is_empty() {
-                Some(park_reason(
-                    &held,
-                    &task.declared_grants,
-                    &task.id,
-                    // `user_request` is already capped by `IntakeRouter`, and the
-                    // reply is bounded again before it is sent.
-                    &task.user_request,
-                ))
-            } else {
-                None
+    /// The Layer-1 park reason for a task, or `None` if it is not gated.
+    ///
+    /// Extracted from `submit` so the gate is reachable from a test holding a
+    /// task that **declares a capability**. `submit` cannot produce one in this
+    /// revision — nothing populates `Task::declared_grants` from operator input
+    /// yet — so a gate driven only through `submit` can never be shown to fire
+    /// on the grant term, and a test that cannot make the gate fire cannot tell
+    /// a working exemption from a gate that never runs.
+    fn shell_gate_reason(&self, task: &Task) -> Option<String> {
+        if !self.would_use_shell(task) {
+            return None;
+        }
+        // **The whole gate is skipped under `Unconfined`, and that is spec §4,
+        // not an optimisation.** "With `sandbox = "none"` nothing is gated: that
+        // mode *is* the operator's consent, and Layer 1 does not apply." The
+        // exemption is therefore the *outer* decision, not the isolation term
+        // alone. Both terms exist to stop a job reaching a boundary wider than
+        // the operator sanctioned: `Unavailable` because there is no boundary to
+        // reach at all, and a missing grant because the sandboxed launch would
+        // bind more than was granted. Under `Unconfined` there is no argv and no
+        // bind: Layer 2 runs `sh -c` in the job directory and reads neither
+        // `Grants` nor `declared_grants`. Parking on the grant term there would
+        // therefore cost one approval round-trip and change nothing about what
+        // runs — and Layer 2, which is the boundary, would not corroborate the
+        // park.
+        //
+        // A `match` rather than `needs_approval() || !missing.is_empty()`:
+        // `needs_approval()` is a pure function of the isolation decision and has
+        // no grant set to look at, so it cannot express the second term. Keeping
+        // both terms in one `match` on the mode is what makes the exemption
+        // structural — there is exactly one place `Unconfined` is answered, and
+        // it answers before either term is evaluated, so a third term cannot be
+        // added above it by accident. For the same reason this `match` replaces
+        // `needs_approval()` entirely — see the deletion below.
+        match &self.shell_isolation {
+            Isolation::Unconfined => None,
+            Isolation::Unavailable(reason) => Some(format!(
+                "shell isolation is unavailable, so a task that would select the shell \
+                 backend is parked: {reason}. Fix bubblewrap (>= 0.12.0) or set \
+                 [supervisor.shell].sandbox = \"none\". A grant cannot replace a missing \
+                 sandbox; `/allow <path>` and `/allow-net` release a capability."
+            )),
+            Isolation::Sandboxed => {
+                let held = self.grants.read().unwrap().clone();
+                let missing = held.missing(&task.declared_grants);
+                if missing.is_empty() {
+                    None
+                } else {
+                    Some(park_reason(
+                        &held,
+                        &task.declared_grants,
+                        &task.id,
+                        // `user_request` is already capped by `IntakeRouter`, and
+                        // the reply is bounded again before it is sent.
+                        &task.user_request,
+                    ))
+                }
             }
-        } else {
-            None
-        };
+        }
+    }
+```
+
+and in `submit`, in place of the whole inline gate:
+
+```rust
+        let gate_reason = self.shell_gate_reason(&task);
         let decision = if gate_reason.is_some() {
             PolicyDecision::RequireApproval
         } else {
             decision
         };
 ```
+
+**Delete `Isolation::needs_approval()`.** It was the whole gate in Task 7, and
+this step's `match` answers the same question — including spec §4's exemption —
+structurally, from the one place the mode is decided. Leaving the predicate
+behind would mean **two representations of one decision**, and the plan has been
+burned four times by an interface that was defined and then not wired to
+anything; the drift risk here is the same defect with the polarity reversed: a
+future arm added to `needs_approval()` that the `match` never consults, or the
+reverse. Its only caller is the Task 7 gate this step replaces, and no test calls
+it directly — Task 7's `a_shell_task_is_not_gated_when_the_operator_chose_none`
+asserts through `submit` — so the deletion moves nothing else. `Isolation` is
+`pub`, so `#![deny(dead_code)]` would **not** have caught it.
+
+**The test that gives the exemption teeth** — add to the `tests` module in
+`src/supervisor/mod.rs`, next to Task 7's
+`a_shell_task_is_not_gated_when_the_operator_chose_none`:
+
+```rust
+    /// Spec §4, with teeth — which Task 7's
+    /// `a_shell_task_is_not_gated_when_the_operator_chose_none` does not have
+    /// once this task adds the grant term.
+    ///
+    /// That test goes through `submit`, and `submit` cannot give a task a
+    /// declaration: `declared_grants` is empty for every task this revision can
+    /// create. So `missing` is empty, the grant term cannot fire, and the test
+    /// returns `AutoExecutePlanned` whether or not the gate exempts
+    /// `Unconfined` — it passes for the wrong reason against exactly the
+    /// regression this pins. This test declares the capability the grant term
+    /// parks on under `"bwrap"`, asserts the same task is **not** gated under
+    /// `"none"`, and then asserts it **is** gated under `"bwrap"`, so the
+    /// exemption cannot pass by the gate being dead.
+    #[tokio::test]
+    async fn an_unconfined_shell_task_declaring_an_ungranted_capability_is_not_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+        sup.registry
+            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
+
+        // The task `submit` builds for "run the build" — the heuristic
+        // classifier gives it the `shell` capability — carrying the declaration
+        // the planner copies into every job. The supervisor holds
+        // `Grants::default()`, so both halves of the declaration are missing.
+        let mut task = crate::supervisor::intake::IntakeRouter::normalize("run the build");
+        task.required_capabilities = vec!["shell".into()];
+        task.declared_grants = Grants {
+            write: [std::path::PathBuf::from("/var/lib")].into(),
+            network: true,
+        };
+
+        let unconfined = sup.with_shell_isolation(Isolation::Unconfined);
+        assert_eq!(
+            unconfined.shell_gate_reason(&task),
+            None,
+            "`sandbox = \"none\"` is the operator's consent: neither term may park"
+        );
+
+        // The control. Without it the assertion above holds for a gate that
+        // never fires at all, which is the shape of the bug this test exists
+        // for — the test would be its own counterexample.
+        let sandboxed = unconfined.with_shell_isolation(Isolation::Sandboxed);
+        let reason = sandboxed
+            .shell_gate_reason(&task)
+            .expect("a declared-but-ungranted capability must park under `bwrap`");
+        assert!(reason.contains("/var/lib"), "{reason}");
+        assert!(reason.contains("/allow-net"), "{reason}");
+    }
+```
+
+> `use crate::supervisor::backend::sandbox::Grants;` and
+> `use crate::supervisor::intake::IntakeRouter;` join the test module's imports
+> if they are not already there. The `required_capabilities` line is set
+> explicitly rather than left to the classifier: the assertion is about the gate
+> reading the registry, and it must not move if the classifier's heuristics are
+> retuned.
+
+**Mutation:** make the `Unconfined` arm fall through to the `Sandboxed` arm (or
+delete it) and
+`an_unconfined_shell_task_declaring_an_ungranted_capability_is_not_gated` fails,
+naming `/var/lib`. Task 7's test still passes under that mutant — which is the
+whole reason the second test exists.
 
 and in the `RequireApproval` arm of the outcome match, the gate's reason wins:
 
@@ -3704,6 +4372,14 @@ Assert, each in its own test:
    without them it fails with `curl: (77) error adding trust anchors`, and with
    `/etc/ssl/certs` bound **alone** it still fails, because the bundle is a
    symlink into `/etc/ca-certificates`.
+9. **an infinite producer is stopped by the byte cap through the *sandboxed*
+   launch** — `ShellBackend` with `Isolation::Sandboxed` and `job.timeout_secs =
+   60`, running `yes`, asserting the job ended with the `byte cap` error and that
+   the captured bytes reached `MAX_OUTPUT_BYTES` (the same assertions Task 6's
+   unit test makes, on the other launch arm). This is the one place a real
+   `bwrap` is allowed to be required, and it is what proves the capture block is
+   genuinely shared: Task 6's test runs `Unconfined`, so a mutation that applies
+   the cap on the `Unconfined` arm only leaves it green and is caught here.
 
 - [ ] **Step 2: Run them**
 
@@ -3739,12 +4415,16 @@ run `cargo clean -p haos-green` before trusting any later result — the
 | remove the Layer-2 refusal | `refuses_to_spawn_when_isolation_is_unavailable` |
 | `Isolation::Unconfined` takes the `bwrap` path anyway | `the_unconfined_mode_runs_the_command_without_the_sandbox` — the job's `$HOME` becomes the job directory, so the sandbox's argv ran |
 | `Isolation::resolve` reads anything other than `"bwrap"` as consent (`shell.sandbox != "bwrap"`, or a `_ =>` arm returning `Unconfined`) | `only_the_literal_none_resolves_to_the_unconfined_mode`, plus Task 4's `an_unknown_sandbox_mode_is_not_consent_to_run_unconfined` |
-| `Isolation::needs_approval()` returns `true` for `Unconfined` | `a_shell_task_is_not_gated_when_the_operator_chose_none` |
+| `Isolation::needs_approval()` returns `true` for `Unconfined` (Task 7 only — Task 8 deletes the predicate) | `a_shell_task_is_not_gated_when_the_operator_chose_none`, at Task 7's gate |
 | `SupervisorConfig::validate()` stops delegating to the shell block | `supervisor_validate_refuses_an_unknown_sandbox_mode` |
 | delete the `config.supervisor.validate()?` call from `Config::load` | `config_load_refuses_an_unknown_shell_sandbox_mode` — a validator nothing calls is the defect this pins |
+| **move** `config.supervisor.validate()?` **below** `config.resolve()?`, keeping the same error and message | `config_load_refuses_an_unknown_shell_sandbox_mode`, and **only** its `assert!(!home.exists(), …)` line. Measured on a scratch copy with its own `CARGO_TARGET_DIR`: 80 of the 81 `config::tests` pass under this mutant and only that one fails, the process still exits 1 with a byte-identical message, and the run leaves `AGENTS.md SOUL.md agents artifacts skills workspace` behind in the home directory |
+| `SupervisorConfig::validate()` returns `Ok(())` without delegating | `supervisor_validate_refuses_an_unknown_sandbox_mode`, `config_load_refuses_an_unknown_shell_sandbox_mode`. **Not** `supervisor_validate_accepts_the_shipped_default` — `Ok(())` is what that test asserts, which is why it is marked a companion rather than a check |
 | `ShellSandboxConfig::validate()`'s unknown arm returns `Ok(())` | `an_unknown_sandbox_mode_is_refused`, `supervisor_validate_refuses_an_unknown_sandbox_mode`, `config_load_refuses_an_unknown_shell_sandbox_mode` |
 | remove the Layer-1 gate | `a_shell_task_is_parked_for_approval_…` |
-| remove the byte cap | `an_infinite_producer_is_stopped_by_the_byte_cap` |
+| remove the byte cap | `an_infinite_producer_is_stopped_by_the_byte_cap` (unconfined arm) **and** live test 9 (sandboxed arm) |
+| apply the cap on the `Unconfined` arm only, leaving the sandboxed arm unbounded | live test 9 — Task 6's unit test stays green, which is why the live test exists |
+| make the `Unconfined` arm of Layer 1 fall through to the grant term | `an_unconfined_shell_task_declaring_an_ungranted_capability_is_not_gated` (Task 8). Task 7's `a_shell_task_is_not_gated_when_the_operator_chose_none` stays green — it declares nothing |
 
 - [ ] **Step 4: Correct the documentation**
 
@@ -3873,10 +4553,12 @@ resolve_path(raw, sandbox_root)` and `grant_write(raw, sandbox_root)` take the
 root as of Task 8 Step 3b, because a grant that covers it (or an ancestor of it)
 is refused; `ShellSandboxConfig { sandbox }` (Task 4) is read by
 `Isolation::resolve` (Task 5 Step 3a) and by **nothing else** — `Isolation` is
-the value Task 5's backend and Task 7's gate both hold, and `needs_approval()` is
-the only question Task 7 asks it, so the config key is read once and the two
-layers cannot drift; `Isolation` is used in Tasks 5 and 7 and its `Unconfined`
-arm is what spec §4's "nothing is gated" means in code;
+the value Task 5's backend and Task 8's gate both hold, so the config key is read
+once and the two layers cannot drift; `Isolation` is used in Tasks 5, 7 and 8,
+its `Unconfined` arm is what spec §4's "nothing is gated" means in code, and from
+Task 8 on the gate `match`es on it directly, and Task 8 **deletes**
+`needs_approval()` — the single-term form of the same decision — so the mode is
+answered in exactly one place at every point in the plan;
 `Grants::{resolve_path, grant_write, revoke_write, grant_network, revoke_network,
 missing, covers, held}` and `Supervisor::{grant_write, deny_write, grant_network,
 deny_network, grants_held}` (Task 8) match their uses in Tasks 7, 8 and 9.
@@ -3901,11 +4583,17 @@ tests now register `ShellBackend` first, and the plan says why.
 
 **Corrections made during execution** — four instances of one defect, all found
 after Task 4 was dispatched, all of the same shape: an interface was defined and
-never wired to anything.
+never wired to anything. (A fifth, in the other direction, was found by Task 4's
+review: the plan's own Task 4 code blocks had **drifted from what shipped** —
+no `is_unconfined()`, no `SupervisorConfig::validate()` block, no `Config::load`
+call, three of eleven tests and an `is_err()`-only assertion — so re-running the
+task from the plan reproduced the very defect it fixed. The blocks are now
+extracted from the shipped source. **The plan is an artifact that must compile;
+a note is not a snippet.**)
 
 | Draft said | Reality | Fixed |
 |---|---|---|
-| `ShellSandboxConfig::validate()` runs at startup | **nothing called it.** `SupervisorConfig` had no `validate()` at all, so `sandbox = "chroot"` was silently accepted | Task 4 gains `SupervisorConfig::validate()` and a fatal `Config::load` call, with `config_load_refuses_an_unknown_shell_sandbox_mode` and a mutant that deletes the call |
+| `ShellSandboxConfig::validate()` runs at startup | **nothing called it.** `SupervisorConfig` had no `validate()` at all, so `sandbox = "chroot"` was silently accepted | Task 4 gains `SupervisorConfig::validate()` and a fatal `Config::load` call, with `config_load_refuses_an_unknown_shell_sandbox_mode` and a mutant that deletes the call — **and that call's position matters**: below `resolve()` it still exits 1 with the same message and leaves a whole home tree behind, so the test also asserts `!home.exists()` |
 | the plan's Task 4 Step 5: "add to `config.example.toml`, under the `[supervisor]` section" | that section **does not exist** in the file — its only mention of "supervisor" is inside a comment | Step 5 now creates the section, after `[learning]` and before the A2A banner |
 | `[supervisor.shell].sandbox` selects the mode | **no code read the key.** The grep for `config.shell` matched only Task 4's own test | Task 5 Step 3a adds `Isolation::resolve` as the single reader, Step 5 wires it, and Task 7 Step 1 tests the `"none"` exemption |
 | Task 5 Step 5 derives `isolation` from the probe alone | under `sandbox = "none"` the backend would still have spawned `bwrap` — and failed on a host without it, which is the host the mode exists for. The refusal message's way out was therefore a **loop**, not a way out | `Isolation::Unconfined` is a distinct arm that runs `sh -c` and never invokes `bwrap`, with `the_unconfined_mode_runs_the_command_without_the_sandbox` and a mutant that sends it back down the `bwrap` path |
@@ -3914,9 +4602,43 @@ The fourth is the one worth remembering: the *message* was correct and the
 *code* did not implement it, so the failure mode was not a crash or an error but
 an operator following the documented remedy and landing in the same refusal.
 
-One more gap, left open rather than fixed here: **Task 6's tests use
-`.with_isolation(Ok(()))`** in the draft, which after this correction is
-`Isolation::Sandboxed` — and they run real commands, so they need a real
-`bwrap` on the host. On a host without one they fail rather than skip. Task 9's
-live file is the one that is meant to be gated behind `HAOS_GREEN_SHELL_LIVE=1`;
-Task 6 either needs the same gate or a stubbed `bwrap` on `PATH`.
+**Task 6's real-`bwrap` dependency — decided, not left open (review finding
+M9).** The draft used `.with_isolation(Ok(()))`, which after the Task 5
+correction is `Isolation::Sandboxed`, on tests that run real commands — so they
+need a real `bwrap >= 0.12.0` on the host and fail rather than skip where there
+is none. Task 9's live file is the one gated behind `HAOS_GREEN_SHELL_LIVE=1`.
+
+Three options were on the table: (a) gate Task 6 behind the same env var, (b)
+stub `bwrap` on `PATH`, (c) run the mode-independent properties under
+`Isolation::Unconfined`.
+
+**Decision: (c) for the byte-cap test, plus a live test for the sandboxed arm.**
+
+- (a) was rejected because a skipped test is a test that can stay skipped: the
+  cap would be unpinned on every host without bubblewrap, which includes CI
+  runners, and the mutation "remove the byte cap" would then have no catcher at
+  all. Task 6's subject is resource containment, not the sandbox, so gating it
+  behind the sandbox's availability buys nothing and risks everything.
+- (b) was rejected because a stub is a second implementation of the thing under
+  test: it would have to satisfy the argv assertions Task 2 already makes against
+  the real builder, and it would test the stub's behaviour, not bubblewrap's.
+- (c) is correct because the cap is enforced by `read_capped` in the capture
+  block that sits **after** the two-launch `match` — one block, both arms — so
+  the property holds on either. `Unconfined` runs the same `sh -c` path the
+  backend used before the sandbox existed.
+
+The residual is real and is recovered rather than ignored: with the byte-cap test
+on the unconfined arm, a mutation that applied the cap to the `Unconfined` arm
+only would leave Task 6 green. **Task 9 therefore gains item 9** — the same
+assertions, run through the sandboxed launch against a real `bwrap`, in the one
+file that is already gated behind `HAOS_GREEN_SHELL_LIVE=1`. That is where a real
+`bwrap` may be required, and it is what proves the capture block is genuinely
+shared rather than merely written once.
+
+**Known separate finding, recorded here so it is not lost (review finding
+M10-adjacent).** `[supervisor].default_autonomy_mode` is parsed, defaulted, and
+documented in `docs/GUIDE.md:44`, but **no production code reads it** — the only
+references in `src/` are the field, its default function, `SupervisorConfig::
+Default`, and one assertion in `config.rs`'s own test. `config.example.toml` no
+longer cites it as a working key. It is pre-existing, independent of this plan,
+and deserves its own issue rather than a fix folded in here.

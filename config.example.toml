@@ -251,9 +251,13 @@ Be concise and helpful."""
 
 # ── Supervisor (optional; defaults apply if section omitted) ────────────────
 #
-# The autonomous task runner. Its other keys — `default_autonomy_mode`
-# (docs/GUIDE.md), `artifacts_dir` and the `[supervisor.risk]` gates
-# (CLAUDE.md) — are left out here; only the shell sandbox is written out.
+# The autonomous task runner. Its other keys — `artifacts_dir` and the
+# `[supervisor.risk]` gates (CLAUDE.md) — are left out here; only the shell
+# sandbox is written out.
+#
+# `default_autonomy_mode` is also left out, and not only for brevity: it is
+# parsed and defaulted but no code reads it yet, so writing it here would
+# document a key that changes nothing.
 #
 # It is written out, rather than commented like the sections below, on purpose:
 # this is the one key that decides whether a shell job has a boundary at all,
@@ -270,8 +274,15 @@ sandbox = "bwrap"
 
 # Nothing else is configured here on purpose. A writable host path and the host
 # network namespace are not settings but runtime grants the operator names at the
-# moment they are used — /allow <path> and /allow-net — standing until /deny or
+# moment they are used — /allow <path> and /allow-net, standing until /deny or
 # /deny-net, and revoked by a restart. Neither substitutes for a missing sandbox.
+#
+# PLANNED, NOT IMPLEMENTED IN THIS BUILD: /allow, /deny, /allow-net and
+# /deny-net are specified but not wired up yet — no code reads a grant, so there
+# is currently no command that releases one. Until they land a shell job runs
+# with the empty grant set: its own job directory, no host path, no network.
+# The commands are named here so the intent is visible, not as a claim that they
+# work today.
 
 # ── A2A (Agent2Agent) protocol (optional; DISABLED by default) ──────────────
 #
