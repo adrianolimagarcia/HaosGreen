@@ -208,6 +208,11 @@ src/
 - File and command operations are contained by `validate_sandbox_path()`
   (`src/tools.rs`). It canonicalises when the target exists, and otherwise
   canonicalises the **parent** and re-joins the file name.
+  **`ShellBackend` is the exception: it does not call `validate_sandbox_path()`
+  at all.** A `shell` job is contained by a real bubblewrap sandbox instead —
+  see "Shell sandbox" under Supervisor. Read that section before assuming a
+  shell job is bounded by the sandbox directory, because it is not: it is
+  bounded by the argv.
 - Tools that read relative to the **home** (not the sandbox) use
   `validate_home_path()` plus an explicit name allowlist. `read_soul_file`,
   `update_soul_file` and `revert_soul_file` are restricted to `SOUL_FILE_NAMES`
@@ -716,6 +721,9 @@ Skill packs are auto-loaded by the existing `SkillRegistry` at startup; the
 default_autonomy_mode = "standard"   # "fast" | "standard" | "rigorous"
 artifacts_dir         = "supervisor/artifacts"
 
+[supervisor.shell]
+sandbox = "bwrap"                    # "bwrap" (default) | "none"
+
 [supervisor.risk]
 require_approval_for_low    = false
 require_approval_for_medium = false
@@ -758,6 +766,51 @@ length of a plan. The reply therefore names the command that moves the task on:
 `/clarify` calls `Supervisor::clarify`, which takes `Clarify -> Execute` only
 for a task actually in `Clarify` (stricter than the state table, mirroring
 `resume`) and then delegates to the existing `execute_now`.
+
+### Shell sandbox
+
+`ShellBackend` (`src/supervisor/backend/shell.rs`) runs a command either inside
+a real bubblewrap sandbox or, only on explicit consent, unconfined. The argv is
+built by `src/supervisor/backend/sandbox.rs`.
+
+`[supervisor.shell].sandbox` accepts exactly two values, and **only the literal
+`"none"` is consent**: every other value — including a typo, and including the
+default — resolves to the sandboxed mode, and `validate()` refuses an unknown
+value at load rather than letting it fail open. `Isolation::resolve` probes the
+host (`bwrap --version` against a **0.12.0** floor, then a smoke test that builds
+the production argv), so a host without a usable bubblewrap yields
+`Isolation::Unavailable(cause)` naming the cause, never a silent downgrade.
+
+Two layers enforce this, and they hold the **same** `Isolation` value so they
+cannot disagree:
+
+- **Layer 1 (route time)** — `Supervisor::submit` parks a task that would select
+  the shell backend with `RequireApproval` when the boundary is absent, so the
+  operator is asked before anything runs rather than learning from a failed job.
+- **Layer 2 (run time)** — `ShellBackend::run` refuses to spawn at all and
+  returns a `Failed` job naming the cause.
+
+The base set is bound **read-only** (`/usr /bin /lib /lib64 /proc /dev`, the
+three resolver files, and both certificate paths), and `/etc/ssl/certs` **plus**
+`/etc/ca-certificates` are both required for TLS: on Arch/CachyOS the bundle is a
+symlink into the latter, so binding the first alone leaves it dangling and `curl`
+fails with `(77) error adding trust anchors`. A network namespace is shared only
+under a network grant, and `--share-net` is emitted **after** `--unshare-all` —
+the reverse order is a silent no-op, measured.
+
+Resource bounds are deliberately modest and are documented as best-effort: a
+256 KiB cap per output pipe (which stops the *producer*, via `SIGPIPE`, not just
+the reading) and an `RLIMIT_NPROC` sized from a live measurement of the real
+uid's thread count plus headroom, never a constant — Linux counts that limit per
+**real uid** and in **threads**, so a flat value below the uid's current count
+makes every `fork` fail with `EAGAIN`. As root the whole limit is a no-op, which
+is why it is a brake and not a boundary.
+
+**Not implemented in this revision:** the operator-facing grant commands
+(`/allow`, `/deny`, `/allow-net`, `/deny-net`) and the declaration that would
+drive them. `Grants` exists as a type and the argv honours it, but nothing yet
+issues or persists a grant, so the only reachable mode is the default (no grants
+held) or `sandbox = "none"`.
 
 ### Artifacts
 
@@ -818,7 +871,12 @@ Known bounds — documented, not hidden:
   calls) are **not** rolled back;
 - `kill_on_drop` kills only the **direct** child — a backgrounded grandchild of
   a compound `sh -c` can survive, and an in-flight MCP tool call is abandoned
-  rather than stopped (`McpBackend` has no timeout or cancellation);
+  rather than stopped (`McpBackend` has no timeout or cancellation). A `shell`
+  job is the **exception**: its argv carries `--die-with-parent`, so its
+  descendants die with the sandbox instead of being reparented. Proven by
+  `tests/shell_sandbox_live.rs::killing_the_supervisor_leaves_no_descendant`,
+  which fails only after its 20 s deadline when that flag is removed — the
+  flag is load-bearing, not decorative;
 - a stale row from a crashed process makes its task unresumable for up to
   `LEASE_TTL_SECS` (300 s); there is no liveness probe or operator override;
 - the TTL is wall-clock, so a backward clock step larger than the TTL can expire
