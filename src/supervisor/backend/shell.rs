@@ -49,6 +49,293 @@ impl ShellBackend {
     }
 }
 
+/// Maximum bytes captured from **each** of stdout and stderr.
+///
+/// The sandbox bounds namespaces, not output. Before this cap the capture was
+/// `wait_with_output`, which buffers without limit, so `yes` — or any command
+/// with a large enough output — exhausted the supervisor's memory long before
+/// `job.timeout_secs` could fire. The deadline bounds *time*; this bounds
+/// *bytes*, and the two are independent.
+///
+/// `pub` because it is the contract the tests assert against, and because
+/// `src/lib.rs` carries `#![deny(dead_code)]`: a reachable `pub` item in the
+/// `pub` module chain is live, a private unused one is a hard error.
+pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// How long the *other* pipe is still drained after the cap has killed the child.
+///
+/// Only reachable when a process that outlived the direct child still holds the
+/// other pipe open — a shell that forked rather than `exec`ed (`sh -c 'a; yes'`
+/// does not `exec`, though `sh -c yes` does). The direct child is dead, so this
+/// normally returns at once; without a bound of its own that case would park the
+/// capture until the job's own deadline, which is minutes away.
+const POST_CAP_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How many tasks the child may hold **beyond what the supervisor's real uid
+/// already holds**.
+///
+/// A headroom rather than an absolute limit, and that is the whole correction
+/// this file makes to the plan. `RLIMIT_NPROC` is counted per **real user ID**,
+/// so a flat absolute value is a limit on the *uid*, not on the job: an absolute
+/// 256 was measured here to break five tests as uid 1000 — including the
+/// sandboxed launch, which failed with `bwrap: Creating new namespace failed:
+/// Resource temporarily unavailable`, and the pre-existing
+/// `a_dropped_run_does_not_leave_the_shell_child_running` — because uid 1000 held
+/// 864 tasks (threads count, not just processes). Disabling this hook entirely
+/// made all fourteen tests pass again as uid 1000, which is what attributes the
+/// failures to this limit rather than to the host.
+///
+/// So the brake is sized from a measurement taken at spawn time: the job may add
+/// this many tasks, and no more.
+const JOB_PROCESS_HEADROOM: libc::rlim_t = 256;
+
+/// How many tasks whose real uid is this process's exist right now, or `None`
+/// when `/proc` could not be read.
+///
+/// **Tasks, not processes.** `RLIMIT_NPROC` is checked against the kernel's
+/// per-uid task counter, which every `clone` increments — threads included — so
+/// counting `/proc/<pid>` entries instead would under-count a browser-shaped uid
+/// by an order of magnitude. Measured on this host: uid 1000 had 70 processes
+/// and 864 tasks.
+///
+/// Read here, in the **parent**, because `pre_exec` runs in a forked child of a
+/// multi-threaded process where `opendir`/`readdir` are not async-signal-safe.
+/// This is a scan of `/proc`, so it is not free; it is one small read per process
+/// on the host, once per job.
+fn uid_task_count() -> Option<libc::rlim_t> {
+    let me = unsafe { libc::getuid() };
+    let mut total: libc::rlim_t = 0;
+    let mut found = false;
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process that exited between the listing and the read is skipped, not
+        // an error: the scan is a sample of a moving system either way.
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let mut mine = false;
+        let mut threads: libc::rlim_t = 0;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                // `Uid:\treal\teffective\tsaved\tfs`
+                mine = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    == Some(me);
+            } else if let Some(rest) = line.strip_prefix("Threads:") {
+                threads = rest.trim().parse().unwrap_or(0);
+            }
+        }
+        if mine {
+            found = true;
+            total = total.saturating_add(threads);
+        }
+    }
+    // This process is the caller's, so a scan that matched nothing did not
+    // measure — it failed, and a failure must not be read as "the uid holds
+    // nothing".
+    found.then_some(total)
+}
+
+/// The `RLIMIT_NPROC` to install in the child, or `None` when it cannot be sized.
+fn child_process_limit() -> Option<libc::rlim_t> {
+    Some(uid_task_count()?.saturating_add(JOB_PROCESS_HEADROOM))
+}
+
+/// Install the child's process brake on a command, in the child.
+///
+/// **What this is:** a brake on a fork bomb, and nothing more. It is not a
+/// security boundary — the sandbox is — and it is not what makes a shell job
+/// safe to run.
+///
+/// **What it is measured to do, and not do, on Linux:**
+///
+/// - Linux skips the `RLIMIT_NPROC` check for a process holding `CAP_SYS_ADMIN`
+///   or `CAP_SYS_RESOURCE`, so **as root this limit is a no-op.** Measured on
+///   this host: with `ulimit -u 256` in a root shell, both `/bin/true` and a real
+///   `bwrap` sandbox still run. It is enforced for a non-root supervisor only.
+/// - The count is per **real user ID**, which is why the value is
+///   [`child_process_limit`]'s measurement plus [`JOB_PROCESS_HEADROOM`] rather
+///   than a constant. If the uid already holds more than the limit, *every*
+///   `fork` in the job fails with `EAGAIN` — measured, as uid 1000, with a flat
+///   256.
+/// - It is only ever *lowered*, never raised, and never allowed to fail a spawn:
+///   an operator's tighter `LimitNPROC` is a decision, and a brake that could not
+///   be applied must not refuse the job.
+///
+/// This is a **second** `pre_exec` closure, registered after the one
+/// `SandboxArgv::command` installs, and the two coexist: `std` runs every
+/// registered closure in registration order and aborts the spawn if one returns
+/// `Err`. Measured with a two-closure probe — both ran, in order, and the
+/// `FD_CLOEXEC` clear performed by the first was visible to the second — so the
+/// C1 property that closure carries is untouched.
+fn limit_child_processes(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Sized here, in the parent: see `uid_task_count`.
+    let Some(want) = child_process_limit() else {
+        // No measurement, no brake. Failing *closed* would refuse the job over a
+        // limit that is best-effort to begin with, and would do it on exactly the
+        // hosts where the sizing is least understood.
+        return;
+    };
+    // SAFETY: `pre_exec` runs between `fork` and `exec`, in the child. The
+    // closure does two raw syscalls — `getrlimit` and `setrlimit` — and nothing
+    // else: no allocation, no lock, no `errno` read. That matters because the
+    // child is a copy of a multi-threaded process, so anything that could take a
+    // lock another thread held at the fork would deadlock here. Neither call is
+    // on POSIX's async-signal-safe list, which is a weaker guarantee than the
+    // `fcntl` closure in `sandbox` claims; on Linux both are direct syscall
+    // wrappers with no libc-side state, and that is what makes them safe in this
+    // region in practice rather than by standard.
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // Never *raise* a limit the operator already set tighter: a systemd
+            // `LimitNPROC=64` is a decision, and a job quietly given more would be
+            // a widening of it. Lower, or leave alone.
+            if libc::getrlimit(libc::RLIMIT_NPROC, &mut current) != 0 || current.rlim_cur <= want {
+                return Ok(());
+            }
+            let limit = libc::rlimit {
+                rlim_cur: want,
+                rlim_max: want,
+            };
+            // Deliberately unchecked: a brake that could not be applied must not
+            // fail the job. `rlim_max` is lowered with `rlim_cur`, so the job
+            // cannot lift it again — raising it needs `CAP_SYS_RESOURCE`.
+            libc::setrlimit(libc::RLIMIT_NPROC, &limit);
+            Ok(())
+        });
+    }
+}
+
+/// What a bounded capture saw.
+struct Capture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// At least one pipe reached [`MAX_OUTPUT_BYTES`], so the child was killed.
+    truncated: bool,
+    /// A pipe was still open when the capture stopped. Only
+    /// [`POST_CAP_DRAIN_GRACE`] or the job's deadline can cause it, and
+    /// `truncated` says which.
+    gave_up: bool,
+}
+
+/// Read a pipe to EOF, or to `cap` bytes — whichever comes first. The `bool` is
+/// `true` when the cap is what stopped it.
+///
+/// The reader is **owned**, not borrowed, and that is load-bearing: when this
+/// future completes, the `ChildStdout`/`ChildStderr` it holds is dropped, which
+/// closes that read end. A producer still writing to a pipe with no reader gets
+/// `SIGPIPE`, so the cap does not merely stop *reading* — it stops the
+/// *producer*, even one the shell forked instead of `exec`ed.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    mut r: R,
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk).await {
+            // A read error is an end, not a failure: the child's exit status is
+            // what reports failure, and a job whose pipe died has no more output
+            // to give either way.
+            Ok(0) | Err(_) => return (buf, false),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= cap {
+                    buf.truncate(cap);
+                    return (buf, true);
+                }
+            }
+        }
+    }
+}
+
+/// Read both pipes under the byte cap, killing the child as soon as either cap
+/// is reached, and stop when both pipes end.
+///
+/// The readers are spawned rather than pinned in place, so a finished reader
+/// drops its pipe and the producer dies of `SIGPIPE` — see [`read_capped`].
+///
+/// Spawning has one cost, stated rather than hidden: if this future is dropped
+/// mid-capture — the lease-loss path drops `execute_now`, which drops `run` —
+/// the two reader tasks are **detached, not cancelled**. They are still bounded:
+/// `kill_on_drop` kills the direct child, both pipes then reach EOF, and each
+/// reader stops at the cap in any case, so neither can outlive the pipes it
+/// reads.
+async fn capture_capped(
+    child: &mut tokio::process::Child,
+    deadline_at: tokio::time::Instant,
+) -> Capture {
+    // Both are `Stdio::piped()` at the spawn in `run`, so this arm is
+    // unreachable; an empty capture is the safe reading rather than a panic in a
+    // job runner.
+    let (Some(stdout_pipe), Some(stderr_pipe)) = (child.stdout.take(), child.stderr.take()) else {
+        return Capture {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+            gave_up: false,
+        };
+    };
+    let mut out = tokio::spawn(read_capped(stdout_pipe, MAX_OUTPUT_BYTES));
+    let mut err = tokio::spawn(read_capped(stderr_pipe, MAX_OUTPUT_BYTES));
+
+    let mut out_res: Option<(Vec<u8>, bool)> = None;
+    let mut err_res: Option<(Vec<u8>, bool)> = None;
+    let mut truncated = false;
+    let mut killed = false;
+    let mut drain_until: Option<tokio::time::Instant> = None;
+
+    while out_res.is_none() || err_res.is_none() {
+        // An absolute instant, so re-creating the sleep each turn does not
+        // restart it. The grace only exists once the cap has fired.
+        let until = drain_until.unwrap_or(deadline_at);
+        tokio::select! {
+            r = &mut out, if out_res.is_none() => {
+                let (buf, hit) = r.unwrap_or_else(|_| (Vec::new(), false));
+                truncated |= hit;
+                out_res = Some((buf, hit));
+            }
+            r = &mut err, if err_res.is_none() => {
+                let (buf, hit) = r.unwrap_or_else(|_| (Vec::new(), false));
+                truncated |= hit;
+                err_res = Some((buf, hit));
+            }
+            _ = tokio::time::sleep_until(until) => {
+                return Capture {
+                    stdout: out_res.take().map(|(b, _)| b).unwrap_or_default(),
+                    stderr: err_res.take().map(|(b, _)| b).unwrap_or_default(),
+                    truncated,
+                    gave_up: true,
+                };
+            }
+        }
+        if truncated && !killed {
+            killed = true;
+            let _ = child.start_kill();
+            drain_until = Some(tokio::time::Instant::now() + POST_CAP_DRAIN_GRACE);
+        }
+    }
+    Capture {
+        stdout: out_res.take().map(|(b, _)| b).unwrap_or_default(),
+        stderr: err_res.take().map(|(b, _)| b).unwrap_or_default(),
+        truncated,
+        gave_up: false,
+    }
+}
+
 // Containment used to live here, as `validate()`: a substring check for `cd /`,
 // `cd ..` and `../`. It is **deleted**, not weakened — it was never containment
 // (command substitution, `pushd` and any number of other forms walk past it).
@@ -132,11 +419,11 @@ impl Backend for ShellBackend {
         // and without it the child would keep running in the sandbox while
         // another owner runs the same task. Mirrors `run_cli_process`.
         //
-        // `spawn` + `wait_with_output` rather than `output()` is what makes the
-        // `job.timeout_secs` deadline possible: `output()` offers no deadline of
-        // its own, so a hung command never returns on its own and — with the
-        // lease heartbeat renewing — its task stays locked forever, across
-        // processes. Dropping the timed-out `wait_with_output` future drops the
+        // `spawn` rather than `output()` is what makes both bounds below
+        // possible: `output()` offers neither a deadline nor a cap of its own, so
+        // a hung command never returns on its own — and, with the lease
+        // heartbeat renewing, its task stays locked forever, across processes —
+        // and `yes` buffers without limit. Dropping the run future drops the
         // child, which `kill_on_drop` then kills.
         //
         // The stdio settings are **not** `output()`'s defaults, and the
@@ -152,16 +439,20 @@ impl Backend for ShellBackend {
         // way out real: the operator who reads it has no usable bubblewrap,
         // so a `bwrap` spawn there would fail the job for the same reason it
         // was refused, and the message would send them in a circle.
-        let child = match &self.isolation {
-            Isolation::Unconfined => Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(job_dir.path())
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?,
+        let mut child = match &self.isolation {
+            Isolation::Unconfined => {
+                let mut unconfined = Command::new("sh");
+                unconfined
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(job_dir.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                limit_child_processes(&mut unconfined);
+                unconfined.spawn()?
+            }
             _ => {
                 // `_` is `Sandboxed` — `Unavailable` returned above — and it is
                 // the **safe** default, unlike the `_` this plan warns about
@@ -190,15 +481,44 @@ impl Backend for ShellBackend {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .kill_on_drop(true)
-                    .spawn()?
+                    .kill_on_drop(true);
+                // A **second** `pre_exec` closure on the same command as the
+                // `FD_CLOEXEC` clear above. Both run, in registration order, and
+                // the first is unaffected — measured, not assumed — so C1 still
+                // holds. See `limit_child_processes`.
+                limit_child_processes(&mut sandboxed);
+                sandboxed.spawn()?
             }
         };
-        let output =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-            {
-                Ok(res) => res?,
+        // One absolute instant for both bounds below, so the capture and the exit
+        // wait share the job's deadline instead of each getting a fresh
+        // `timeout_secs`.
+        let deadline_at = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let captured = capture_capped(&mut child, deadline_at).await;
+        // The deadline is reported only when nothing else ended the job: once the
+        // cap has fired, the cap is the reason, and the deadline is at most the
+        // backstop that ended the drain.
+        if captured.gave_up && !captured.truncated {
+            job.status = JobStatus::Failed;
+            return Ok(JobOutput {
+                status: JobStatus::Failed,
+                summary: String::new(),
+                evidence: vec![],
+                errors: vec![format!("shell command timed out after {timeout_secs}s")],
+                changed_files: vec![],
+                next_step: None,
+            });
+        }
+        // The exit status, under the same deadline. On the cap path the child has
+        // just been killed and on the ordinary path both pipes are already at
+        // EOF, so this returns at once; the bound is for a child that closed its
+        // pipes and kept running.
+        let exit = if captured.gave_up {
+            None
+        } else {
+            match tokio::time::timeout_at(deadline_at, child.wait()).await {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(_)) => None,
                 Err(_) => {
                     job.status = JobStatus::Failed;
                     return Ok(JobOutput {
@@ -210,25 +530,33 @@ impl Backend for ShellBackend {
                         next_step: None,
                     });
                 }
-            };
-        let exit = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let status = if output.status.success() {
-            JobStatus::Succeeded
-        } else {
+            }
+        };
+        let stdout = String::from_utf8_lossy(&captured.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&captured.stderr).into_owned();
+        let mut errors = Vec::new();
+        if captured.truncated {
+            errors.push(format!("output exceeded the {MAX_OUTPUT_BYTES}-byte cap"));
+        }
+        if !stderr.is_empty() {
+            errors.push(stderr);
+        }
+        // A truncated capture is incomplete by construction, so the job is not a
+        // success even when the child exited 0: `Backend::verify_result` reads
+        // `Succeeded` as "this output can be trusted".
+        let status = if captured.truncated || !exit.is_some_and(|s| s.success()) {
             JobStatus::Failed
+        } else {
+            JobStatus::Succeeded
         };
         job.status = status.clone();
         Ok(JobOutput {
             status,
             summary: stdout.trim().to_string(),
-            evidence: vec![Evidence::ExitCode { code: exit }],
-            errors: if stderr.is_empty() {
-                vec![]
-            } else {
-                vec![stderr]
-            },
+            evidence: vec![Evidence::ExitCode {
+                code: exit.and_then(|s| s.code()).unwrap_or(-1),
+            }],
+            errors,
             changed_files: vec![],
             next_step: None,
         })
@@ -805,6 +1133,163 @@ mod tests {
             !finished.exists(),
             "the timed-out shell child survived the deadline: {} appeared",
             finished.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_infinite_producer_is_stopped_by_the_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // `Unconfined`, deliberately — see the note below the test. The cap lives
+        // in the shared capture block *after* the two-launch `match`, so this
+        // test does not need a real `bwrap` on the host to have teeth, and under
+        // `Sandboxed` it would be a test of the host's tooling rather than of the
+        // cap. No grant is held either way: the shipped grant set is empty, and
+        // the unconfined launch reads no grants at all.
+        let b = ShellBackend::new(dir.path().into()).with_isolation(Isolation::Unconfined);
+        let mut job = crate::supervisor::job::Job::new(
+            "t",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            "yes",
+        );
+        job.timeout_secs = 60; // far longer than the test may take
+        let out = crate::supervisor::bounded("yes", b.run(&mut job, &RunContext::new()))
+            .await
+            .unwrap();
+        // The cap must be the *reason* the job ended, not merely a bound its
+        // output happened to fit under. `yes` produces without limit, so a run
+        // that ended any other way — the child failed to start, the deadline
+        // fired, the pipe closed — must not satisfy this test, and a bare
+        // `bytes <= cap` assertion would let all three through. `byte cap` is
+        // the wording Step 3 mandates for this error.
+        assert!(
+            out.errors.iter().any(|e| e.contains("byte cap")),
+            "the byte cap must be what stopped the job, got {:?}",
+            out.errors
+        );
+        let bytes: usize = out.summary.len() + out.errors.iter().map(|e| e.len()).sum::<usize>();
+        assert!(
+            bytes >= MAX_OUTPUT_BYTES,
+            "the cap must have been reached before the kill, got {bytes}"
+        );
+        assert!(
+            bytes <= MAX_OUTPUT_BYTES + 4096,
+            "cap not enforced: {bytes}"
+        );
+    }
+
+    /// The same cap, on the **sandboxed** launch arm.
+    ///
+    /// `an_infinite_producer_is_stopped_by_the_byte_cap` runs `Unconfined`, and
+    /// the plan gives up sandboxed-arm coverage here on purpose (review finding
+    /// M9): a cap test that needed a real `bwrap` would be a test of the host.
+    /// That leaves one thing unproven — "the capture block is shared" is a claim
+    /// about the *code*, and a change that moved the cap into the `Unconfined`
+    /// arm alone would leave the test above green while the sandboxed launch
+    /// buffered `yes` without limit. This test dies on that mutant, and it is
+    /// gated exactly like `the_sandboxed_launch_is_a_real_sandbox`: a host with
+    /// no usable bubblewrap skips (visibly, via `no_real_bwrap`) instead of
+    /// failing on a spawn error.
+    #[tokio::test]
+    async fn the_sandboxed_launch_is_stopped_by_the_same_byte_cap() {
+        let root = tempfile::tempdir().unwrap();
+        // Held for the whole test: the gate, `Isolation::resolve` and `b.run`
+        // all let `bwrap` resolve through `PATH`, and a stub alive on another
+        // libtest thread would answer for this host.
+        let host_path = sandbox::tests::real_path();
+        let host_can = sandbox::tests::bwrap_can_sandbox_here(&host_path).await;
+        // Deliberately read for the **skip branch only**. The two older
+        // real-bwrap tests also assert `Sandboxed` on the non-skip path, because
+        // they take their mode from `resolve`; this one hard-codes
+        // `Isolation::Sandboxed` below, so a `resolve` that disagreed would not
+        // change which arm ran and asserting it here would add an unrelated
+        // failure mode. What the fail-closed outcome owes is asserted, and
+        // `the_sandboxed_launch_is_a_real_sandbox` is where a resolver that
+        // refuses a host that can sandbox is caught.
+        let isolation =
+            Isolation::resolve(&ShellSandboxConfig::default(), &Grants::default()).await;
+        if !host_can {
+            sandbox::tests::no_real_bwrap("the_sandboxed_launch_is_stopped_by_the_same_byte_cap");
+            assert!(
+                matches!(isolation, Isolation::Unavailable(_)),
+                "with no boundary proven the only other outcome is a refusal, got {isolation:?}"
+            );
+            return;
+        }
+        let b = ShellBackend::new(root.path().into()).with_isolation(Isolation::Sandboxed);
+        let mut job = crate::supervisor::job::Job::new(
+            "t",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            "yes",
+        );
+        job.timeout_secs = 60;
+
+        let out = crate::supervisor::bounded(
+            "yes under the sandbox",
+            b.run(&mut job, &RunContext::new()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.errors.iter().any(|e| e.contains("byte cap")),
+            "the byte cap must stop the sandboxed launch too, got {:?}",
+            out.errors
+        );
+        let bytes: usize = out.summary.len() + out.errors.iter().map(|e| e.len()).sum::<usize>();
+        assert!(
+            bytes >= MAX_OUTPUT_BYTES,
+            "the cap must have been reached before the kill, got {bytes}"
+        );
+        assert!(
+            bytes <= MAX_OUTPUT_BYTES + 4096,
+            "cap not enforced: {bytes}"
+        );
+    }
+
+    /// The cap on **stderr**, which neither test above can see.
+    ///
+    /// Both of them produce on stdout, so a mutation that gave the stderr reader
+    /// its own unbounded cap — `read_capped(stderr_pipe, usize::MAX)` — leaves
+    /// them green while `sh -c 'yes 1>&2'` runs to EOF and the whole thing lands
+    /// in `errors`, which is `JobOutput` and therefore the job row. Spec §5
+    /// lists stderr as a bound this change *adds*, and names the reason: a
+    /// runaway producer must not inflate the database.
+    ///
+    /// This is also the only test that drives the capture's `err` branch to the
+    /// cap: stdout ends immediately here, so the loop is waiting on stderr alone
+    /// when the cap fires.
+    #[tokio::test]
+    async fn the_stderr_cap_stops_an_infinite_stderr_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = ShellBackend::new(dir.path().into()).with_isolation(Isolation::Unconfined);
+        let mut job = crate::supervisor::job::Job::new(
+            "t",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            "yes 1>&2",
+        );
+        job.timeout_secs = 60; // far longer than the test may take
+        let out = crate::supervisor::bounded("yes 1>&2", b.run(&mut job, &RunContext::new()))
+            .await
+            .unwrap();
+        // The error strings are printed by length, not by value: the failure
+        // case here is a 256 KiB run of `y`, and dumping it into the test log
+        // would hide the assertion it is meant to explain.
+        let lengths: Vec<usize> = out.errors.iter().map(|e| e.len()).collect();
+        assert!(
+            out.errors.iter().any(|e| e.contains("byte cap")),
+            "the byte cap must stop an unbounded stderr producer too, got errors of {lengths:?} bytes"
+        );
+        let bytes: usize = out.summary.len() + out.errors.iter().map(|e| e.len()).sum::<usize>();
+        assert!(
+            bytes >= MAX_OUTPUT_BYTES,
+            "the cap must have been reached before the kill, got {bytes}"
+        );
+        assert!(
+            bytes <= MAX_OUTPUT_BYTES + 4096,
+            "the stderr cap is not enforced: {bytes} bytes"
         );
     }
 }
