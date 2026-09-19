@@ -509,6 +509,69 @@ impl MemoryStore {
             }
         }
 
+        // Migration: `sup_transitions.task_id` must be nullable.
+        //
+        // A grant is process-wide, not task-scoped: `/allow /etc` is not a
+        // transition of any task, so its audit row has no `sup_tasks` row to
+        // point at. The column was declared NOT NULL with a foreign key, which
+        // makes that row impossible to write. NULL is allowed in a foreign key
+        // column, so the rebuild is enough — no foreign key is dropped.
+        //
+        // `PRAGMA foreign_keys=OFF` must precede `BEGIN`: SQLite ignores the
+        // pragma inside a transaction, and with it on, `DROP TABLE` would
+        // cascade or refuse. It is restored after `COMMIT`.
+        //
+        // `sup_transitions` carries **no index**, verified against the DDL
+        // above, so the rebuild loses none — which is the one thing that would
+        // make this migration lossy rather than merely slow.
+        // `notnull` is a **reserved SQLite keyword**, so the unquoted form is a
+        // syntax error, not a false answer: `SELECT notnull FROM
+        // pragma_table_info(...)` fails to parse. The plan's snippet wrote it
+        // unquoted and then wrapped the result in `.unwrap_or(false)`, which
+        // swallowed that syntax error and read it as "no rebuild needed" — so
+        // the migration was dead code that looked alive, and the only symptom
+        // was a NOT NULL violation much later, at the first audit write. The
+        // identifier is quoted, and a real error is propagated rather than
+        // collapsed into `false`.
+        let not_null: bool = match conn.query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('sup_transitions') WHERE name = 'task_id'",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(n) => n == 1,
+            // The table does not exist yet: nothing to rebuild.
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                return Err(e).context("read sup_transitions.task_id nullability");
+            }
+        };
+        if not_null {
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 BEGIN;
+                 CREATE TABLE sup_transitions_new (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     task_id     TEXT,
+                     from_state  TEXT NOT NULL,
+                     to_state    TEXT NOT NULL,
+                     reason      TEXT,
+                     actor       TEXT NOT NULL,
+                     occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY (task_id) REFERENCES sup_tasks(id)
+                 );
+                 INSERT INTO sup_transitions_new
+                     (id, task_id, from_state, to_state, reason, actor, occurred_at)
+                     SELECT id, task_id, from_state, to_state, reason, actor, occurred_at
+                     FROM sup_transitions;
+                 DROP TABLE sup_transitions;
+                 ALTER TABLE sup_transitions_new RENAME TO sup_transitions;
+                 COMMIT;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .context("rebuild sup_transitions so task_id is nullable")?;
+            info!("Rebuilt sup_transitions so a grant audit row can be written");
+        }
+
         Ok(())
     }
 }

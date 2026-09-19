@@ -832,8 +832,26 @@ back the ability to replace the root itself. Containment is component-wise, so
 a path that no longer exists, so a grant cannot outlive the operator's ability
 to take it back.
 
+Every grant change is written to `sup_transitions` as an audit row with a
+**NULL `task_id`**: a grant is process-wide, not a transition of any task. That
+row was impossible to write before — the column was `NOT NULL` with a foreign key
+to `sup_tasks` — so `run_migrations` rebuilds the table to make it nullable, and
+`TaskStore::record_grant_audit` inserts it directly. A grant that takes effect but
+whose audit row cannot be written says so in the reply rather than reporting
+success.
+
+> **`notnull` is a reserved SQLite keyword.** The check that gates that rebuild
+> reads `pragma_table_info`, and the unquoted form — `SELECT notnull FROM
+> pragma_table_info(...)` — is a **syntax error**, not a false answer. Wrapped in
+> `.unwrap_or(false)` it reads as "no rebuild needed", so the migration becomes
+> dead code that looks alive, and the only symptom is a `NOT NULL constraint
+> failed` at the first audit write, far from the cause. The identifier is quoted
+> and a real error is propagated instead of collapsed into `false`.
+
 **Known limitation: a grant is in-memory only.** There is no `sup_grants` table
-and no migration, so every grant is lost on restart and must be re-issued. The
+and nothing restores grants at startup, so every grant is lost on restart and
+must be re-issued — the audit log records that it *was* issued, not that it still
+holds. The
 `Supervisor` also refuses to grant at all when it was never told its sandbox
 root (`with_sandbox_root`), because the ancestor check is what stops a grant
 from handing back the sandbox — a guessed root would be a guessed containment

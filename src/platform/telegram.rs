@@ -328,10 +328,10 @@ pub(crate) async fn dispatch_supervisor_command(
         "cancel" => lifecycle_command(arg, supervisor, LifecycleAction::Cancel).await,
         "approve" => lifecycle_command(arg, supervisor, LifecycleAction::Approve).await,
         "clarify" => clarify_command(arg, supervisor).await,
-        "allow" => allow_command(arg, supervisor),
-        "deny" => deny_command(arg, supervisor),
-        "allow_net" => allow_net_command(supervisor),
-        "deny_net" => deny_net_command(supervisor),
+        "allow" => allow_command(arg, actor, supervisor).await,
+        "deny" => deny_command(arg, actor, supervisor).await,
+        "allow_net" => allow_net_command(actor, supervisor).await,
+        "deny_net" => deny_net_command(actor, supervisor).await,
         "grants" => grants_command(supervisor),
         // Unreachable while `SUPERVISOR_COMMANDS` and this match agree. A
         // bounded answer rather than a panic keeps the two honest.
@@ -350,18 +350,43 @@ pub(crate) async fn dispatch_supervisor_command(
     Ok(true)
 }
 
+/// Record a grant change in the audit log, and say so in the reply when that
+/// fails.
+///
+/// The grant is **already in force** when this runs, so a failed audit must not
+/// report the command as failed — that would be a false statement about the
+/// boundary. It reports the *audit* as failed, which is a different and
+/// actionable thing.
+async fn audit_note(supervisor: &Supervisor, actor: &SupervisorActor, reason: &str) -> String {
+    match supervisor
+        .audit_grant(&actor.user_id.to_string(), reason)
+        .await
+    {
+        Ok(()) => String::new(),
+        Err(e) => {
+            format!("\nWARNING: the grant took effect, but its audit row was NOT written: {e:#}")
+        }
+    }
+}
+
 /// `/allow <absolute-path>` — grant a shell job read-write access to one host
 /// path, for every future job until it is revoked.
 ///
 /// The reply names what is **now held**, not merely what changed: a grant is
 /// cumulative state, and an operator issuing two grants needs to see the set,
 /// not the delta.
-fn allow_command(arg: &str, supervisor: &Supervisor) -> String {
+async fn allow_command(arg: &str, actor: &SupervisorActor, supervisor: &Supervisor) -> String {
     match supervisor.allow_path(arg) {
         Ok(path) => format!(
-            "Granted write access to {}.\nHeld now: {}",
+            "Granted write access to {}.\nHeld now: {}{}",
             path.display(),
-            supervisor.granted()
+            supervisor.granted(),
+            audit_note(
+                supervisor,
+                actor,
+                &format!("grant write {}", path.display())
+            )
+            .await
         ),
         // `{e:#}` rather than `{e}`: anyhow's plain `Display` prints only the
         // outermost context, and the refusal reasons are in the chain.
@@ -370,12 +395,18 @@ fn allow_command(arg: &str, supervisor: &Supervisor) -> String {
 }
 
 /// `/deny <absolute-path>` — revoke a write grant.
-fn deny_command(arg: &str, supervisor: &Supervisor) -> String {
+async fn deny_command(arg: &str, actor: &SupervisorActor, supervisor: &Supervisor) -> String {
     match supervisor.deny_path(arg) {
         Ok(path) => format!(
-            "Revoked write access to {}.\nHeld now: {}",
+            "Revoked write access to {}.\nHeld now: {}{}",
             path.display(),
-            supervisor.granted()
+            supervisor.granted(),
+            audit_note(
+                supervisor,
+                actor,
+                &format!("revoke write {}", path.display())
+            )
+            .await
         ),
         Err(e) => format!("Refused: {e:#}"),
     }
@@ -386,19 +417,21 @@ fn deny_command(arg: &str, supervisor: &Supervisor) -> String {
 /// The reply carries the warning, because this is the grant that widens the
 /// boundary most: with it, a sandboxed job can reach a local service that can
 /// run commands on the host.
-fn allow_net_command(supervisor: &Supervisor) -> String {
+async fn allow_net_command(actor: &SupervisorActor, supervisor: &Supervisor) -> String {
     format!(
         "Granted the host network namespace. A sandboxed job can now reach anything this host \
-         can, including loopback services.\nHeld now: {}",
-        supervisor.allow_network()
+         can, including loopback services.\nHeld now: {}{}",
+        supervisor.allow_network(),
+        audit_note(supervisor, actor, "grant the host network namespace").await
     )
 }
 
 /// `/deny-net` — stop sharing the host network namespace.
-fn deny_net_command(supervisor: &Supervisor) -> String {
+async fn deny_net_command(actor: &SupervisorActor, supervisor: &Supervisor) -> String {
     format!(
-        "Revoked the host network namespace.\nHeld now: {}",
-        supervisor.deny_network()
+        "Revoked the host network namespace.\nHeld now: {}{}",
+        supervisor.deny_network(),
+        audit_note(supervisor, actor, "revoke the host network namespace").await
     )
 }
 
@@ -2934,18 +2967,20 @@ mod tests {
         // No argument, `/`, and a relative path are three different mistakes,
         // each refused rather than granted.
         for bad in ["", "/", "relative/path"] {
-            let reply = allow_command(bad, &sup);
+            let reply = allow_command(bad, &actor(), &sup).await;
             assert!(
                 reply.starts_with("Refused:"),
                 "{bad:?} must be refused, got {reply}"
             );
         }
         // The sandbox root itself is refused too.
-        assert!(allow_command(dir.path().to_str().unwrap(), &sup).starts_with("Refused:"));
+        assert!(allow_command(dir.path().to_str().unwrap(), &actor(), &sup)
+            .await
+            .starts_with("Refused:"));
 
         assert!(grants_command(&sup).contains("nothing is granted"));
 
-        let reply = allow_command("/usr", &sup);
+        let reply = allow_command("/usr", &actor(), &sup).await;
         assert!(
             reply.contains("Granted write access to /usr"),
             "got {reply}"
@@ -2956,7 +2991,7 @@ mod tests {
             grants_command(&sup)
         );
 
-        let reply = deny_command("/usr", &sup);
+        let reply = deny_command("/usr", &actor(), &sup).await;
         assert!(
             reply.contains("Revoked write access to /usr"),
             "got {reply}"
@@ -2965,7 +3000,7 @@ mod tests {
 
         // Network is a separate capability, and its reply carries the warning:
         // this is the grant that widens the boundary most.
-        let reply = allow_net_command(&sup);
+        let reply = allow_net_command(&actor(), &sup).await;
         assert!(reply.contains("network namespace"), "got {reply}");
         assert!(
             reply.contains("loopback"),
@@ -2973,8 +3008,50 @@ mod tests {
         );
         assert!(grants_command(&sup).contains("network"));
 
-        assert!(deny_net_command(&sup).contains("Revoked"));
+        assert!(deny_net_command(&actor(), &sup).await.contains("Revoked"));
         assert!(grants_command(&sup).contains("nothing is granted"));
+    }
+
+    /// A grant writes an audit row, and that row belongs to **no task**.
+    ///
+    /// This is the assertion the migration exists for: `sup_transitions.task_id`
+    /// was `NOT NULL` with a foreign key to `sup_tasks`, so a grant's row had no
+    /// legal value and both the insert and the audit were lost. The reply is
+    /// checked for `WARNING` as well as the row being checked for existence —
+    /// without that, a silently-failing audit would still leave the row absent
+    /// and this test would fail for the right reason but name the wrong one.
+    #[tokio::test]
+    async fn a_grant_writes_an_audit_row_that_belongs_to_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conn = memory.connection();
+        let sup = crate::supervisor::Supervisor::new_for_test(dir.path().into(), conn.clone())
+            .with_sandbox_root(dir.path().into());
+
+        let reply = allow_command("/usr", &actor(), &sup).await;
+        assert!(reply.contains("Granted"), "got {reply}");
+        assert!(
+            !reply.contains("WARNING"),
+            "the audit row must have been written: {reply}"
+        );
+
+        let conn = conn.lock().await;
+        let (task_id, reason, who): (Option<String>, String, String) = conn
+            .query_row(
+                "SELECT task_id, reason, actor FROM sup_transitions WHERE reason LIKE 'grant write%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("a grant must leave an audit row");
+        assert!(
+            task_id.is_none(),
+            "a grant belongs to no task, got {task_id:?}"
+        );
+        assert!(
+            reason.contains("/usr"),
+            "the row must name the path: {reason}"
+        );
+        assert_eq!(who, ALLOWED_USER_ID.to_string());
     }
 
     /// The supervisor refuses to grant at all when it was never told its sandbox
@@ -2987,7 +3064,7 @@ mod tests {
         // No `with_sandbox_root`.
         let sup =
             crate::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection());
-        let reply = allow_command("/usr", &sup);
+        let reply = allow_command("/usr", &actor(), &sup).await;
         assert!(
             reply.starts_with("Refused:") && reply.contains("sandbox root"),
             "got {reply}"

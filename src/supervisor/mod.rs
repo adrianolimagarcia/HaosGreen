@@ -748,6 +748,13 @@ impl Supervisor {
         self.grants.read().unwrap().describe()
     }
 
+    /// Record a grant change in the audit log. A grant belongs to no task, so
+    /// the row is written with a NULL `task_id`; see
+    /// [`TaskStore::record_grant_audit`].
+    pub async fn audit_grant(&self, actor: &str, reason: &str) -> anyhow::Result<()> {
+        self.store.record_grant_audit(actor, reason).await
+    }
+
     /// Would this task select the shell backend?
     ///
     /// Derived from the registry rather than from a hand-written predicate, so

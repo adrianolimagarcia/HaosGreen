@@ -80,6 +80,30 @@ pub struct TransitionRow {
 }
 
 impl TaskStore {
+    /// Append an audit row that belongs to no task.
+    ///
+    /// `record_transition` is the wrong tool twice over: a grant is not a state
+    /// transition, and its row has no task to point at, so the foreign key
+    /// refuses the insert and the `sup_tasks` compare-and-swap answers
+    /// `not_found`. The row is inserted directly, with a NULL `task_id` — which
+    /// is why the migration in `memory::run_migrations` makes that column
+    /// nullable.
+    ///
+    /// `from_state`/`to_state` are both `Route`: the columns are NOT NULL and
+    /// this is not a transition at all — `reason` carries the meaning, and it
+    /// names the actor's action, the path and whether it was granted or revoked.
+    pub async fn record_grant_audit(&self, actor: &str, reason: &str) -> Result<()> {
+        let state = serde_json::to_string(&TaskStatus::Route)?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sup_transitions (task_id, from_state, to_state, reason, actor)
+             VALUES (NULL, ?1, ?2, ?3, ?4)",
+            rusqlite::params![state, state, reason, actor],
+        )
+        .context("insert sup_transitions grant audit row")?;
+        Ok(())
+    }
+
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self { conn }
     }
