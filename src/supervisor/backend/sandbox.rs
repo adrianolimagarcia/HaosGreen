@@ -685,7 +685,7 @@ impl Grants {
             }
         }
         if declared.network && !self.network {
-            out.push("the host network namespace — grant it with `/allow-net`".to_string());
+            out.push("the host network namespace — grant it with `/allow_net`".to_string());
         }
         out
     }

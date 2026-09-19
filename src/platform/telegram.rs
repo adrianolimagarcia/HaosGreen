@@ -188,6 +188,17 @@ fn supervisor_commands() -> Vec<teloxide::types::BotCommand> {
             "clarify",
             "Answer a supervisor clarification prompt: /clarify <id> <text>",
         ),
+        BotCommand::new(
+            "allow",
+            "Grant shell jobs write access to a host path: /allow <absolute-path>",
+        ),
+        BotCommand::new("deny", "Revoke a write grant: /deny <absolute-path>"),
+        BotCommand::new(
+            "allow_net",
+            "Share the host network namespace with sandboxed shell jobs",
+        ),
+        BotCommand::new("deny_net", "Stop sharing the host network namespace"),
+        BotCommand::new("grants", "Show the grants currently held"),
     ]
 }
 
@@ -198,13 +209,23 @@ fn supervisor_commands() -> Vec<teloxide::types::BotCommand> {
 /// Kept in step with [`supervisor_commands`] by the test
 /// `the_published_menu_and_the_router_name_the_same_commands`, which compares
 /// the two lists rather than restating either.
-pub(crate) const SUPERVISOR_COMMANDS: [&str; 6] = [
+pub(crate) const SUPERVISOR_COMMANDS: [&str; 11] = [
     "supervise",
     "tasks",
     "resume",
     "cancel",
     "approve",
     "clarify",
+    "allow",
+    "deny",
+    // Underscores, **not** hyphens: Telegram `BotCommand` names must match
+    // `[a-z0-9_]{1,32}`, so `/allow-net` is not a command Telegram will accept
+    // or publish — the plan names it that way and the plan is wrong. The
+    // assertion in `test_supported_commands_lists_user_visible_commands` is what
+    // caught it.
+    "allow_net",
+    "deny_net",
+    "grants",
 ];
 
 /// Longest `/supervise` task text the dispatcher forwards, in characters. The
@@ -307,6 +328,11 @@ pub(crate) async fn dispatch_supervisor_command(
         "cancel" => lifecycle_command(arg, supervisor, LifecycleAction::Cancel).await,
         "approve" => lifecycle_command(arg, supervisor, LifecycleAction::Approve).await,
         "clarify" => clarify_command(arg, supervisor).await,
+        "allow" => allow_command(arg, supervisor),
+        "deny" => deny_command(arg, supervisor),
+        "allow_net" => allow_net_command(supervisor),
+        "deny_net" => deny_net_command(supervisor),
+        "grants" => grants_command(supervisor),
         // Unreachable while `SUPERVISOR_COMMANDS` and this match agree. A
         // bounded answer rather than a panic keeps the two honest.
         other => format!("Unknown supervisor command: /{other}"),
@@ -322,6 +348,67 @@ pub(crate) async fn dispatch_supervisor_command(
         .await
         .context("send a supervisor command reply")?;
     Ok(true)
+}
+
+/// `/allow <absolute-path>` — grant a shell job read-write access to one host
+/// path, for every future job until it is revoked.
+///
+/// The reply names what is **now held**, not merely what changed: a grant is
+/// cumulative state, and an operator issuing two grants needs to see the set,
+/// not the delta.
+fn allow_command(arg: &str, supervisor: &Supervisor) -> String {
+    match supervisor.allow_path(arg) {
+        Ok(path) => format!(
+            "Granted write access to {}.\nHeld now: {}",
+            path.display(),
+            supervisor.granted()
+        ),
+        // `{e:#}` rather than `{e}`: anyhow's plain `Display` prints only the
+        // outermost context, and the refusal reasons are in the chain.
+        Err(e) => format!("Refused: {e:#}"),
+    }
+}
+
+/// `/deny <absolute-path>` — revoke a write grant.
+fn deny_command(arg: &str, supervisor: &Supervisor) -> String {
+    match supervisor.deny_path(arg) {
+        Ok(path) => format!(
+            "Revoked write access to {}.\nHeld now: {}",
+            path.display(),
+            supervisor.granted()
+        ),
+        Err(e) => format!("Refused: {e:#}"),
+    }
+}
+
+/// `/allow-net` — share the host network namespace with sandboxed jobs.
+///
+/// The reply carries the warning, because this is the grant that widens the
+/// boundary most: with it, a sandboxed job can reach a local service that can
+/// run commands on the host.
+fn allow_net_command(supervisor: &Supervisor) -> String {
+    format!(
+        "Granted the host network namespace. A sandboxed job can now reach anything this host \
+         can, including loopback services.\nHeld now: {}",
+        supervisor.allow_network()
+    )
+}
+
+/// `/deny-net` — stop sharing the host network namespace.
+fn deny_net_command(supervisor: &Supervisor) -> String {
+    format!(
+        "Revoked the host network namespace.\nHeld now: {}",
+        supervisor.deny_network()
+    )
+}
+
+/// `/grants` — what the operator currently holds.
+///
+/// Without this the four commands above are write-only, and an operator who has
+/// forgotten whether `/allow-net` was issued has no way to find out short of
+/// restarting the process.
+fn grants_command(supervisor: &Supervisor) -> String {
+    format!("Held: {}", supervisor.granted())
 }
 
 /// `/supervise <text>` — create and route a supervisor task.
@@ -2827,6 +2914,83 @@ mod tests {
         assert_eq!(
             classify_attachment_kind("application/zip", Some("archive.zip")),
             AttachmentKind::Other
+        );
+    }
+
+    /// The grant commands refuse, grant, list and revoke — end to end through
+    /// the handlers the dispatcher calls.
+    ///
+    /// Each refusal is asserted to start with `Refused:`, not merely to be
+    /// non-empty: an implementation that answered "Granted" to `/allow /` would
+    /// pass a weaker assertion while handing back the whole filesystem.
+    #[tokio::test]
+    async fn the_grant_commands_refuse_grant_list_and_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup =
+            crate::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection())
+                .with_sandbox_root(dir.path().into());
+
+        // No argument, `/`, and a relative path are three different mistakes,
+        // each refused rather than granted.
+        for bad in ["", "/", "relative/path"] {
+            let reply = allow_command(bad, &sup);
+            assert!(
+                reply.starts_with("Refused:"),
+                "{bad:?} must be refused, got {reply}"
+            );
+        }
+        // The sandbox root itself is refused too.
+        assert!(allow_command(dir.path().to_str().unwrap(), &sup).starts_with("Refused:"));
+
+        assert!(grants_command(&sup).contains("nothing is granted"));
+
+        let reply = allow_command("/usr", &sup);
+        assert!(
+            reply.contains("Granted write access to /usr"),
+            "got {reply}"
+        );
+        assert!(
+            grants_command(&sup).contains("/usr"),
+            "got {}",
+            grants_command(&sup)
+        );
+
+        let reply = deny_command("/usr", &sup);
+        assert!(
+            reply.contains("Revoked write access to /usr"),
+            "got {reply}"
+        );
+        assert!(grants_command(&sup).contains("nothing is granted"));
+
+        // Network is a separate capability, and its reply carries the warning:
+        // this is the grant that widens the boundary most.
+        let reply = allow_net_command(&sup);
+        assert!(reply.contains("network namespace"), "got {reply}");
+        assert!(
+            reply.contains("loopback"),
+            "the warning must be in the reply: {reply}"
+        );
+        assert!(grants_command(&sup).contains("network"));
+
+        assert!(deny_net_command(&sup).contains("Revoked"));
+        assert!(grants_command(&sup).contains("nothing is granted"));
+    }
+
+    /// The supervisor refuses to grant at all when it was never told its sandbox
+    /// root — the ancestor check is what stops a grant from handing back the
+    /// sandbox, so a guessed root would be a guessed containment check.
+    #[tokio::test]
+    async fn a_grant_is_refused_when_the_sandbox_root_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        // No `with_sandbox_root`.
+        let sup =
+            crate::supervisor::Supervisor::new_for_test(dir.path().into(), memory.connection());
+        let reply = allow_command("/usr", &sup);
+        assert!(
+            reply.starts_with("Refused:") && reply.contains("sandbox root"),
+            "got {reply}"
         );
     }
 

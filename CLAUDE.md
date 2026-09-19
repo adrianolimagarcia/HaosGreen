@@ -743,8 +743,13 @@ fields to tighten the gate.
 | `/cancel <id>`      | Cancel a task |
 | `/approve <id>`     | Approve a task that hit `RequireApproval` |
 | `/clarify <id> <text>` | Reply to a `Clarify` prompt |
+| `/allow <abs-path>` | Grant shell jobs write access to one host path |
+| `/deny <abs-path>`  | Revoke a write grant |
+| `/allow_net`        | Share the host network namespace with sandboxed jobs |
+| `/deny_net`         | Stop sharing the host network namespace |
+| `/grants`           | Show the grants currently held |
 
-The six commands are routed by `dispatch_supervisor_command` in
+All eleven commands are routed by `dispatch_supervisor_command` in
 `src/platform/telegram.rs`, reachable only from users in
 `telegram.allowed_user_ids` — checked by the dispatcher's filter **and** again
 as the first statement of the handler, before any argument parsing, store read
@@ -806,11 +811,39 @@ uid's thread count plus headroom, never a constant — Linux counts that limit p
 makes every `fork` fail with `EAGAIN`. As root the whole limit is a no-op, which
 is why it is a brake and not a boundary.
 
-**Not implemented in this revision:** the operator-facing grant commands
-(`/allow`, `/deny`, `/allow-net`, `/deny-net`) and the declaration that would
-drive them. `Grants` exists as a type and the argv honours it, but nothing yet
-issues or persists a grant, so the only reachable mode is the default (no grants
-held) or `sandbox = "none"`.
+### Grants
+
+A shell job's boundary can be widened by naming a capability, never by asking
+for one. `Grants` holds a set of writable host paths and a network flag, and the
+operator releases them one at a time with `/allow`, `/deny`, `/allow_net`,
+`/deny_net` and reads them back with `/grants`.
+
+**The command names use underscores, not hyphens.** Telegram `BotCommand` names
+must match `[a-z0-9_]{1,32}`, so `/allow-net` is not a command Telegram will
+accept or publish. The design documents name it with a hyphen; the assertion in
+`test_supported_commands_lists_user_visible_commands` is what caught that.
+
+`Grants::resolve_path` refuses four things at **issue** time rather than when a
+job later fails to start: `/`, a relative path, a path that does not exist, and
+the sandbox root **or any ancestor of it** — the last because an ancestor hands
+back the ability to replace the root itself. Containment is component-wise, so
+`/…/ws-evil` is grantable while `/…/ws` is the root. A grant covers the path
+**named** and not its children, and `revoke_write` is deliberately lenient about
+a path that no longer exists, so a grant cannot outlive the operator's ability
+to take it back.
+
+**Known limitation: a grant is in-memory only.** There is no `sup_grants` table
+and no migration, so every grant is lost on restart and must be re-issued. The
+`Supervisor` also refuses to grant at all when it was never told its sandbox
+root (`with_sandbox_root`), because the ancestor check is what stops a grant
+from handing back the sandbox — a guessed root would be a guessed containment
+check.
+
+**`/allow_net` is the grant that widens the boundary most**, and the reply says
+so. Once it is held, a sandboxed job can reach any service the host can,
+including loopback — and a local service that can run commands on the host is
+then reachable from inside the sandbox. The reply names that explicitly rather
+than reporting a bare success.
 
 ### Artifacts
 

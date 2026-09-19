@@ -577,7 +577,12 @@ async fn main() -> Result<()> {
             sup_registry,
             config.supervisor.risk.clone(),
         )
-        .with_shell_isolation(isolation),
+        .with_shell_isolation(isolation)
+        // The **same** `Arc` the backend above holds, so a grant issued through
+        // `/allow` is visible to Layer 2 at once; and the resolved sandbox root,
+        // so `/allow` can refuse a grant that would cover the sandbox itself.
+        .with_grants(Arc::clone(&grants))
+        .with_sandbox_root(config.sandbox.allowed_directory.clone()),
     );
     match _supervisor.resumable_task_ids().await {
         Ok(ids) if !ids.is_empty() => info!(
