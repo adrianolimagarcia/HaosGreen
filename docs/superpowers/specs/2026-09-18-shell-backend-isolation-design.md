@@ -272,9 +272,14 @@ and, **only when the operator has granted the network**, one more flag after the
   grant, because it hands the job the host's namespace — measured as `lo enp2s0
   wlan0 tailscale0 virbr0 dnsstub`, with the operator's own LLM gateway on
   `127.0.0.1:8790` reachable from inside.
-- **The three `/etc` files for name resolution are always bound.** Without them
-  a job cannot resolve a hostname at all, and DNS resolution is a read; measured,
-  `getent hosts example.com` resolves correctly with them and fails without.
+- **The three `/etc` files for name resolution are never gated** — no grant is
+  needed to read them, because DNS resolution is a read. They are not *always
+  bound*, though: like the certificate paths they are bound only if present,
+  since bwrap aborts with exit 1 on a `--ro-bind` whose source does not exist,
+  and binding unconditionally would break every shell job on a host lacking
+  `/etc/resolv.conf`. Without them a job cannot resolve a hostname at all;
+  measured, `getent hosts example.com` resolves correctly with them and fails
+  without.
 
 - **`--new-session`** (P0). Without it the sandboxed process keeps the
   controlling terminal, and `TIOCSTI` lets it inject input into the operator's
@@ -733,10 +738,10 @@ asserts the properties the boundary claims:
 > **The three resolver files are bound but inert without the network grant.**
 > `getent hosts example.com` fails with `resolv.conf`, `hosts` and
 > `nsswitch.conf` all bound and no `--share-net`, because there is no route to a
-> resolver. They are bound unconditionally because a network grant can be issued
-> at any time and re-building the argv per grant is not worth it — but the
-> binding alone does not make name resolution work, and no check should assume
-> it does.
+> resolver. They are bound regardless of the grant because a network grant can be
+> issued at any time and re-building the argv per grant is not worth it — but the
+> binding alone does not make name resolution work, and no check should assume it
+> does.
 
 A failure at any step is `IsolationUnavailable`, with the failing step named in
 the error. The probe runs once at startup and its result is cached.
