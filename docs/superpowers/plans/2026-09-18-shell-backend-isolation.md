@@ -2865,21 +2865,22 @@ impl JobDir {
         &self.path
     }
 
-    /// A duplicate of the descriptor with `FD_CLOEXEC` **cleared**, so the child
-    /// inherits exactly this one. `try_clone` dups with `F_DUPFD_CLOEXEC`, so the
-    /// duplicate is close-on-exec until this clears it; the original keeps the
-    /// flag and is closed when `JobDir` drops. Bind the result to a name that
-    /// outlives the `spawn` call — a dropped descriptor is a closed one.
-    pub fn inheritable_fd(&self) -> Result<OwnedFd> {
-        let dup = self.fd.try_clone()?;
-        // SAFETY: `dup` is an open descriptor owned by `dup` for the call.
-        if unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
-            bail!(
-                "cannot make the job directory inheritable: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(dup)
+    /// A duplicate of the descriptor that **keeps** `FD_CLOEXEC` in the parent.
+    ///
+    /// **This is the corrected form. The text here originally cleared the flag
+    /// in the parent, and that was the C1 defect** — clearing `FD_CLOEXEC` on
+    /// the duplicate publishes it to *every* child this process spawns, from any
+    /// thread, for as long as the argv is alive, not merely to the sandboxed
+    /// job. The clear therefore belongs in the child, in the `pre_exec` hook
+    /// [`SandboxArgv::command`] installs, where it can only affect the process
+    /// about to `exec` `bwrap`.
+    ///
+    /// `try_clone` dups with `F_DUPFD_CLOEXEC`, so the duplicate is
+    /// close-on-exec and stays that way; the original keeps its flag and is
+    /// closed when `JobDir` drops. Bind the result to a name that outlives the
+    /// `spawn` call — a dropped descriptor is a closed one.
+    pub fn duplicate_fd(&self) -> Result<OwnedFd> {
+        Ok(self.fd.try_clone()?)
     }
 }
 ```
@@ -3207,7 +3208,10 @@ Add the builder:
 
 Initialise the field **fail closed** in both constructors — `Supervisor::new`
 and `Supervisor::new_for_test` — with `Isolation::default()`, which is
-`Unavailable(NotInstalled)`. A `Supervisor` built without an explicit value must
+`Unavailable(NotDecided)` (not `NotInstalled`: a backend that was merely never
+handed a decision has not established that bubblewrap is missing, and telling
+the operator to install a package they probably already have is a wrong cause
+with a plausible-sounding message). A `Supervisor` built without an explicit value must
 park shell tasks, never run them: the default has to be the refusing one, or the
 constructor becomes a way to bypass the gate.
 

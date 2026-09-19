@@ -828,8 +828,13 @@ Added, one per correction in this revision:
   symlinked level is opened as a descriptor for the symlink rather than refused
 - drop `O_NOFOLLOW` from the level open → a symlinked level is followed, so the
   open succeeds and returns a descriptor for the symlink's target
-- drop `O_CLOEXEC` → the descriptors must be shown to be inheritable by the
-  sandboxed child
+- drop `O_CLOEXEC` → under the fixed design this is **not** the inheritance
+  mechanism and the mutation is caught differently: inheritance comes from the
+  child-side clear in `SandboxArgv::command`'s `pre_exec`, so dropping
+  `O_CLOEXEC` means the *original* descriptor is inherited by every unrelated
+  child of the supervisor — a C1-class defect, not a way to make the job work.
+  The assertion that catches it is
+  `fd_flags(jd.fd.as_raw_fd()) & FD_CLOEXEC != 0` in the job-directory test
 - compare containment as **text** rather than as path components → the sibling
   case (`/…/ws-evil` beside `/…/ws`) must be refused as `OutsideRoot` and is
   instead refused as `NotItself`, which the clause assertion catches even though
