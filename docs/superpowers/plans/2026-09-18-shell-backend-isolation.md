@@ -1295,31 +1295,49 @@ git commit -m "feat(supervisor): build the hardened bubblewrap argv and smoke-pr
 
 > **As shipped** (Task 3, `src/supervisor/backend/sandbox.rs`; the source is
 > authoritative). The four tests below are the first version and are kept for
-> the record; the shipped set is **ten**, because these four leave three guards
-> unpinned and one assertion with no teeth:
+> the record. The shipped section is **24 tests**, because these four leave the
+> guards unpinned and one assertion with no teeth:
 >
-> - `refuses_the_filesystem_root_as_the_root` — `contains("/")` is satisfied by
->   *every* message the function can produce, including the `cannot create /t:
->   Permission denied` a **non-root** runner gets when the `/` guard is deleted.
->   The shipped test also requires `must not be /`;
-> - `a_relative_root_is_refused` and `empty ids` (now
->   `traversal_shaped_task_ids_…` / `…_job_ids_…`) — the `is_absolute` guard and
->   the id validation had no test at all;
-> - `traversal_shaped_*_ids_are_refused_before_anything_is_created`,
->   `a_traversal_id_does_not_create_the_root_either` and
->   `a_symlinked_task_dir_is_refused_without_writing_through_it` — the ordering
->   fix in Step 3; each asserts that **nothing was created**, not merely that an
->   error came back;
-> - `a_task_dir_symlinked_to_the_root_itself_is_refused` — the "never equal to
->   the root" clause;
-> - `a_workspace_root_is_accepted_and_the_job_dir_is_created` — the plan's
->   version checks containment and "is a directory", both of which hold for a
->   path that dropped the job id, so it now also pins the layout
->   `<root>/<task-id>/<job-id>`.
+> - `refuses_the_filesystem_root_as_the_root` — the plan's `contains("/")` is
+>   satisfied by *every* message the function can produce, including the
+>   `cannot create /t: Permission denied` a **non-root** runner gets when the `/`
+>   guard is deleted. That assertion was **removed**, not kept beside the real
+>   one: a toothless assertion inside a security test is a trap for the next
+>   reader, who may take the pair for one check and delete the wrong half. The
+>   shipped test requires `must not be /`;
+> - **`refuses_a_root_that_holds_config_toml` is inverted**, because keying the
+>   guard on `config.toml` refuses every shell job in any project workspace that
+>   has one — a Rust or Python project has one — and reports the denial as a
+>   security refusal. The guard now keys on the files this application creates in
+>   its own home (`haos-green.db`, `web-auth.toml`), and
+>   `a_project_workspace_that_holds_config_toml_is_accepted` pins the false
+>   positive as fixed;
+> - ids: `traversal_shaped_task_ids_…`, `traversal_shaped_job_ids_…`,
+>   `a_traversal_id_does_not_create_the_root_either`,
+>   `a_control_character_in_an_id_is_refused`,
+>   `an_id_is_joined_as_its_normalised_component`;
+> - ordering: `a_symlinked_task_dir_is_refused_without_writing_through_it`,
+>   `a_concurrent_swap_cannot_create_a_directory_outside_the_root`;
+> - layout and containment: `a_task_dir_symlinked_to_the_root_itself_is_refused`,
+>   `an_in_root_task_symlink_is_refused_rather_than_aliasing_the_layout`,
+>   `an_in_root_job_symlink_is_refused_rather_than_aliasing_the_layout`,
+>   `a_symlink_to_a_sibling_whose_name_extends_the_root_is_refused`;
+> - roots and levels that are not usable directories:
+>   `a_relative_root_is_refused`,
+>   `a_root_that_is_not_a_directory_is_refused_by_name`,
+>   `a_root_that_is_a_dangling_symlink_is_refused_by_name`,
+>   `a_dangling_symlink_at_a_level_is_refused_by_name`;
+> - `the_sandbox_root_is_created_when_it_does_not_exist_yet`,
+>   `resolving_the_same_job_twice_is_idempotent`,
+>   `a_newline_in_the_root_path_is_escaped_in_every_message`.
 >
-> Every one of the ten was shown to fail under a mutation that removes the guard
-> it covers, run as uid 1000 (as root the `/`-guard mutant is masked, because
-> root can really create `/t`).
+> Each was shown to fail under a mutation that removes the guard it covers, run
+> as uid 1000 — as root the `/`-guard mutant is masked, because root can really
+> create `/t`. The one exception is
+> `a_concurrent_swap_cannot_create_a_directory_outside_the_root`, which is
+> one-sided by construction: it fails only when the swap wins, which is what
+> keeps it from going red on a loaded machine. It does fail against path-based
+> creation, which is the point of it.
 
 Add to the `tests` module:
 
@@ -1376,101 +1394,289 @@ directory exists is not containment. The plan's original block is in the
 commit that first shipped Task 3; this is the version that stands:
 
 ```rust
-/// Refuse an id that is not exactly one ordinary path component.
+/// Refuse an id that does not normalise to exactly one ordinary path component,
+/// and return that component.
 ///
 /// `task_id` and `job_id` are joined onto the root, and `Path::join` lets an
 /// absolute argument replace the whole path while `..` walks out of it. Either
 /// would put the job directory outside the root — and a refusal that arrives
-/// *after* `create_dir_all` has created it is not containment, so this runs
+/// *after* the directory has been created is not containment, so this runs
 /// before the first filesystem call, including the one that creates the root.
-/// No caller has a legitimate id of any other shape: they are UUIDs.
-fn one_component(id: &str, what: &str) -> anyhow::Result<()> {
+///
+/// `Path::components()` normalises a trailing `/` and `/.` away, so `"a/"` and
+/// `"a/."` are the aliases of `"a"` that they are. What the caller joins is the
+/// **normalised** component, never the raw string: that keeps
+/// `<root>/<task-id>/<job-id>` literally true with no separator left in either
+/// id, and it matters beyond tidiness — the path form `"<root>/task-1/job-1/."`
+/// is not the same path to `create_dir_all`, which fails on it with `No such
+/// file or directory` when `task-1` does not exist yet.
+///
+/// A control character is refused outright. An id is a UUID in practice, and a
+/// newline in one is only ever an attempt to forge a line in a log or an error
+/// message; refusing it here closes that at the source, and the escaping in the
+/// messages below is the second line of defence rather than the only one.
+fn one_component<'a>(id: &'a str, what: &str) -> anyhow::Result<&'a OsStr> {
+    if id.chars().any(char::is_control) {
+        anyhow::bail!("the {what} {id:?} contains a control character");
+    }
     let mut parts = Path::new(id).components();
     match (parts.next(), parts.next()) {
-        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        (Some(std::path::Component::Normal(name)), None) => Ok(name),
         _ => anyhow::bail!("the {what} {id:?} is not a single path component"),
     }
 }
-/// Create `dir` if absent, then canonicalise it and require it to be strictly
-/// inside `root`.
+
+/// The refusal for a level that resolved to `real`, or `None` when `real` is an
+/// acceptable resolution of `dir`: strictly below `root`, and `dir` itself.
 ///
-/// Canonicalising one level at a time is what keeps a pre-existing symlink from
-/// being written through: `create_dir_all` on a symlink to an existing
-/// directory creates nothing, so the escape is refused here — before the next
-/// level, the one that would actually be created, is attempted.
-fn create_within(root: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
-    let real = std::fs::canonicalize(dir)
-        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", dir.display()))?;
-    // Two distinct refusals, because one message for both reads wrong: a path
-    // that *is* the root, reported as "outside" it, sends a reader looking for
-    // a traversal that never happened.
+/// One function rather than a check at each site, so that a mutation removing a
+/// clause is not masked by the same clause surviving in a second copy.
+fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<anyhow::Error> {
+    // Three distinct refusals, because one message for all of them reads wrong:
+    // a path that *is* the root, reported as "outside" it, sends a reader
+    // looking for a traversal that never happened.
     if real == root {
-        anyhow::bail!(
-            "the sandbox path {} is the sandbox root itself, not below it",
-            real.display()
-        );
+        return Some(anyhow::anyhow!(
+            "the sandbox path {real:?} is the sandbox root itself, not below it"
+        ));
     }
     if !real.starts_with(root) {
-        anyhow::bail!(
-            "the sandbox path {} resolved outside the sandbox root {}",
-            real.display(),
-            root.display()
-        );
+        return Some(anyhow::anyhow!(
+            "the sandbox path {real:?} resolved outside the sandbox root {root:?}"
+        ));
     }
-    Ok(real)
+    // An in-root symlink passes both checks above — it resolves to a directory
+    // inside the root — and still breaks the layout the spec makes normative:
+    // two ids symlinked to one directory would share a sandbox, which is what
+    // per-job directories exist to prevent. The ids arrive here normalised to
+    // one component each, so `dir` is exactly `<root>/<task-id>` or
+    // `<task-id>/<job-id>` lexically, and a path that does not canonicalise to
+    // itself has a symlink at its last level.
+    if real != dir {
+        return Some(anyhow::anyhow!(
+            "the sandbox path {dir:?} resolves to {real:?} rather than to itself; \
+             a symlink here would let two jobs share one sandbox"
+        ));
+    }
+    None
 }
+
+/// Why `dir` is not a directory that can be used, given that opening it as one
+/// without following a symlink failed.
+fn not_a_directory(root: &Path, dir: &Path, err: std::io::Error) -> anyhow::Error {
+    // A symlink is the interesting case, so name where it points, and give the
+    // containment wording when containment is the reason it is refused.
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        if let Some(refusal) = containment_refusal(root, dir, &real) {
+            return refusal;
+        }
+        return anyhow::anyhow!("the sandbox path {dir:?} is not a directory");
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            anyhow::anyhow!("the sandbox path {dir:?} is a symlink to a target that does not exist")
+        }
+        _ => anyhow::anyhow!("cannot create {dir:?}: {err}"),
+    }
+}
+
+/// Why the configured root cannot be used, given that creating or opening it
+/// failed. `File exists (os error 17)` is what the raw error says for a root
+/// that is a regular file, a root that is a dangling symlink, and a symlink at
+/// either level — none of which is what "file exists" leads a reader to.
+fn root_not_usable(root: &Path, err: std::io::Error) -> anyhow::Error {
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.file_type().is_symlink() => anyhow::anyhow!(
+            "the sandbox root {root:?} is a symlink to a target that does not exist"
+        ),
+        Ok(m) if !m.is_dir() => {
+            anyhow::anyhow!("the sandbox root {root:?} is not a directory")
+        }
+        _ => anyhow::anyhow!("cannot create the sandbox root {root:?}: {err}"),
+    }
+}
+
+/// Open `path` as a directory, without following a symlink at the last
+/// component.
+fn open_dir(path: &Path) -> anyhow::Result<OwnedFd> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("the path {path:?} contains a NUL byte"))?;
+    // SAFETY: `c` is a valid NUL-terminated string that outlives the call, and
+    // the descriptor is immediately owned by `OwnedFd`, which closes it on drop.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(root_not_usable(path, std::io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` is a fresh descriptor from `open`, checked non-negative.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `mkdirat(parent, name)`, treating an existing entry as success.
+fn mkdir_in(parent: &OwnedFd, name: &OsStr, dir: &Path) -> anyhow::Result<()> {
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("the name {name:?} contains a NUL byte"))?;
+    // SAFETY: `parent` is an open directory descriptor and `c` is a valid
+    // NUL-terminated string; `mkdirat` neither retains nor frees either.
+    let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o777) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("cannot create {dir:?}: {e}"))
+}
+
+/// `openat(parent, name)` as a directory, refusing a symlink at this level.
+fn open_dir_in(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
+    let c = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: as in `open_dir`.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor from `openat`, checked non-negative.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Create `name` inside `parent` — a directory already verified — and return the
+/// canonical path together with a descriptor for the new level.
+///
+/// Creation is relative to the descriptor rather than to a path, and that is
+/// the whole point: a symlink swapped in at this level *after* the level above
+/// was verified cannot redirect the creation, because `mkdirat` creates inside
+/// the directory the descriptor names or fails. A path-based `create_dir_all`
+/// re-traverses from the root and does follow the swap, which is how a writer
+/// looping on that swap got a directory created outside the root. The descriptor
+/// is opened with `O_NOFOLLOW`, so a symlink already in place is refused with
+/// nothing written through it.
+///
+/// Every message uses `{:?}` rather than `display()`: the path is built from
+/// caller-supplied ids and an operator-supplied root, and `Path::display()` does
+/// not escape control characters.
+fn create_within(
+    parent: &OwnedFd,
+    root: &Path,
+    dir: &Path,
+    name: &OsStr,
+) -> anyhow::Result<(PathBuf, OwnedFd)> {
+    mkdir_in(parent, name, dir)?;
+    let child = match open_dir_in(parent, name) {
+        Ok(fd) => fd,
+        Err(e) => return Err(not_a_directory(root, dir, e)),
+    };
+    let real = std::fs::canonicalize(dir)
+        .map_err(|e| anyhow::anyhow!("cannot canonicalise {dir:?}: {e}"))?;
+    match containment_refusal(root, dir, &real) {
+        Some(refusal) => Err(refusal),
+        None => Ok((real, child)),
+    }
+}
+
+/// The files this application creates in its own home directory. A root that
+/// directly holds one of them is the home directory, one level too high.
+///
+/// Deliberately not `config.toml`: a project workspace holding a `config.toml`
+/// is ordinary — a Rust or Python project has one — and refusing every shell job
+/// in such a workspace, as a *security* refusal, is a control that can only
+/// break the feature. These two names are created by this application and are
+/// not names project content uses.
+const HOME_MARKERS: [&str; 2] = ["haos-green.db", "web-auth.toml"];
+
 /// Resolve and validate the per-job sandbox directory.
 ///
-/// This directory is the **only** writable host path in the argv, which makes
-/// it the critical part of the boundary. Every check below is a hard error.
+/// This directory is the **only** read-write bind in the argv that is derived
+/// from the sandbox root — write grants add binds of their own, but they are
+/// operator-named and independent of it — which makes this the critical part of
+/// the boundary. Every check below is a hard error.
 ///
-/// The returned path is canonical, and is a strict descendant of `root` — never
-/// equal to it — so a job can never write at the root itself.
+/// The returned path is canonical, is a strict descendant of `root` — never
+/// equal to it — and is exactly `<root>/<task-id>/<job-id>`, so a job can never
+/// write at the root itself and two ids can never share one directory.
 ///
 /// Order matters as much as the checks do. The ids are validated before any
-/// filesystem call, and each level of the path is canonicalised and checked
-/// before the level below it is created, so a path that is going to be refused
-/// is refused *before* anything is created — outside the root or through a
-/// symlink. A refusal that arrives after the directory exists is an apology,
-/// not containment.
+/// filesystem call; each level is created relative to the descriptor of the
+/// level above it, opened without following a symlink, and canonicalised and
+/// checked before the level below it is attempted. So against a filesystem that
+/// is not being modified underneath the call, a path that is going to be refused
+/// is refused before anything is created — outside the root, or through a
+/// symlink. A refusal that arrives after the directory exists is an apology, not
+/// containment.
+///
+/// **Residual, measured.** A concurrent writer that can replace
+/// `<root>/<task-id>` after this function has verified it can still make the
+/// *returned* path resolve elsewhere, and this function will refuse it; what it
+/// can no longer do is make this function create a directory at a path of its
+/// choosing outside the root, because the creation is `mkdirat` on a descriptor
+/// rather than a path (measured before that change: 1472 of 8246 refusals over
+/// 15 s of swapping had created `elsewhere/job-1`, first hit after 4 refusals).
+/// The two cases left are both harmless:
+///
+/// - the writer *moves* the verified directory outside the root, and the level
+///   below is then created inside it. That directory is one the writer could
+///   already write to — moving it requires write access to both ends — so no
+///   privilege is gained, and the containment check still refuses the result;
+/// - the writer swaps a level after this returns but before bubblewrap opens the
+///   path in the argv. That window is not this function's to close: the returned
+///   `PathBuf` is not what gets mounted, bubblewrap resolves it again when it
+///   runs. Closing it belongs to the argv and grant layer, not here.
+///
+/// Both need a local writer with write access to the sandbox root. That is not
+/// free: `/allow <root>` is grantable, and the default root is the same
+/// directory the chat agent's shell tool uses as its working directory, so the
+/// precondition is recorded in the spec — **no write grant may cover the sandbox
+/// root** — rather than assumed here.
 pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
-    one_component(task_id, "task id")?;
-    one_component(job_id, "job id")?;
+    let task_id = one_component(task_id, "task id")?;
+    let job_id = one_component(job_id, "job id")?;
 
     if !root.is_absolute() {
-        anyhow::bail!("sandbox root {} is not absolute", root.display());
+        anyhow::bail!("sandbox root {root:?} is not absolute");
     }
-    std::fs::create_dir_all(root)
-        .map_err(|e| anyhow::anyhow!("cannot create sandbox root {}: {e}", root.display()))?;
+    std::fs::create_dir_all(root).map_err(|e| root_not_usable(root, e))?;
     let root = std::fs::canonicalize(root)
-        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", root.display()))?;
+        .map_err(|e| anyhow::anyhow!("cannot canonicalise {root:?}: {e}"))?;
     if root == Path::new("/") {
         anyhow::bail!("the sandbox root must not be /");
     }
-    // A root that directly holds config.toml is the "one level too high"
-    // misconfiguration: the home layout puts the workspace beside config.toml,
-    // so pointing the root at `<home>` itself is a realistic mistake. It is not
-    // by itself an exposure — the only read-write bind in the argv is the job
-    // directory — so this is defence in depth against a root that is one level
+    // A root that directly holds one of the home markers is the "one level too
+    // high" misconfiguration: the home layout puts the workspace beside them, so
+    // pointing the root at `<home>` itself is a realistic mistake. It is not by
+    // itself an exposure — the only read-write bind derived from the sandbox
+    // root is the job directory, and a write grant would have to name the file
+    // explicitly — so this is defence in depth against a root that is one level
     // too high, refused rather than tolerated.
-    if root.join("config.toml").exists() {
+    if let Some(marker) = HOME_MARKERS.iter().find(|m| root.join(m).exists()) {
         anyhow::bail!(
-            "the sandbox root {} holds config.toml; point it at a dedicated \
-             directory such as <home>/workspace",
-            root.display()
+            "the sandbox root {root:?} holds {marker}; that looks like the HaosGreen home \
+             directory, not a sandbox root. Point it at a dedicated directory such as \
+             <home>/workspace"
         );
     }
-    let task_dir = create_within(&root, &root.join(task_id))?;
-    create_within(&root, &task_dir.join(job_id))
+    let root_fd = open_dir(&root)?;
+    let (task_dir, task_fd) = create_within(&root_fd, &root, &root.join(task_id), task_id)?;
+    let (job_dir, _job_fd) = create_within(&task_fd, &root, &task_dir.join(job_id), job_id)?;
+    Ok(job_dir)
 }
 ```
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib supervisor::backend::sandbox`
-Expected: PASS, 55 tests.
+Expected: PASS, 69 tests.
 
 - [ ] **Step 5: Commit**
 

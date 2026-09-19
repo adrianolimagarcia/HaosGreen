@@ -30,6 +30,21 @@
 > id of `..`, an absolute id, or a symlink at the task level created directories
 > outside the root before the refusal. Fail-closed was not enough: the job never
 > ran, but the filesystem side effect had already happened.
+>
+> **Revision 4, corrected after the Task 3 review.** Five more corrections, all
+> of them to claims rather than to the boundary. The id rule said "containing no
+> separator" while `Path::components()` resolves a trailing `/` and `/.` away, so
+> the section now says what the code does — the *normalised* component is joined —
+> and control characters are refused at validation rather than only escaped in
+> messages. The `config.toml` guard is replaced by app-created home markers,
+> because it refused every shell job in a project workspace that has one. The
+> ordering claim was still too strong: "refused before anything is created" is
+> false against a concurrent writer, measured at 1472 of 8246 refusals, so
+> creation is now descriptor-relative and the two remaining cases are named
+> rather than denied — one of which makes "no write grant may cover the sandbox
+> root" a precondition rather than a remark. And the section now records the
+> bind-mount bound and that containment is a component test, not a string-prefix
+> one.
 
 ## Objective
 
@@ -268,8 +283,10 @@ and, **only when the operator has granted the network**, one more flag after the
 
 #### 1.3 The writable directory (P1)
 
-The job sandbox is the **only** writable host path in the argv, which makes it
-the critical part of the boundary. It is resolved as:
+The job sandbox is the **only read-write bind in the argv that is derived from
+the sandbox root** — a write grant adds binds of its own, but they are
+operator-named and independent of it — which makes it the critical part of the
+boundary. It is resolved as:
 
 ```
 sandbox_root = canonicalize(configured sandbox root)?
@@ -284,41 +301,104 @@ with these invariants, each a hard failure rather than a warning:
   whole path while `..` walks out of it, so an id of any other shape moves the
   job directory out of the root. They are refused **before the first filesystem
   call**, which removes the traversal class outright instead of detecting it
-  after it has already happened;
+  after it has already happened. What is joined is the component the id
+  *normalises* to, never the raw string: `Path::components()` resolves a trailing
+  `/` and `/.` away, so `a/` and `a/.` are the aliases of `a` that they are, and
+  the path built is exactly the one above with no separator left in either id.
+  An id containing a **control character** is refused too — ids are UUIDs, so a
+  newline in one is only ever an attempt to forge a line in a log or an error
+  message — which closes that at the source rather than relying on the escaping
+  of the message;
 - the resolved path is absolute;
 - it is **not** `/`;
 - it is a strict descendant of `sandbox_root` (after canonicalisation, so
   `..` and symlink tricks are already resolved) — strictly below it, never
-  equal to it, so the job can never write at the root itself;
-- `sandbox_root` is not `/`, and `sandbox_root` does **not directly hold
-  `config.toml`**. The default root is `<home>/workspace` and the job directory
+  equal to it, so the job can never write at the root itself. Containment is a
+  **path-component** test and not a string-prefix one: `/…/ws-evil` starts with
+  `/…/ws` as a string and is outside it;
+- the resolved path is **what it names** — `<sandbox_root>/<task-id>/<job-id>`
+  — so a level that canonicalises to something other than itself is refused. An
+  in-root symlink passes containment, since it resolves to a directory inside
+  the root, and still breaks this: two ids symlinked to one directory would
+  share one sandbox, which is what per-job directories exist to prevent;
+- `sandbox_root` is not `/`, and `sandbox_root` does **not directly hold** a
+  file this application creates in its own home directory: `haos-green.db` or
+  `web-auth.toml`. The default root is `<home>/workspace` and the job directory
   is `<home>/workspace/<task-id>/<job-id>`, so an operator who points the root
   at `<home>` itself is refused — the realistic mistake, because the home layout
-  puts `workspace/` beside `config.toml`.
+  puts `workspace/` beside those files.
 
   This is refused as a **misconfiguration**, not as an exposure. The only
-  read-write bind in the argv is `<job-sandbox> <job-sandbox>`, so a root one
-  level too high does not by itself hand the job the credentials; an earlier
+  read-write bind derived from the sandbox root is the job directory, so a root
+  one level too high does not by itself hand the job the credentials; an earlier
   revision of this section claimed it did, and that overstatement is exactly how
   a later reader concludes the check guards something it does not. It is worth
   refusing anyway, because a root one level too high is a mistake no one should
   make silently, and because every later `/allow <path>` grant is drawn from the
   operator's picture of where the sandbox lives.
 
-  The rule is deliberately about what the root **directly holds**, not about
-  `config.toml` anywhere below it. An "is not an ancestor of `config.toml`"
-  rule — which is what revision 3 said — refuses almost every plausible root:
-  `/home/user` is an ancestor of `/home/user/.haos-green/config.toml`, and so is
-  every directory above any home that holds one. A rule that refuses everything
-  usable is a rule that gets worked around, which is worse than the narrow one
-  it replaces;
-- the directory is created if absent, and **each level is canonicalised and
-  checked before the level below it is created**. A pre-existing symlink is
-  refused with nothing written through it, which is also the CVE-2026-87766
-  precondition. Order is part of the invariant, not an implementation detail: a
-  check that runs *after* `create_dir_all` has created the directory is not
-  containment, and a refusal that leaves directories behind — outside the root,
-  or through a symlink — is not a refusal.
+  The markers are deliberately app-created names, and deliberately **not
+  `config.toml`**. Revision 3 keyed the guard on `config.toml`, which refuses
+  every shell job in any project workspace that has one — a Rust or Python
+  project has one — and reports the denial as a *security* refusal. A control
+  that can only break the feature is worse than the narrow one it replaces. The
+  rule is also about what the root **directly holds**, not about `config.toml`
+  anywhere below it: an "is not an ancestor of `config.toml`" rule refuses almost
+  every plausible root, since `/home/user` is an ancestor of
+  `/home/user/.haos-green/config.toml` and so is every directory above any home
+  that holds one. A rule that refuses everything usable is a rule that gets
+  worked around.
+
+  The guard is a heuristic and it fails **open**: a home whose database is pinned
+  elsewhere by `config.toml` has neither marker, and no refusal fires. That is
+  the right direction for this one — the boundary does not rest on it, and a
+  false refusal here stops every shell job;
+- the directory is created if absent, and **each level is created relative to a
+  descriptor for the level above it, opened without following a symlink**, then
+  canonicalised and checked before the level below it is attempted. The
+  `O_NOFOLLOW` is not decoration: without it a symlink swapped in just before the
+  open becomes the parent descriptor for the level below, and that level is then
+  created on the far side of it — measured as a failing concurrent test. A pre-existing
+  symlink is refused with nothing written through it, which is also the
+  CVE-2026-87766 precondition. Order is part of the invariant, not an
+  implementation detail: a check that runs *after* the directory has been created
+  is not containment.
+
+  Against a filesystem that is not being modified underneath the call, a path
+  that is going to be refused is refused before anything is created. A
+  **concurrent** writer is a different claim, and revisions 3 and 4 stated a
+  stronger one than the code could deliver: with creation by path, a writer
+  looping on the swap of `<root>/<task-id>` got a directory created outside the
+  root — measured at **1472 of 8246 refusals over 15 s** of swapping, first hit
+  after 4 refusals. Creating each level with `mkdirat` on the descriptor of the
+  verified level above it removes that: the level below is created inside the
+  directory the descriptor names, or not at all, and the module's concurrent test
+  fails against the path-based form.
+
+  Two cases remain, both needing a local writer with write access to the root:
+
+  - a writer that **moves** the verified directory outside the root gets the next
+    level created inside a directory it could already write to — moving it needs
+    write access to both ends — so no privilege is gained, and the containment
+    check still refuses the result;
+  - a writer that swaps a level *after* this function returns, but before
+    bubblewrap opens the path in the argv, defeats the mount instead. That window
+    is not this function's to close: the returned path is not what gets mounted,
+    bubblewrap resolves it again when it runs, and the window is far wider than
+    the one inside the function. Closing it belongs to the argv and grant layer.
+
+  Because the second case is reachable by a *job* when a grant covers the root,
+  **no write grant may cover the sandbox root** — see §4, where that is recorded
+  next to the grant rules. The default root is the same directory the chat
+  agent's shell tool uses as its working directory, so the precondition is
+  load-bearing rather than theoretical.
+
+  Bound: a **bind mount** at any level defeats these checks, because a mountpoint
+  is in-root *as a path* and `canonicalize` cannot see the difference —
+  `mount --bind <elsewhere> <root>/task-1` resolves to `<root>/task-1/job-1`
+  while the directory is created on `<elsewhere>`. It needs mount privilege, and
+  a `st_dev` comparison would catch only the cross-device case, so it is recorded
+  here rather than guarded by a check that would not hold.
 
 Per-job directories, not one shared sandbox: a shell job must not see a
 sibling's artifacts, and a symlink planted by job A must not sit in job B's
@@ -430,6 +510,15 @@ without reading. `/deny` is the revocation, and it is immediate.
 symlink pointing at `/etc` resolve to the same entry. A grant covers exactly the
 path named and not its children: `/allow /var/lib/docker` does not grant
 `/var/lib`. Widening is an explicit, separate decision.
+
+> **A grant must not cover the sandbox root.** The job directory is resolved
+> before the job starts, and the checks that resolve it assume no *job* can write
+> the levels it walks: with write access to the root, a job can plant a symlink
+> that a later job's setup follows. Creating each level on a descriptor rather
+> than a path removes the directory-creation half of that (§1.3), and the mount
+> half is not closable from there — so the grant set is what keeps it out of
+> reach. `/allow <root>` is grantable today, so this is a rule the grant layer
+> has to enforce, not a property it already has.
 
 The grant set is in-memory and **never persists across a restart**, matching the
 dashboard's session model: a restart is a cheap, complete revocation. Every
