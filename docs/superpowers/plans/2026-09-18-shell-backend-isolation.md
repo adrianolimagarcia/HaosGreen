@@ -4459,6 +4459,42 @@ named the wrong test, two named tests that do not exist, and four are stale:
 | `Isolation::needs_approval()` | **stale** — the predicate was deleted in Task 8, as the row itself says. |
 | `Unconfined` arm falls through to the grant term | **stale** — the grant term is gone. |
 
+**Round 2 — the nine rows round 1 did not reach.** Same scratch-copy discipline.
+Eight caught immediately; the ninth was a **real gap**, found by the mutation and
+then closed:
+
+| Row | Outcome |
+|---|---|
+| hold no network grant | caught — emitting `--share-net` unconditionally fails `loopback_is_unreachable_without_the_network_grant_and_reachable_with_it` |
+| `/deny` after `/allow` | caught — `the_grant_commands_refuse_grant_list_and_revoke` |
+| write the grant without the audit row | caught — `a_grant_writes_an_audit_row_that_belongs_to_no_task` |
+| `Isolation::Unconfined` takes the `bwrap` path | caught — `the_unconfined_mode_runs_the_command_without_the_sandbox` |
+| delete `config.supervisor.validate()?` from `Config::load` | caught — `config_load_refuses_an_unknown_shell_sandbox_mode` |
+| **move** `validate` below `resolve` | caught — the same test, and the error text is byte-identical, so it is the `assert!(!home.exists(), …)` line that catches it |
+| remove the Layer-1 gate | caught — `a_shell_task_is_parked_for_approval_when_isolation_is_unavailable` |
+| remove the byte cap | caught by **both** arms: the unit test (unconfined) and live test 9 (sandboxed) |
+| `Isolation::resolve` reads anything but `"bwrap"` as consent | **SURVIVED — a real gap.** See below. |
+
+**The gap, and what closed it.** Changing `resolve`'s `shell.is_unconfined()` to
+`shell.sandbox != "bwrap"` — reading a typo as the operator's standing consent to
+run unconfined, the exact mistake `an_unknown_sandbox_mode_is_not_consent_to_run_unconfined`
+names in its own doc comment — left **every test in the suite green**. That test
+pins the *predicate* `is_unconfined()`; `only_the_literal_none_resolves_to_the_unconfined_mode`
+only ever tried `"none"` and `"bwrap"`. Neither exercised the function production
+actually calls with a value that is neither. `ShellSandboxConfig::validate()`
+refuses such a value at load, so the path is unreachable today — which is the
+reason to pin it, not a reason not to: two independent guards where only one is
+tested is one guard, and the load-time one is a file check that any code
+constructing a `ShellSandboxConfig` walks straight past. The test now tries
+`"chroot"`, `"None"`, `"NONE"`, `"bwrap2"`, `""` and `"none "`, and the mutation
+fails it with `"chroot" must not resolve to the unconfined mode`.
+
+**One row is not expressible as written.** "Apply the cap on the `Unconfined` arm
+only" cannot be done as a one-line edit: `capture_capped` is **shared** by both
+arms, so there is no arm-specific cap site to mutate. That sharing *is* the
+reason the property holds, so the honest substitute is the stronger mutation —
+delete the cap entirely and check **both** arms fail, which is what was run.
+
 - [ ] **Step 4: Correct the documentation**
 
 - `CLAUDE.md`: the security section's claim that file and command operations are
