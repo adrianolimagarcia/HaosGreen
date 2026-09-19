@@ -1453,8 +1453,10 @@ mod tests {
         // Asserted here because nothing else can: the probe cannot detect this
         // flag's removal while `--disable-userns` remains — with that flag
         // present the behaviour is identical, because this one verifies rather
-        // than acts — so a mutation removing only this line survives the whole
-        // suite. See the flag's own comment in `build_argv`.
+        // than acts. This assertion is therefore the only thing standing between
+        // the flag and a silent deletion; deleting the flag line makes *this
+        // test* fail, and nothing else in the suite would. See the flag's own
+        // comment in `build_argv`.
         assert!(a.contains(&"--assert-userns-disabled".to_string()));
     }
 
