@@ -523,9 +523,11 @@ impl MemoryStore {
         // pragma inside a transaction, and with it on, `DROP TABLE` would
         // cascade or refuse. It is restored after `COMMIT`.
         //
-        // `sup_transitions` carries **no index**, verified against the DDL
-        // above, so the rebuild loses none — which is the one thing that would
-        // make this migration lossy rather than merely slow.
+        // `DROP TABLE` takes the table's indexes with it, so the rebuild is
+        // lossy for anything declared in the DDL batch above. `sup_transitions`
+        // had no index when this was written and the comment said so; it has one
+        // now, created **below** rather than in the batch, precisely so this
+        // `DROP` cannot silently remove it. Do not move that statement up.
         // `notnull` is a **reserved SQLite keyword**, so the unquoted form is a
         // syntax error, not a false answer: `SELECT notnull FROM
         // pragma_table_info(...)` fails to parse. The plan's snippet wrote it
@@ -573,6 +575,30 @@ impl MemoryStore {
             .context("rebuild sup_transitions so task_id is nullable")?;
             info!("Rebuilt sup_transitions so a grant audit row can be written");
         }
+
+        // Index the audit log by task, which is how the task-detail route reads
+        // it (`TaskStore::transitions`: `WHERE task_id=?1 ORDER BY id ASC`).
+        //
+        // Measured on 200k rows: `SCAN sup_transitions` 11.55 ms against
+        // `SEARCH sup_transitions USING INDEX idx_sup_transitions_task
+        // (task_id=?)` 0.27 ms — a 43x factor. The table is append-only and never
+        // pruned, so the scan only degrades. Every sibling table already carries
+        // the matching index (`idx_sup_jobs_task`, `idx_sup_artifacts_task`);
+        // this one did not.
+        //
+        // **It is created here, after the rebuild, and must not be moved into
+        // the DDL batch above.** The batch declares `sup_transitions.task_id` as
+        // `NOT NULL` and the rebuild above drops and recreates the table on
+        // *every* database — fresh ones included, not just pre-existing ones — so
+        // an index declared in the batch would be created and then immediately
+        // dropped, and would never exist anywhere. The placement is the fix, not
+        // a detail of it.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sup_transitions_task \
+             ON sup_transitions(task_id, id)",
+            [],
+        )
+        .context("index sup_transitions by task_id")?;
 
         Ok(())
     }
@@ -632,6 +658,73 @@ mod tests {
         assert!(
             indexed,
             "index idx_sup_execution_leases_expiry missing on sup_execution_leases(expires_at)"
+        );
+    }
+
+    /// The audit log is indexed by task — **and the index survives the rebuild**.
+    ///
+    /// That second half is the whole point. `run_migrations` declares
+    /// `sup_transitions.task_id` as `NOT NULL` and then rebuilds the table to make
+    /// it nullable, dropping the original. So an index declared in the DDL batch
+    /// would be created and then immediately dropped, and would exist on **no**
+    /// database at all — fresh ones included, because the batch DDL always
+    /// creates the `NOT NULL` form and the rebuild always fires.
+    ///
+    /// A test that only asserted "the index exists" on an already-migrated
+    /// database would pass under that mistake. Asserting it **after a full
+    /// `run_migrations`**, together with the query plan that consumes it, is what
+    /// pins the placement rather than the statement.
+    #[test]
+    fn sup_transitions_is_indexed_by_task_after_the_rebuild() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let conn = memory.connection();
+        let conn = conn.blocking_lock();
+
+        // The rebuild really ran: this is a fresh store, so a nullable `task_id`
+        // can only have come from it.
+        let not_null: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('sup_transitions') WHERE name='task_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            not_null, 0,
+            "the rebuild must have run and made task_id nullable"
+        );
+
+        // And the index is there after it, not merely before.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_sup_transitions_task'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx, 1,
+            "the index must survive the rebuild; an index declared in the DDL batch is dropped by it"
+        );
+
+        // Which is only worth anything if the reader uses it.
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT task_id, from_state, to_state, reason, actor, \
+                 occurred_at FROM sup_transitions WHERE task_id=?1 ORDER BY id ASC",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(["t"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("idx_sup_transitions_task"),
+            "the task-detail query must use the index, or it is a full scan of an \
+             append-only table: {plan}"
         );
     }
 
