@@ -190,7 +190,6 @@ pub struct RawLearning {
 
 #[derive(Deserialize, Default, Clone)]
 pub struct RawSupervisor {
-    pub default_autonomy_mode: Option<String>,
     pub artifacts_dir: Option<String>,
     pub risk: Option<RawSupervisorRisk>,
 }

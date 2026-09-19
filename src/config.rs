@@ -53,8 +53,6 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SupervisorConfig {
-    #[serde(default = "default_autonomy_mode")]
-    pub default_autonomy_mode: String,
     #[serde(default)]
     pub artifacts_dir: std::path::PathBuf,
     #[serde(default)]
@@ -66,7 +64,6 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            default_autonomy_mode: default_autonomy_mode(),
             artifacts_dir: default_artifacts_dir(),
             risk: RiskThresholdsConfig::default(),
             shell: ShellSandboxConfig::default(),
@@ -611,10 +608,6 @@ impl ShellSandboxConfig {
     pub fn is_unconfined(&self) -> bool {
         self.sandbox == "none"
     }
-}
-
-fn default_autonomy_mode() -> String {
-    "standard".to_string()
 }
 
 fn default_artifacts_dir() -> std::path::PathBuf {
@@ -1577,7 +1570,6 @@ mod tests {
             allowed_directory = "/tmp"
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.supervisor.default_autonomy_mode, "standard");
         assert_eq!(cfg.supervisor.artifacts_dir, std::path::PathBuf::new());
     }
 

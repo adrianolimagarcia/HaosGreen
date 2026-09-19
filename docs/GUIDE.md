@@ -41,7 +41,6 @@ HaosGreen reads `config.toml` on startup. Copy [`config.example.toml`](../config
 | `[agent]` | `max_iterations` | Max agentic loop iterations | `25` |
 | `[langsmith]` | `api_key` | LangSmith API key for LLM observability | — |
 | `[learning]` | `skill_extraction_enabled` | Post-task skill extraction | `false` |
-| `[supervisor]` | `default_autonomy_mode` | Workflow mode: `fast`, `standard`, `rigorous` | `standard` |
 | `[supervisor.shell]` | `sandbox` | `bwrap` runs shell jobs in a bubblewrap sandbox; only the literal `none` runs them unconfined, and any other value is refused at load | `bwrap` |
 
 > Persistent home: All paths resolve relative to `~/.haos-green` by default.

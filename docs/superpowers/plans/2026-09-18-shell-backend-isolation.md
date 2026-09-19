@@ -4656,3 +4656,19 @@ references in `src/` are the field, its default function, `SupervisorConfig::
 Default`, and one assertion in `config.rs`'s own test. `config.example.toml` no
 longer cites it as a working key. It is pre-existing, independent of this plan,
 and deserves its own issue rather than a fix folded in here.
+
+> **Resolved in revision 6: deleted, not wired.** Wiring was rejected on
+> inspection rather than on principle. The mode is derived by the classifier from
+> the task type and risk, and the natural slot for a "default" is its fallback
+> arm — which catches only Research, Writing, Ops and Unknown, because code
+> changes are hardcoded `Rigorous` (`classifier.rs:61`) and general assistant
+> tasks hardcoded `Fast`. So `default_autonomy_mode = "fast"` would not have made
+> a refactor fast, and `Fast` skips `Clarify` and `Plan` entirely
+> (`workflow.rs:16`). Wiring it there would have produced a name that lies in a
+> new way — the same defect as `declared_grants`, one level up. A coherent wiring
+> exists but is a *new semantic* (a floor: "never below this mode"), which no
+> document describes and which needs a product decision. So the field, its
+> default function, the wizard's raw shadow field and the `config.rs` assertion
+> are removed, the `docs/GUIDE.md:44` row is gone, and `config.example.toml`
+> records the reasoning so a real knob is added as a designed feature rather than
+> a resurrected dead field.
