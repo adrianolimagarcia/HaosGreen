@@ -564,16 +564,21 @@ async fn main() -> Result<()> {
         haos_green::supervisor::backend::shell::ShellBackend::new(
             config.sandbox.allowed_directory.clone(),
         )
-        .with_isolation(isolation)
+        .with_isolation(isolation.clone())
         .with_grants(Arc::clone(&grants)),
     ));
 
-    let _supervisor = Arc::new(haos_green::supervisor::Supervisor::new(
-        config.supervisor.artifacts_dir.clone(),
-        memory.connection(),
-        sup_registry,
-        config.supervisor.risk.clone(),
-    ));
+    // The **same** decision the backend got, so Layer 1 (this gate) and Layer 2
+    // (the boundary) cannot disagree about whether the sandbox exists.
+    let _supervisor = Arc::new(
+        haos_green::supervisor::Supervisor::new(
+            config.supervisor.artifacts_dir.clone(),
+            memory.connection(),
+            sup_registry,
+            config.supervisor.risk.clone(),
+        )
+        .with_shell_isolation(isolation),
+    );
     match _supervisor.resumable_task_ids().await {
         Ok(ids) if !ids.is_empty() => info!(
             "  Supervisor: {} resumable task(s) found at startup",

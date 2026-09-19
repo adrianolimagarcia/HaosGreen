@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::supervisor::artifact::ArtifactManager;
+use crate::supervisor::backend::sandbox::Isolation;
 use crate::supervisor::backend::{reasoning::ReasoningBackend, Registry};
 use crate::supervisor::classifier::{Classifier, HeuristicClassifier};
 use crate::supervisor::intake::IntakeRouter;
@@ -608,6 +609,19 @@ pub struct Supervisor {
     in_flight: Arc<InFlight>,
     pub registry: Registry,
     pub workspace_mgr: Option<Arc<crate::supervisor::workspace::WorkspaceManager>>,
+    /// The isolation decision `ShellBackend` was given, so Layer 1 and Layer 2
+    /// cannot disagree about whether the boundary exists.
+    ///
+    /// `Unavailable` means the sandbox is absent, so a task that would select
+    /// the shell backend is parked for approval instead of auto-executing.
+    /// `Unconfined` is the operator's standing consent, so nothing is gated
+    /// (spec §4). A second read of `[supervisor.shell].sandbox` here would be a
+    /// second place the mode is decided, and two reads can drift.
+    ///
+    /// Fail-closed default: a `Supervisor` built without an explicit value must
+    /// park shell tasks, never run them, or the constructor becomes a way to
+    /// bypass the gate.
+    shell_isolation: Isolation,
 }
 
 impl Supervisor {
@@ -623,6 +637,7 @@ impl Supervisor {
             in_flight: Arc::new(InFlight::default()),
             registry: Registry::new(),
             workspace_mgr: None,
+            shell_isolation: Isolation::default(),
         }
     }
 
@@ -653,7 +668,28 @@ impl Supervisor {
             in_flight: Arc::new(InFlight::default()),
             registry,
             workspace_mgr: None,
+            shell_isolation: Isolation::default(),
         }
+    }
+
+    /// Attach the isolation decision resolved at startup — the same value the
+    /// shell backend holds, so the two layers cannot disagree.
+    pub fn with_shell_isolation(mut self, r: Isolation) -> Self {
+        self.shell_isolation = r;
+        self
+    }
+
+    /// Would this task select the shell backend?
+    ///
+    /// Derived from the registry rather than from a hand-written predicate, so
+    /// it cannot drift from what the executor would actually select. An empty
+    /// registry answers `false` for everything, which is why a test of this gate
+    /// has to register the shell backend: with nothing registered the gate never
+    /// fires and the test would pass for the wrong reason.
+    fn would_use_shell(&self, task: &crate::supervisor::task::Task) -> bool {
+        self.registry
+            .select_for(&task.required_capabilities)
+            .is_some_and(|b| b.name() == "shell")
     }
 
     pub fn register_test_reasoning_backend<F, Fut>(&mut self, f: F)
@@ -1304,7 +1340,31 @@ impl Supervisor {
                 None,
             )
             .await?;
+        // LAYER 1 — route-time gate. This asks the same registry the executor
+        // uses, rather than duplicating a routing predicate that could drift.
+        //
+        // `needs_approval()` is the whole condition, and it is `false` for
+        // `Unconfined`: `sandbox = "none"` is the operator's consent, and under
+        // it nothing is gated (spec §4).
+        //
+        // Known and deliberate at this step: the `RequireApproval` arm below
+        // builds its `reason` from `task.risk_level`, so a task parked *here*
+        // is told "medium-risk task requires approval" when the real cause is
+        // the missing sandbox. Task 8 replaces this with `shell_gate_reason`,
+        // which names the sandbox.
         let decision = self.policy.decide(&task);
+        // The gate **shadows** the policy's decision rather than replacing it:
+        // the `_` arm is the policy's own answer, so the two cannot drift.
+        let decision = match self.would_use_shell(&task) {
+            true if self.shell_isolation.needs_approval() => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    "shell isolation unavailable; parking for approval"
+                );
+                PolicyDecision::RequireApproval
+            }
+            _ => decision,
+        };
         self.artifacts
             .write_text(
                 &task.id,
@@ -1394,6 +1454,8 @@ pub(crate) async fn bounded<T>(what: &str, fut: impl std::future::Future<Output 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervisor::backend::sandbox::IsolationUnavailable;
+    use crate::supervisor::backend::shell::ShellBackend;
     use crate::supervisor::task::{Task, TaskStatus};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2774,5 +2836,92 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A shell task is parked for approval when the boundary is absent.
+    ///
+    /// The registry is registered **deliberately**: the gate asks it, so with an
+    /// empty registry `select_for` returns `None`, the gate never fires, and the
+    /// task auto-executes — the test would pass for the wrong reason. This is
+    /// also the only proof that `Isolation::needs_approval` has a production
+    /// caller at all.
+    #[tokio::test]
+    async fn a_shell_task_is_parked_for_approval_when_isolation_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+        sup.registry
+            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
+        let sup =
+            sup.with_shell_isolation(Isolation::Unavailable(IsolationUnavailable::NotInstalled));
+
+        let outcome = bounded("submit", sup.submit("test", "u1", None, "run the build"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SubmitOutcome::NeedsApproval { .. }),
+            "got {outcome:?}"
+        );
+        let id = outcome.task_id();
+        assert_eq!(sup.state(&id).await.unwrap(), TaskStatus::Route);
+    }
+
+    /// A task that does not select the shell backend is not gated by its gate.
+    #[tokio::test]
+    async fn a_reasoning_task_is_not_gated_by_the_shell_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+        sup.registry
+            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
+        let sup =
+            sup.with_shell_isolation(Isolation::Unavailable(IsolationUnavailable::NotInstalled));
+
+        let outcome = bounded(
+            "submit",
+            // **American spelling, and it is load-bearing.** The plan's snippet
+            // said "summarise"; `HeuristicClassifier` matches the literal
+            // `starts_with("summarize")`, so the British spelling falls through
+            // to `TaskType::Unknown`, and `PolicyEngine` answers `Clarify` for an
+            // Unknown low-risk task — the test would then fail on
+            // `NeedsClarification` without the gate ever being consulted. This
+            // spelling classifies as `GeneralAssistant`/Low, which auto-executes
+            // and requires only `["reasoning"]`.
+            sup.submit("test", "u1", None, "summarize this document"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SubmitOutcome::AutoExecutePlanned { .. }),
+            "a task that does not select the shell backend must not be gated, got {outcome:?}"
+        );
+    }
+
+    /// Spec §4: with `sandbox = "none"` **nothing is gated**.
+    ///
+    /// This is the mode the refusal message sends an operator to, so parking
+    /// their shell tasks anyway would make the way out a dead end.
+    ///
+    /// Task 8 supersedes this as the coverage for §4 — it adds a second gate
+    /// term this test cannot see (the task it submits declares no capability, so
+    /// `missing` is empty either way) and adds
+    /// `an_unconfined_shell_task_declaring_an_ungranted_capability_is_not_gated`.
+    /// It is kept as the `submit`-level integration check.
+    #[tokio::test]
+    async fn a_shell_task_is_not_gated_when_the_operator_chose_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+        sup.registry
+            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
+        let sup = sup.with_shell_isolation(Isolation::Unconfined);
+
+        let outcome = bounded("submit", sup.submit("test", "u1", None, "run the build"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SubmitOutcome::AutoExecutePlanned { .. }),
+            "`sandbox = \"none\"` is consent: nothing is gated, got {outcome:?}"
+        );
     }
 }
