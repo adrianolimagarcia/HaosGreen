@@ -1293,6 +1293,34 @@ git commit -m "feat(supervisor): build the hardened bubblewrap argv and smoke-pr
 
 - [ ] **Step 1: Write the failing test**
 
+> **As shipped** (Task 3, `src/supervisor/backend/sandbox.rs`; the source is
+> authoritative). The four tests below are the first version and are kept for
+> the record; the shipped set is **ten**, because these four leave three guards
+> unpinned and one assertion with no teeth:
+>
+> - `refuses_the_filesystem_root_as_the_root` — `contains("/")` is satisfied by
+>   *every* message the function can produce, including the `cannot create /t:
+>   Permission denied` a **non-root** runner gets when the `/` guard is deleted.
+>   The shipped test also requires `must not be /`;
+> - `a_relative_root_is_refused` and `empty ids` (now
+>   `traversal_shaped_task_ids_…` / `…_job_ids_…`) — the `is_absolute` guard and
+>   the id validation had no test at all;
+> - `traversal_shaped_*_ids_are_refused_before_anything_is_created`,
+>   `a_traversal_id_does_not_create_the_root_either` and
+>   `a_symlinked_task_dir_is_refused_without_writing_through_it` — the ordering
+>   fix in Step 3; each asserts that **nothing was created**, not merely that an
+>   error came back;
+> - `a_task_dir_symlinked_to_the_root_itself_is_refused` — the "never equal to
+>   the root" clause;
+> - `a_workspace_root_is_accepted_and_the_job_dir_is_created` — the plan's
+>   version checks containment and "is a directory", both of which hold for a
+>   path that dropped the job id, so it now also pins the layout
+>   `<root>/<task-id>/<job-id>`.
+>
+> Every one of the ten was shown to fail under a mutation that removes the guard
+> it covers, run as uid 1000 (as root the `/`-guard mutant is masked, because
+> root can really create `/t`).
+
 Add to the `tests` module:
 
 ```rust
@@ -1340,9 +1368,59 @@ Expected: FAIL — `cannot find function resolve_job_dir`.
 
 - [ ] **Step 3: Implement it**
 
-Add above `#[cfg(test)]`:
+Add above `#[cfg(test)]` — **as shipped**; the ordering and the id checks
+below are corrections made after the first implementation, which checked
+containment *after* `create_dir_all` and so created directories outside the
+root (or through a symlink) before refusing. A refusal that arrives after the
+directory exists is not containment. The plan's original block is in the
+commit that first shipped Task 3; this is the version that stands:
 
 ```rust
+/// Refuse an id that is not exactly one ordinary path component.
+///
+/// `task_id` and `job_id` are joined onto the root, and `Path::join` lets an
+/// absolute argument replace the whole path while `..` walks out of it. Either
+/// would put the job directory outside the root — and a refusal that arrives
+/// *after* `create_dir_all` has created it is not containment, so this runs
+/// before the first filesystem call, including the one that creates the root.
+/// No caller has a legitimate id of any other shape: they are UUIDs.
+fn one_component(id: &str, what: &str) -> anyhow::Result<()> {
+    let mut parts = Path::new(id).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => anyhow::bail!("the {what} {id:?} is not a single path component"),
+    }
+}
+/// Create `dir` if absent, then canonicalise it and require it to be strictly
+/// inside `root`.
+///
+/// Canonicalising one level at a time is what keeps a pre-existing symlink from
+/// being written through: `create_dir_all` on a symlink to an existing
+/// directory creates nothing, so the escape is refused here — before the next
+/// level, the one that would actually be created, is attempted.
+fn create_within(root: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
+    let real = std::fs::canonicalize(dir)
+        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", dir.display()))?;
+    // Two distinct refusals, because one message for both reads wrong: a path
+    // that *is* the root, reported as "outside" it, sends a reader looking for
+    // a traversal that never happened.
+    if real == root {
+        anyhow::bail!(
+            "the sandbox path {} is the sandbox root itself, not below it",
+            real.display()
+        );
+    }
+    if !real.starts_with(root) {
+        anyhow::bail!(
+            "the sandbox path {} resolved outside the sandbox root {}",
+            real.display(),
+            root.display()
+        );
+    }
+    Ok(real)
+}
 /// Resolve and validate the per-job sandbox directory.
 ///
 /// This directory is the **only** writable host path in the argv, which makes
@@ -1350,48 +1428,49 @@ Add above `#[cfg(test)]`:
 ///
 /// The returned path is canonical, and is a strict descendant of `root` — never
 /// equal to it — so a job can never write at the root itself.
-pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> Result<PathBuf> {
+///
+/// Order matters as much as the checks do. The ids are validated before any
+/// filesystem call, and each level of the path is canonicalised and checked
+/// before the level below it is created, so a path that is going to be refused
+/// is refused *before* anything is created — outside the root or through a
+/// symlink. A refusal that arrives after the directory exists is an apology,
+/// not containment.
+pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
+    one_component(task_id, "task id")?;
+    one_component(job_id, "job id")?;
+
     if !root.is_absolute() {
-        bail!("sandbox root {} is not absolute", root.display());
+        anyhow::bail!("sandbox root {} is not absolute", root.display());
     }
     std::fs::create_dir_all(root)
         .map_err(|e| anyhow::anyhow!("cannot create sandbox root {}: {e}", root.display()))?;
     let root = std::fs::canonicalize(root)
         .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", root.display()))?;
     if root == Path::new("/") {
-        bail!("the sandbox root must not be /");
+        anyhow::bail!("the sandbox root must not be /");
     }
-    // A root that directly holds config.toml would make the job directory's
-    // parent the directory holding the API key and every peer token.
+    // A root that directly holds config.toml is the "one level too high"
+    // misconfiguration: the home layout puts the workspace beside config.toml,
+    // so pointing the root at `<home>` itself is a realistic mistake. It is not
+    // by itself an exposure — the only read-write bind in the argv is the job
+    // directory — so this is defence in depth against a root that is one level
+    // too high, refused rather than tolerated.
     if root.join("config.toml").exists() {
-        bail!(
+        anyhow::bail!(
             "the sandbox root {} holds config.toml; point it at a dedicated \
              directory such as <home>/workspace",
             root.display()
         );
     }
-    let dir = root.join(task_id).join(job_id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
-    // Re-canonicalise AFTER creation: a pre-existing symlink at this path is
-    // caught here, which is also the CVE-2026-87766 precondition.
-    let dir = std::fs::canonicalize(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", dir.display()))?;
-    if !dir.starts_with(&root) || dir == root {
-        bail!(
-            "the job sandbox {} resolved outside the sandbox root {}",
-            dir.display(),
-            root.display()
-        );
-    }
-    Ok(dir)
+    let task_dir = create_within(&root, &root.join(task_id))?;
+    create_within(&root, &task_dir.join(job_id))
 }
 ```
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib supervisor::backend::sandbox`
-Expected: PASS, 18 tests.
+Expected: PASS, 55 tests.
 
 - [ ] **Step 5: Commit**
 

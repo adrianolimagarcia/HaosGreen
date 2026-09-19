@@ -14,6 +14,22 @@
 > revocable grant**. §3 records the model and §4 records why the config key is
 > gone. The network default is therefore no longer `true`; it is "not granted
 > until the operator says `/allow-net`".
+>
+> **Revision 3, corrected after Task 3 shipped.** §1.3 has been fixed against the
+> implementation on three points. Its rule "`sandbox_root` is **not an ancestor
+> of `config.toml`**" was wrong — an ancestor rule refuses almost every usable
+> root — and is now the narrower "does not **directly hold** `config.toml`". Its
+> stated reason for that rule was overstated: it claimed a root holding
+> `config.toml` would give the job a read-write bind over the credentials, but
+> the argv's only read-write bind is `<job-sandbox> <job-sandbox>`, so the
+> refusal is a misconfiguration guard, not an exposure. And §1.3 had omitted the
+> two invariants the implementation needed: the ids must be single ordinary path
+> components, and each level of the path is canonicalised and checked **before**
+> the level below it is created. The ordering is the one that mattered — the
+> first implementation checked containment *after* `create_dir_all`, so a task
+> id of `..`, an absolute id, or a symlink at the task level created directories
+> outside the root before the refusal. Fail-closed was not enough: the job never
+> ran, but the filesystem side effect had already happened.
 
 ## Objective
 
@@ -262,21 +278,47 @@ job_sandbox  = sandbox_root / <task-id> / <job-id>
 
 with these invariants, each a hard failure rather than a warning:
 
+- `<task-id>` and `<job-id>` are each **one ordinary path component**: not
+  empty, not `.` or `..`, not absolute, and containing no separator. They are
+  joined onto the root, and `Path::join` lets an absolute argument replace the
+  whole path while `..` walks out of it, so an id of any other shape moves the
+  job directory out of the root. They are refused **before the first filesystem
+  call**, which removes the traversal class outright instead of detecting it
+  after it has already happened;
 - the resolved path is absolute;
 - it is **not** `/`;
 - it is a strict descendant of `sandbox_root` (after canonicalisation, so
   `..` and symlink tricks are already resolved) — strictly below it, never
   equal to it, so the job can never write at the root itself;
-- `sandbox_root` is not `/`, and `sandbox_root` is **not an ancestor of
+- `sandbox_root` is not `/`, and `sandbox_root` does **not directly hold
   `config.toml`**. The default root is `<home>/workspace` and the job directory
-  is `<home>/workspace/<task-id>/<job-id>`, so the job can write only below
-  `workspace/` and `config.toml` — a sibling, not a descendant — stays
-  unreachable. An operator who points the root at `<home>` itself is refused,
-  because then the job directory's parent *is* the directory holding the
-  secrets;
-- the directory is created if absent, and re-canonicalised **after** creation
-  (a pre-existing symlink at that path is caught here, which is also the
-  CVE-2026-87766 precondition).
+  is `<home>/workspace/<task-id>/<job-id>`, so an operator who points the root
+  at `<home>` itself is refused — the realistic mistake, because the home layout
+  puts `workspace/` beside `config.toml`.
+
+  This is refused as a **misconfiguration**, not as an exposure. The only
+  read-write bind in the argv is `<job-sandbox> <job-sandbox>`, so a root one
+  level too high does not by itself hand the job the credentials; an earlier
+  revision of this section claimed it did, and that overstatement is exactly how
+  a later reader concludes the check guards something it does not. It is worth
+  refusing anyway, because a root one level too high is a mistake no one should
+  make silently, and because every later `/allow <path>` grant is drawn from the
+  operator's picture of where the sandbox lives.
+
+  The rule is deliberately about what the root **directly holds**, not about
+  `config.toml` anywhere below it. An "is not an ancestor of `config.toml`"
+  rule — which is what revision 3 said — refuses almost every plausible root:
+  `/home/user` is an ancestor of `/home/user/.haos-green/config.toml`, and so is
+  every directory above any home that holds one. A rule that refuses everything
+  usable is a rule that gets worked around, which is worse than the narrow one
+  it replaces;
+- the directory is created if absent, and **each level is canonicalised and
+  checked before the level below it is created**. A pre-existing symlink is
+  refused with nothing written through it, which is also the CVE-2026-87766
+  precondition. Order is part of the invariant, not an implementation detail: a
+  check that runs *after* `create_dir_all` has created the directory is not
+  containment, and a refusal that leaves directories behind — outside the root,
+  or through a symlink — is not a refusal.
 
 Per-job directories, not one shared sandbox: a shell job must not see a
 sibling's artifacts, and a symlink planted by job A must not sit in job B's

@@ -1027,6 +1027,53 @@ async fn run_in_sandbox(
     }
 }
 
+/// Refuse an id that is not exactly one ordinary path component.
+///
+/// `task_id` and `job_id` are joined onto the root, and `Path::join` lets an
+/// absolute argument replace the whole path while `..` walks out of it. Either
+/// would put the job directory outside the root — and a refusal that arrives
+/// *after* `create_dir_all` has created it is not containment, so this runs
+/// before the first filesystem call, including the one that creates the root.
+/// No caller has a legitimate id of any other shape: they are UUIDs.
+fn one_component(id: &str, what: &str) -> anyhow::Result<()> {
+    let mut parts = Path::new(id).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => anyhow::bail!("the {what} {id:?} is not a single path component"),
+    }
+}
+
+/// Create `dir` if absent, then canonicalise it and require it to be strictly
+/// inside `root`.
+///
+/// Canonicalising one level at a time is what keeps a pre-existing symlink from
+/// being written through: `create_dir_all` on a symlink to an existing
+/// directory creates nothing, so the escape is refused here — before the next
+/// level, the one that would actually be created, is attempted.
+fn create_within(root: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
+    let real = std::fs::canonicalize(dir)
+        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", dir.display()))?;
+    // Two distinct refusals, because one message for both reads wrong: a path
+    // that *is* the root, reported as "outside" it, sends a reader looking for
+    // a traversal that never happened.
+    if real == root {
+        anyhow::bail!(
+            "the sandbox path {} is the sandbox root itself, not below it",
+            real.display()
+        );
+    }
+    if !real.starts_with(root) {
+        anyhow::bail!(
+            "the sandbox path {} resolved outside the sandbox root {}",
+            real.display(),
+            root.display()
+        );
+    }
+    Ok(real)
+}
+
 /// Resolve and validate the per-job sandbox directory.
 ///
 /// This directory is the **only** writable host path in the argv, which makes
@@ -1034,7 +1081,17 @@ async fn run_in_sandbox(
 ///
 /// The returned path is canonical, and is a strict descendant of `root` — never
 /// equal to it — so a job can never write at the root itself.
+///
+/// Order matters as much as the checks do. The ids are validated before any
+/// filesystem call, and each level of the path is canonicalised and checked
+/// before the level below it is created, so a path that is going to be refused
+/// is refused *before* anything is created — outside the root or through a
+/// symlink. A refusal that arrives after the directory exists is an apology,
+/// not containment.
 pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
+    one_component(task_id, "task id")?;
+    one_component(job_id, "job id")?;
+
     if !root.is_absolute() {
         anyhow::bail!("sandbox root {} is not absolute", root.display());
     }
@@ -1045,8 +1102,12 @@ pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Resu
     if root == Path::new("/") {
         anyhow::bail!("the sandbox root must not be /");
     }
-    // A root that directly holds config.toml would make the job directory's
-    // parent the directory holding the API key and every peer token.
+    // A root that directly holds config.toml is the "one level too high"
+    // misconfiguration: the home layout puts the workspace beside config.toml,
+    // so pointing the root at `<home>` itself is a realistic mistake. It is not
+    // by itself an exposure — the only read-write bind in the argv is the job
+    // directory — so this is defence in depth against a root that is one level
+    // too high, refused rather than tolerated.
     if root.join("config.toml").exists() {
         anyhow::bail!(
             "the sandbox root {} holds config.toml; point it at a dedicated \
@@ -1054,21 +1115,8 @@ pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Resu
             root.display()
         );
     }
-    let dir = root.join(task_id).join(job_id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
-    // Re-canonicalise AFTER creation: a pre-existing symlink at this path is
-    // caught here, which is also the CVE-2026-87766 precondition.
-    let dir = std::fs::canonicalize(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", dir.display()))?;
-    if !dir.starts_with(&root) || dir == root {
-        anyhow::bail!(
-            "the job sandbox {} resolved outside the sandbox root {}",
-            dir.display(),
-            root.display()
-        );
-    }
-    Ok(dir)
+    let task_dir = create_within(&root, &root.join(task_id))?;
+    create_within(&root, &task_dir.join(job_id))
 }
 
 #[cfg(test)]
@@ -2326,16 +2374,132 @@ exit 0"#,
     }
 
     /// The invariant is *strictly* below the root, never equal to it (spec
-    /// §1.3), and empty ids are the way that clause is reachable: `root.join("")`
-    /// is the root again. Without the `dir == root` term the job would be handed
-    /// the root itself — all of `<home>/workspace` bound read-write, which is
-    /// the one thing per-job directories exist to prevent.
+    /// §1.3). Component validation closes the empty-id route to that clause, but
+    /// it is still reachable through a symlink: a task-level link pointing back
+    /// at the root resolves to the root itself, and a job directory that *is*
+    /// the root is the whole root bound read-write.
     #[test]
-    fn empty_ids_do_not_resolve_to_the_root_itself() {
+    fn a_task_dir_symlinked_to_the_root_itself_is_refused() {
         let home = tempfile::tempdir().unwrap();
         let ws = home.path().join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
-        let e = resolve_job_dir(&ws, "", "").unwrap_err();
+        std::os::unix::fs::symlink(&ws, ws.join("task-1")).unwrap();
+        let e = resolve_job_dir(&ws, "task-1", "job-1").unwrap_err();
+        assert!(
+            e.to_string().contains("is the sandbox root itself"),
+            "the refusal must name the root, not an escape: {e}"
+        );
+    }
+
+    /// Ids are joined onto the root, so an id that is not one ordinary path
+    /// component can move the job directory out of it: `..` walks out and an
+    /// absolute id replaces the whole path. `create_dir_all` would then create
+    /// that directory *before* the containment check refused it, so the ids are
+    /// validated before the first filesystem call — and the assertion is that
+    /// nothing appeared, not merely that an error came back.
+    ///
+    /// Both positions are exercised, and in separate tests, because the two
+    /// validations are separate guards: a mutation dropping either one has to
+    /// fail a test of its own.
+    fn assert_refused_without_creating_anything(
+        home: &Path,
+        ws: &Path,
+        elsewhere: &Path,
+        task: &str,
+        job: &str,
+    ) {
+        let e = resolve_job_dir(ws, task, job).unwrap_err();
+        assert!(
+            e.to_string().contains("not a single path component"),
+            "{task:?}/{job:?}: {e}"
+        );
+        assert_eq!(
+            std::fs::read_dir(ws).unwrap().count(),
+            0,
+            "{task:?}/{job:?} created something inside the root"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["elsewhere".to_string(), "workspace".to_string()],
+            "{task:?}/{job:?}: a refusal created something outside the root"
+        );
+        assert!(!elsewhere.join("job-1").exists() && !elsewhere.join("task-1").exists());
+    }
+
+    /// A `(home, workspace, elsewhere)` triple with both directories created,
+    /// plus the traversal shapes to try. The absolute shape is a real path
+    /// inside the tempdir, so the old create-then-check order would write there
+    /// rather than at the filesystem root.
+    fn traversal_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<String>) {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let abs = elsewhere.to_str().unwrap().to_string();
+        (
+            home,
+            ws,
+            elsewhere,
+            vec!["".into(), ".".into(), "..".into(), "a/b".into(), abs],
+        )
+    }
+
+    #[test]
+    fn traversal_shaped_task_ids_are_refused_before_anything_is_created() {
+        let (home, ws, elsewhere, shapes) = traversal_fixture();
+        for bad in &shapes {
+            assert_refused_without_creating_anything(home.path(), &ws, &elsewhere, bad, "job-1");
+        }
+    }
+
+    #[test]
+    fn traversal_shaped_job_ids_are_refused_before_anything_is_created() {
+        let (home, ws, elsewhere, shapes) = traversal_fixture();
+        for bad in &shapes {
+            assert_refused_without_creating_anything(home.path(), &ws, &elsewhere, "task-1", bad);
+        }
+    }
+
+    /// The ids are checked before the root itself is created: a bad id must not
+    /// leave a directory behind anywhere, not even the configured root.
+    #[test]
+    fn a_traversal_id_does_not_create_the_root_either() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        let e = resolve_job_dir(&ws, "..", "job-1").unwrap_err();
+        assert!(e.to_string().contains("not a single path component"), "{e}");
+        assert!(
+            !ws.exists(),
+            "the root was created before the ids were validated"
+        );
+    }
+
+    /// A pre-existing symlink at the *task* level survives component validation
+    /// — `task-1` is a legitimate single component — so it is caught by
+    /// checking each level before descending into the next. `create_dir_all` on
+    /// a symlink to an existing directory creates nothing, which is what makes
+    /// this the level to check: the job directory is refused without anything
+    /// having been written through the link.
+    #[test]
+    fn a_symlinked_task_dir_is_refused_without_writing_through_it() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ws.join("task-1")).unwrap();
+
+        let e = resolve_job_dir(&ws, "task-1", "job-1").unwrap_err();
         assert!(e.to_string().contains("outside the sandbox root"), "{e}");
+        assert!(
+            !elsewhere.join("job-1").exists(),
+            "the job directory was created through the symlink before the refusal"
+        );
     }
 }
