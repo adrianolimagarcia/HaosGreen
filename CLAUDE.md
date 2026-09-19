@@ -879,6 +879,16 @@ success.
 > failed` at the first audit write, far from the cause. The identifier is quoted
 > and a real error is propagated instead of collapsed into `false`.
 
+> **That rebuild drops the table, so it drops the table's indexes too — and it
+> fires on every database, not only pre-existing ones.** The DDL batch declares
+> `sup_transitions.task_id` as `NOT NULL`, so a fresh database creates that form
+> and the rebuild immediately replaces it. Any index on `sup_transitions`
+> declared in the batch is therefore created and then dropped, and exists
+> nowhere. `idx_sup_transitions_task` is created **after** the rebuild for that
+> reason, and `sup_transitions_is_indexed_by_task_after_the_rebuild` pins the
+> placement: declaring it before the rebuild instead fails that test with
+> `left: 0, right: 1`. Do not move the statement up.
+
 **Known limitation: a grant is in-memory only.** There is no `sup_grants` table
 and nothing restores grants at startup, so every grant is lost on restart and
 must be re-issued — the audit log records that it *was* issued, not that it still
