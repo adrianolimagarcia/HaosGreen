@@ -57,6 +57,11 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         constraints: serde_json::Value::Null,
         inputs: serde_json::Value::Null,
         expected_outputs: serde_json::Value::Null,
+        // No `sup_tasks` column carries a declaration, so a job reads back as
+        // declaring nothing. Declarations are consumed by the run that created
+        // the job and are not persisted; a resumed job therefore re-declares
+        // through its task rather than through the row. See `Grants`.
+        declared_grants: Default::default(),
     })
 }
 
@@ -458,6 +463,11 @@ impl TaskStore {
                         }
                     }),
                     error: r.get(15)?,
+                    // No `sup_jobs` column carries a declaration, so a job reads back as
+                    // declaring nothing. Declarations are consumed by the run that created
+                    // the job and are not persisted; a resumed job therefore re-declares
+                    // through its task rather than through the row. See `Grants`.
+                    declared_grants: Default::default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

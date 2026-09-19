@@ -388,21 +388,6 @@ impl Isolation {
             Err(reason) => Isolation::Unavailable(reason),
         }
     }
-
-    /// Does Layer 1 have to park a shell task for approval?
-    ///
-    /// Only when the boundary is **absent**. `Unconfined` is the operator's
-    /// consent, so nothing is gated (spec §4) — and this is the whole of what
-    /// Task 7 needs from this type, which is why it is a method here rather
-    /// than a second read of the config key there.
-    ///
-    /// **Task 8 deletes this.** Once the gate carries a second term it `match`es
-    /// on the mode directly, so this predicate would have no production caller
-    /// left and would be a second representation of a decision that must have
-    /// exactly one.
-    pub fn needs_approval(&self) -> bool {
-        matches!(self, Isolation::Unavailable(_))
-    }
 }
 
 /// The version floor and the smoke probe, as **one** result.
@@ -571,6 +556,144 @@ pub struct Grants {
     pub write: std::collections::BTreeSet<std::path::PathBuf>,
     /// Share the host network namespace.
     pub network: bool,
+}
+
+/// Strip one leading `--` from operator input.
+///
+/// The path is operator input, so `/allow -- /etc` must not be read as a flag.
+/// No absolute path begins with `--`, so this cannot eat a legitimate one.
+fn strip_dashes(raw: &str) -> &str {
+    let raw = raw.trim();
+    raw.strip_prefix("--").map(str::trim_start).unwrap_or(raw)
+}
+
+impl Grants {
+    /// What is held, for the operator and the dashboard.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .write
+            .iter()
+            .map(|p| format!("write {}", p.display()))
+            .collect();
+        if self.network {
+            parts.push("network".to_string());
+        }
+        if parts.is_empty() {
+            "nothing is granted".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Canonicalise an operator-supplied grant path, refusing the three that
+    /// have no meaning as a grant.
+    ///
+    /// Refused **at issue time**, not when a job later fails to start:
+    ///
+    /// - `/` would hand back everything the sandbox exists to withhold;
+    /// - a relative path has no meaning once the sandbox has its own root;
+    /// - a path that does not exist cannot be bound, and binding it later would
+    ///   be a decision nobody made.
+    pub fn resolve_path(raw: &str, sandbox_root: &Path) -> anyhow::Result<PathBuf> {
+        let raw = strip_dashes(raw);
+        if raw.is_empty() {
+            anyhow::bail!("a grant needs a path");
+        }
+        let p = Path::new(raw);
+        if !p.is_absolute() {
+            anyhow::bail!(
+                "{raw:?} is not an absolute path: the sandbox has its own root, so a \
+                 relative path has no meaning"
+            );
+        }
+        if p == Path::new("/") {
+            anyhow::bail!("refusing to grant /: it is everything the sandbox withholds");
+        }
+        let canon = std::fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("cannot grant {}: {e}", p.display()))?;
+        if canon == Path::new("/") {
+            anyhow::bail!("refusing to grant {}: it resolves to /", p.display());
+        }
+        // A grant that covers the sandbox root, or any ancestor of it, is not a
+        // grant at all: the sandbox root is the directory the job is *already*
+        // allowed to write, and an ancestor of it hands back everything the
+        // sandbox withholds — including the ability to replace the root itself.
+        // `Path::starts_with` compares whole components, so `/ws-evil` is
+        // correctly not treated as being below `/ws`.
+        if sandbox_root.starts_with(&canon) {
+            anyhow::bail!(
+                "refusing to grant {}: it is the sandbox root, or an ancestor of it ({}), \
+                 which the job can already write",
+                canon.display(),
+                sandbox_root.display()
+            );
+        }
+        Ok(canon)
+    }
+
+    /// Grant read-write access to one host path, for every future job until it
+    /// is revoked. Returns the canonical path the caller audits.
+    pub fn grant_write(&mut self, raw: &str, sandbox_root: &Path) -> anyhow::Result<PathBuf> {
+        let path = Self::resolve_path(raw, sandbox_root)?;
+        self.write.insert(path.clone());
+        Ok(path)
+    }
+
+    /// Revoke a write grant.
+    ///
+    /// Lenient about existence, unlike [`Self::resolve_path`]: a path deleted
+    /// since it was granted must still be revocable, or a grant could outlive
+    /// the operator's ability to take it back. Both the literal path and its
+    /// canonical form are removed, so the entry that was inserted is found
+    /// either way.
+    pub fn revoke_write(&mut self, raw: &str) -> anyhow::Result<PathBuf> {
+        let raw = strip_dashes(raw);
+        let p = Path::new(raw);
+        if raw.is_empty() || !p.is_absolute() {
+            anyhow::bail!("a revocation needs an absolute path, got {raw:?}");
+        }
+        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        self.write.remove(p);
+        self.write.remove(&canon);
+        Ok(canon)
+    }
+
+    pub fn grant_network(&mut self) {
+        self.network = true;
+    }
+
+    pub fn revoke_network(&mut self) {
+        self.network = false;
+    }
+
+    /// What `declared` asks for that is not held, named the way the operator
+    /// has to name it. Used verbatim in the park reason and in the Layer-2
+    /// refusal, so the two cannot say different things.
+    pub fn missing(&self, declared: &Grants) -> Vec<String> {
+        let mut out = Vec::new();
+        for d in &declared.write {
+            // Canonicalised on both sides: `/etc/../etc` and a symlink to /etc
+            // resolve to the same entry. An **exact** match, never a prefix — a
+            // grant covers the path named and not its children.
+            let canon = std::fs::canonicalize(d).unwrap_or_else(|_| d.clone());
+            if !self.write.contains(&canon) {
+                out.push(format!(
+                    "a writable host path {} — grant it with `/allow {}`",
+                    d.display(),
+                    d.display()
+                ));
+            }
+        }
+        if declared.network && !self.network {
+            out.push("the host network namespace — grant it with `/allow-net`".to_string());
+        }
+        out
+    }
+
+    /// Does the held set cover everything this declaration asks for?
+    pub fn covers(&self, declared: &Grants) -> bool {
+        self.missing(declared).is_empty()
+    }
 }
 
 /// Append `--ro-bind <path> <path>` for `path`, if it exists under `root`.
@@ -2082,6 +2205,114 @@ pub(crate) mod tests {
         }
     }
 
+    /// `resolve_path` refuses the inputs that have no meaning as a grant.
+    ///
+    /// Each refusal is asserted by its **own** cause, not by "it failed":
+    /// `/` and a relative path and a nonexistent path are three different
+    /// mistakes, and an implementation that refused all three with one message
+    /// would pass a test that only checked `is_err`.
+    #[test]
+    fn a_grant_path_is_refused_when_it_has_no_meaning_as_a_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        let err = Grants::resolve_path("/", &root).unwrap_err().to_string();
+        assert!(
+            err.contains("everything the sandbox withholds"),
+            "got {err}"
+        );
+
+        let err = Grants::resolve_path("relative/path", &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an absolute path"), "got {err}");
+
+        let err = Grants::resolve_path("/nonexistent-haos-green-grant", &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot grant"), "got {err}");
+
+        // The sandbox root itself is refused: the job can already write it.
+        let err = Grants::resolve_path(root.to_str().unwrap(), &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox root"), "got {err}");
+
+        // And so is every **ancestor** of it, which would hand back the ability
+        // to replace the root itself. A tempdir's parent is such an ancestor.
+        let parent = root.parent().unwrap().to_str().unwrap();
+        let err = Grants::resolve_path(parent, &root).unwrap_err().to_string();
+        assert!(err.contains("ancestor"), "got {err}");
+
+        // A real path that is neither is grantable.
+        assert!(Grants::resolve_path("/usr", &root).is_ok());
+    }
+
+    /// Containment is component-wise, so a sibling whose name merely *starts
+    /// with* the root's name is not treated as being below it.
+    #[test]
+    fn a_sibling_sharing_a_name_prefix_is_not_the_sandbox_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let evil = dir.path().join("ws-evil");
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::create_dir(&evil).unwrap();
+        let ws = ws.canonicalize().unwrap();
+        // `/…/ws-evil` must be grantable while `/…/ws` is the root.
+        assert!(Grants::resolve_path(evil.to_str().unwrap(), &ws).is_ok());
+        assert!(Grants::resolve_path(ws.to_str().unwrap(), &ws).is_err());
+    }
+
+    /// A grant covers the path **named**, never its children.
+    #[test]
+    fn a_grant_covers_the_path_named_and_not_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut held = Grants::default();
+        held.grant_write("/etc", &root).unwrap();
+
+        let mut exact = Grants::default();
+        exact.write.insert(PathBuf::from("/etc"));
+        assert!(
+            held.covers(&exact),
+            "the granted path itself must be covered"
+        );
+
+        let mut child = Grants::default();
+        child.write.insert(PathBuf::from("/etc/ssl"));
+        assert!(
+            !held.covers(&child),
+            "a grant must not silently extend to children"
+        );
+
+        let mut net = Grants::default();
+        net.grant_network();
+        assert!(!held.covers(&net), "network is a separate capability");
+        assert!(net.covers(&net));
+        net.revoke_network();
+        assert!(!net.covers(&Grants {
+            network: true,
+            ..Default::default()
+        }));
+    }
+
+    /// A revocation must work on a path that no longer exists — otherwise a
+    /// grant could outlive the operator's ability to take it back.
+    #[test]
+    fn a_revocation_is_lenient_about_a_path_that_no_longer_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut g = Grants::default();
+        g.grant_write("/etc", &root).unwrap();
+        assert!(!g.write.is_empty());
+        g.revoke_write("/etc").unwrap();
+        assert!(g.write.is_empty(), "the grant must be gone: {:?}", g.write);
+        // The literal path is removed even when it cannot be canonicalised.
+        assert!(g.revoke_write("/nonexistent-haos-green-grant").is_ok());
+        // A relative revocation is still refused: there is nothing to remove.
+        assert!(g.revoke_write("relative").is_err());
+    }
+
     /// The consenting half of the table, and the fail-closed half for a value
     /// `Config::load` would already have refused.
     ///
@@ -2274,46 +2505,6 @@ pub(crate) mod tests {
              a host with no usable bubblewrap, so probing it first is a spawn that cannot \
              change the answer",
             marker.display()
-        );
-    }
-
-    /// Layer 1's only question, pinned for all three modes. `Unconfined` is the
-    /// operator's consent, so nothing is gated (spec §4) — parking their shell
-    /// tasks anyway would be the same operator loop the refusal message opens,
-    /// one layer up.
-    ///
-    /// `M14` (`Isolation::default()` no longer failing closed) used to die on the
-    /// last assertion alone, and only for the modes it happened to produce. It is
-    /// pinned here from three directions instead: the **variant** the default
-    /// carries, the predicate for **every** `Unavailable` cause rather than one,
-    /// and the message, which must not name a cause the default never
-    /// established. The fourth direction is in `shell`: a `ShellBackend` built
-    /// without a decision must refuse to run.
-    #[test]
-    fn needs_approval_is_true_only_when_the_boundary_is_absent() {
-        assert!(!Isolation::Sandboxed.needs_approval());
-        assert!(!Isolation::Unconfined.needs_approval());
-        for cause in [
-            IsolationUnavailable::NotDecided,
-            IsolationUnavailable::NotInstalled,
-            IsolationUnavailable::VersionUnreadable("no output".into()),
-            IsolationUnavailable::VersionTooOld((0, 11, 9)),
-            IsolationUnavailable::SmokeTestFailed("the base properties".into()),
-        ] {
-            assert!(
-                Isolation::Unavailable(cause.clone()).needs_approval(),
-                "every unavailable cause must be gated, {cause:?} is not"
-            );
-        }
-        assert_eq!(
-            Isolation::default(),
-            Isolation::Unavailable(IsolationUnavailable::NotDecided),
-            "the default must fail closed, and must not claim a cause it never \
-             established"
-        );
-        assert!(
-            Isolation::default().needs_approval(),
-            "the default fails closed"
         );
     }
 

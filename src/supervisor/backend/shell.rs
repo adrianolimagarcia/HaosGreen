@@ -462,6 +462,41 @@ impl Backend for ShellBackend {
                 // holding it across the `spawn` below would make this future
                 // non-`Send`.
                 let held = self.grants.read().unwrap().clone();
+                // LAYER 2 — a capability the job declares and the operator has
+                // not granted is refused here, before anything is spawned.
+                // bubblewrap cannot be widened once it has started, so a missing
+                // grant can only mean "do not run".
+                //
+                // **Inside the `Sandboxed` arm on purpose, and that is not a
+                // stylistic choice.** The plan's snippet put this refusal before
+                // the `match`, which would refuse an `Unconfined` job too. That
+                // contradicts spec §4 — "with `sandbox = \"none\"` nothing is
+                // gated: that mode *is* the operator's consent" — and the plan's
+                // own `shell_gate_reason` rationale, which states that under
+                // `Unconfined` this arm "reads neither `Grants` nor
+                // `declared_grants`". Under `Unconfined` there is no argv and no
+                // bind, so a declaration buys the job nothing: refusing it would
+                // cost an approval round-trip and change nothing about what
+                // runs. Putting it in the arm also makes the exemption
+                // structural — there is no single `if` above the `match` for a
+                // later change to widen by accident.
+                let missing = held.missing(&job.declared_grants);
+                if !missing.is_empty() {
+                    job.status = JobStatus::Failed;
+                    return Ok(JobOutput {
+                        status: JobStatus::Failed,
+                        summary: String::new(),
+                        evidence: vec![],
+                        errors: vec![format!(
+                            "refusing to run a shell job that needs what the supervisor \
+                             does not hold: {}. Grant it by name, then approve the task \
+                             again.",
+                            missing.join("; ")
+                        )],
+                        changed_files: vec![],
+                        next_step: None,
+                    });
+                }
                 // `built` owns the descriptor the argv names, so it is open when
                 // the child is spawned and closed when this arm ends — after the
                 // spawn, never before it.
@@ -578,6 +613,88 @@ mod tests {
     /// `Sandboxed` would run a job through a boundary that was never proven; one
     /// that became `Unconfined` would run it with no boundary at all. Both die
     /// here, on the `spawned` marker as well as on the status.
+    /// A job that declares a capability the operator has not granted is refused
+    /// **before anything is spawned**, and the refusal names the command that
+    /// releases it rather than only the fact.
+    ///
+    /// `Isolation::Sandboxed` is passed directly, so this needs no working
+    /// `bwrap`: the point is that the refusal precedes the spawn, and the
+    /// `spawned` marker proves it did.
+    #[tokio::test]
+    async fn a_declared_capability_that_is_not_granted_refuses_to_spawn_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("spawned");
+        let b = ShellBackend::new(dir.path().into())
+            .with_isolation(Isolation::Sandboxed)
+            .with_grants(std::sync::Arc::new(std::sync::RwLock::new(
+                Grants::default(),
+            )));
+        let mut job = crate::supervisor::job::Job::new(
+            "t",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            &format!("touch '{}'", spawned.display()),
+        );
+        job.declared_grants
+            .write
+            .insert(std::path::PathBuf::from("/etc"));
+
+        let out = b.run(&mut job, &RunContext::new()).await.unwrap();
+        assert!(
+            matches!(out.status, crate::supervisor::job::JobStatus::Failed),
+            "a declared capability that is not held must refuse, got {:?}",
+            out.status
+        );
+        assert!(
+            !spawned.exists(),
+            "the refusal must happen before any spawn: {} exists",
+            spawned.display()
+        );
+        assert!(
+            out.errors.iter().any(|e| e.contains("/allow /etc")),
+            "the refusal must name the command that releases the capability, got {:?}",
+            out.errors
+        );
+    }
+
+    /// **The same declaration is not refused under `Unconfined`, and this test
+    /// is what pins the refusal inside the `Sandboxed` arm.**
+    ///
+    /// Move the coverage check above the `match` — which is what the plan's
+    /// snippet does — and this test fails while the one above still passes.
+    /// That asymmetry is the whole reason both exist: without this one, an
+    /// implementation that gates every mode looks correct.
+    ///
+    /// Spec §4: "with `sandbox = \"none\"` nothing is gated: that mode *is* the
+    /// operator's consent". Under `Unconfined` there is no argv and no bind, so
+    /// the declaration buys the job nothing.
+    #[tokio::test]
+    async fn a_declared_capability_is_not_refused_under_unconfined() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("spawned");
+        let b = ShellBackend::new(dir.path().into())
+            .with_isolation(Isolation::Unconfined)
+            .with_grants(std::sync::Arc::new(std::sync::RwLock::new(
+                Grants::default(),
+            )));
+        let mut job = crate::supervisor::job::Job::new(
+            "t",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            &format!("touch '{}'", spawned.display()),
+        );
+        job.declared_grants
+            .write
+            .insert(std::path::PathBuf::from("/etc"));
+
+        let out = b.run(&mut job, &RunContext::new()).await.unwrap();
+        assert!(
+            spawned.exists(),
+            "Unconfined is the operator's consent, so the declaration must not gate it; \
+             got {out:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_backend_without_a_decision_refuses_to_spawn_anything() {
         let dir = tempfile::tempdir().unwrap();

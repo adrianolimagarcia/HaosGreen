@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::supervisor::artifact::ArtifactManager;
-use crate::supervisor::backend::sandbox::Isolation;
+use crate::supervisor::backend::sandbox::{Grants, Isolation};
 use crate::supervisor::backend::{reasoning::ReasoningBackend, Registry};
 use crate::supervisor::classifier::{Classifier, HeuristicClassifier};
 use crate::supervisor::intake::IntakeRouter;
@@ -622,6 +622,11 @@ pub struct Supervisor {
     /// park shell tasks, never run them, or the constructor becomes a way to
     /// bypass the gate.
     shell_isolation: Isolation,
+    /// The operator's live grant set, shared with `ShellBackend` — **the same
+    /// `Arc`**, so a grant the operator issues is visible to both layers at
+    /// once. A second `RwLock<Grants>` here would mean Layer 1 parks a task for
+    /// a grant Layer 2 already holds, or worse, the reverse.
+    grants: Arc<std::sync::RwLock<Grants>>,
 }
 
 impl Supervisor {
@@ -638,6 +643,7 @@ impl Supervisor {
             registry: Registry::new(),
             workspace_mgr: None,
             shell_isolation: Isolation::default(),
+            grants: Arc::new(std::sync::RwLock::new(Grants::default())),
         }
     }
 
@@ -669,6 +675,7 @@ impl Supervisor {
             registry,
             workspace_mgr: None,
             shell_isolation: Isolation::default(),
+            grants: Arc::new(std::sync::RwLock::new(Grants::default())),
         }
     }
 
@@ -679,6 +686,12 @@ impl Supervisor {
         self
     }
 
+    /// Attach the operator's grant set — the same `Arc` the shell backend holds.
+    pub fn with_grants(mut self, grants: Arc<std::sync::RwLock<Grants>>) -> Self {
+        self.grants = grants;
+        self
+    }
+
     /// Would this task select the shell backend?
     ///
     /// Derived from the registry rather than from a hand-written predicate, so
@@ -686,6 +699,62 @@ impl Supervisor {
     /// registry answers `false` for everything, which is why a test of this gate
     /// has to register the shell backend: with nothing registered the gate never
     /// fires and the test would pass for the wrong reason.
+    /// The Layer-1 park reason for a task, or `None` if it is not gated.
+    ///
+    /// Extracted from `submit` so the gate is reachable from a test holding a
+    /// task that **declares a capability**. `submit` cannot produce one in this
+    /// revision — nothing populates `Task::declared_grants` from operator input
+    /// yet — so a gate driven only through `submit` can never be shown to fire
+    /// on the grant term, and a test that cannot make the gate fire cannot tell
+    /// a working exemption from a gate that never runs.
+    pub fn shell_gate_reason(&self, task: &crate::supervisor::task::Task) -> Option<String> {
+        if !self.would_use_shell(task) {
+            return None;
+        }
+        // **The whole gate is skipped under `Unconfined`, and that is spec §4,
+        // not an optimisation.** "With `sandbox = \"none\"` nothing is gated:
+        // that mode *is* the operator's consent, and Layer 1 does not apply."
+        // The exemption is therefore the *outer* decision, not the isolation
+        // term alone. Both terms exist to stop a job reaching a boundary wider
+        // than the operator sanctioned: `Unavailable` because there is no
+        // boundary to reach at all, and a missing grant because the sandboxed
+        // launch would bind more than was granted. Under `Unconfined` there is
+        // no argv and no bind: Layer 2 runs `sh -c` in the job directory and
+        // reads neither `Grants` nor `declared_grants`. Parking on the grant
+        // term there would cost one approval round-trip and change nothing
+        // about what runs.
+        //
+        // A `match` rather than `needs_approval() || !missing.is_empty()`:
+        // `needs_approval()` is a pure function of the isolation decision and
+        // has no grant set to look at, so it cannot express the second term.
+        // Keeping both terms in one `match` on the mode makes the exemption
+        // structural — there is exactly one place `Unconfined` is answered, and
+        // it answers before either term is evaluated.
+        match &self.shell_isolation {
+            Isolation::Unconfined => None,
+            Isolation::Unavailable(reason) => Some(format!(
+                "shell isolation is unavailable, so a task that would select the shell \
+                 backend is parked: {reason}. Fix bubblewrap (>= 0.12.0) or set \
+                 [supervisor.shell].sandbox = \"none\". A grant cannot replace a missing \
+                 sandbox; `/allow <path>` and `/allow-net` release a capability."
+            )),
+            Isolation::Sandboxed => {
+                let held = self.grants.read().unwrap().clone();
+                let missing = held.missing(&task.declared_grants);
+                if missing.is_empty() {
+                    None
+                } else {
+                    Some(park_reason(
+                        &held,
+                        &task.declared_grants,
+                        &task.id,
+                        &task.user_request,
+                    ))
+                }
+            }
+        }
+    }
+
     fn would_use_shell(&self, task: &crate::supervisor::task::Task) -> bool {
         self.registry
             .select_for(&task.required_capabilities)
@@ -1354,16 +1423,14 @@ impl Supervisor {
         // which names the sandbox.
         let decision = self.policy.decide(&task);
         // The gate **shadows** the policy's decision rather than replacing it:
-        // the `_` arm is the policy's own answer, so the two cannot drift.
-        let decision = match self.would_use_shell(&task) {
-            true if self.shell_isolation.needs_approval() => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    "shell isolation unavailable; parking for approval"
-                );
+        // the `None` arm is the policy's own answer, so the two cannot drift.
+        let gate_reason = self.shell_gate_reason(&task);
+        let decision = match &gate_reason {
+            Some(reason) => {
+                tracing::warn!(task_id = %task.id, %reason, "shell task parked for approval");
                 PolicyDecision::RequireApproval
             }
-            _ => decision,
+            None => decision,
         };
         self.artifacts
             .write_text(
@@ -1395,7 +1462,11 @@ impl Supervisor {
                 }
             }
             PolicyDecision::RequireApproval => {
-                let reason = match task.risk_level {
+                // The gate's own reason wins over the risk-level one. Without
+                // this a task parked *because the sandbox is missing* was told
+                // "medium-risk task requires approval", which names a cause the
+                // operator cannot act on and hides the one they can.
+                let reason = gate_reason.unwrap_or_else(|| match task.risk_level {
                     crate::supervisor::task::RiskLevel::High => {
                         "high-risk task requires approval".to_string()
                     }
@@ -1411,7 +1482,7 @@ impl Supervisor {
                     crate::supervisor::task::RiskLevel::Low => {
                         "low-risk task requires approval (threshold config)".to_string()
                     }
-                };
+                });
                 SubmitOutcome::NeedsApproval {
                     task_id: task.id,
                     reason,
@@ -1423,6 +1494,19 @@ impl Supervisor {
             },
         })
     }
+}
+
+/// Why a shell task was parked, naming each grant it needs, the command that
+/// releases it, and what the task is trying to do. The operator is never told
+/// only "approval required" — spec §3 asks for the path **and** the reason.
+pub fn park_reason(held: &Grants, declared: &Grants, task_id: &str, request: &str) -> String {
+    let missing = held.missing(declared);
+    format!(
+        "task {task_id} declares {} it does not hold, for: {request}. Grant {} by name, then \
+         approve the task again with `/approve {task_id}`.",
+        missing.join(", "),
+        if missing.len() == 1 { "it" } else { "them" }
+    )
 }
 
 /// Await `fut` under a bound, so a run that never finishes fails **the calling

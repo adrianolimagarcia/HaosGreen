@@ -71,6 +71,10 @@ pub struct Task {
     pub inputs: serde_json::Value,
     #[serde(default)]
     pub expected_outputs: serde_json::Value,
+    /// The capabilities this task declares it needs; the planner copies it into
+    /// every job it creates. Empty is the shipped default.
+    #[serde(default)]
+    pub declared_grants: crate::supervisor::backend::sandbox::Grants,
 }
 
 impl Task {
@@ -88,6 +92,7 @@ impl Task {
             constraints: serde_json::Value::Null,
             inputs: serde_json::Value::Null,
             expected_outputs: serde_json::Value::Null,
+            declared_grants: Default::default(),
         }
     }
 }
