@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
 /// Minimum safe bubblewrap version.
 ///
@@ -127,6 +128,38 @@ fn drain_capped(mut pipe: impl Read) -> Vec<u8> {
     let mut buf = [0u8; 4096];
     loop {
         match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if kept.len() < MAX_PROBE_TEXT {
+                    let take = n.min(MAX_PROBE_TEXT - kept.len());
+                    kept.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    kept
+}
+
+/// The async twin of [`drain_capped`], for the probe's own invocations.
+///
+/// Bounded for the same reason, and it matters more here: the version probe
+/// reads a binary we chose, while this one runs an arbitrary command string
+/// inside the sandbox. `wait_with_output` collects the whole stream into memory,
+/// so it cannot be used — a sandboxed process that prints without end would grow
+/// this process until it died, at startup, before the supervisor serves
+/// anything.
+///
+/// Still drained to EOF after the cap is reached: stopping the read would block
+/// the child on a full pipe and turn a merely noisy job into a reported hang.
+/// [`MAX_PROBE_TEXT`] is comfortably above the largest transcript the probe asks
+/// for — ten short fields, two of them the job path.
+async fn drain_capped_async(pipe: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
                 if kept.len() < MAX_PROBE_TEXT {
@@ -400,10 +433,11 @@ pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String>
         //
         // The probe cannot detect this flag's removal while `--disable-userns`
         // remains: with that flag present the observable behaviour is identical,
-        // because this one verifies rather than acts, so a mutation removing only
-        // this line survives the whole suite. It is here for the failure mode
-        // where `--disable-userns` silently does *not* take effect. Do not delete
-        // it on the strength of a green probe.
+        // because this one verifies rather than acts. A mutation deleting this
+        // line therefore survives the **probe** — the runtime check — though not
+        // the static argv test, which does catch it. It is here for the failure
+        // mode the probe cannot see: `--disable-userns` silently *not* taking
+        // effect. Do not delete it on the strength of a green probe.
         "--assert-userns-disabled".into(),
         // Detach the controlling terminal, or TIOCSTI lets the job inject
         // input into the operator's terminal.
@@ -524,8 +558,11 @@ fn smoke(step: &str, detail: impl std::fmt::Display) -> IsolationUnavailable {
 }
 
 /// Run the production argv against a scratch job directory and assert the
-/// properties the boundary claims (spec §6). Any failure is
-/// [`IsolationUnavailable::SmokeTestFailed`], carrying the step that failed.
+/// properties the boundary claims (spec §6). A failed assertion, a spawn failure
+/// or a timeout is [`IsolationUnavailable::SmokeTestFailed`], carrying the step
+/// that failed; a `bwrap` that cannot be executed at all is
+/// [`IsolationUnavailable::NotInstalled`], the same variant the version probe
+/// reports, so a missing package is never described as a broken sandbox.
 ///
 /// Called once at startup; the result is cached by being stored in the
 /// `ShellBackend` and the `Supervisor`.
@@ -741,12 +778,21 @@ fn verdict_base(
             .map(str::to_string)
     };
     let cause = bwrap_cause(out);
+    // A capture that reached the cap may have been cut before the field being
+    // looked for, which would otherwise read as "the shell never printed it".
+    // The transcript is ~300 bytes against a 512-byte cap, so this should never
+    // fire — but a surprise here has to be diagnosable rather than confusing.
+    let capped = if out.stdout.len() >= MAX_PROBE_TEXT {
+        "; the capture hit the {MAX_PROBE_TEXT}-byte cap, so the transcript may be incomplete"
+    } else {
+        ""
+    };
     let expect = |k: &str, want: &str, what: &str| -> Result<(), IsolationUnavailable> {
         match field(k).as_deref() {
             Some(v) if v == want => Ok(()),
             other => Err(smoke(
                 what,
-                format!("expected {k}={want}, got {other:?}{cause}"),
+                format!("expected {k}={want}, got {other:?}{cause}{capped}"),
             )),
         }
     };
@@ -823,11 +869,11 @@ fn verdict_https(out: &std::process::Output) -> Result<(), IsolationUnavailable>
     Err(smoke(
         STEP_HTTPS,
         format!(
-            "curl exited {:?} with {body:?} / {:?}; a `(77) error adding trust anchors` \
+            "curl exited {:?} with {body:?} / {}; a `(77) error adding trust anchors` \
              means the /etc/ssl/certs and /etc/ca-certificates binds are missing or \
              unresolvable",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            describe_output(&out.stderr)
         ),
     ))
 }
@@ -861,6 +907,22 @@ fn loopback_reachable(stdout: &str) -> Result<bool, String> {
         "7" => Ok(false),
         // Connected, then waited for a response that never comes (28), or got
         // one (0). Either way the host's listener was reachable.
+        //
+        // 28 is ambiguous — curl returns it for "connected, then the response
+        // timed out" and for "the connect itself timed out" — so a loopback that
+        // is DROPped rather than refused also reads here as reachable. Kept
+        // deliberately. Measured on this host: refused → `exit=7`; a
+        // bound-but-never-accepting listener → `exit=28`; a blackholed address →
+        // `exit=28`. The two 28s are separable by curl's `%{num_connects}`
+        // (1 vs 0), and that is the discriminator to reach for if this ever
+        // matters. It does not, because without `--share-net` the sandbox is in
+        // its own netns with `lo` and nothing listening — a DROP rule on the
+        // host cannot reach into that netns — so it always gets 7. The ambiguous
+        // 28 therefore only arises when `--share-net` *is* in effect, which is
+        // exactly what the "reachable under a grant" check exists to confirm.
+        // The tighter rule would trade that benign miss for a risk of reading a
+        // real connection as unreachable, which is the I1 failure mode: refusing
+        // shell jobs on a working sandbox.
         "0" | "28" => Ok(true),
         other => Err(format!(
             "cannot tell whether the host network is reachable: curl exited {other}"
@@ -922,16 +984,42 @@ async fn run_in_sandbox(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let child = cmd.spawn().map_err(|e| match e.kind() {
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
         // The same outcome the version probe reports, so `probe()` called on its
         // own does not describe a missing binary as a smoke-test failure.
         std::io::ErrorKind::NotFound => IsolationUnavailable::NotInstalled,
         _ => smoke(step, format!("cannot run {}: {e}", bwrap.display())),
     })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| smoke(step, "the sandbox has no stdout pipe"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| smoke(step, "the sandbox has no stderr pipe"))?;
+
     let bound = std::time::Duration::from_secs(PROBE_STEP_TIMEOUT_SECS);
-    match tokio::time::timeout(bound, child.wait_with_output()).await {
-        Ok(Ok(out)) => Ok(out),
-        Ok(Err(e)) => Err(smoke(step, e)),
+    // `async move` so the child is owned by the future: on a timeout the future
+    // is dropped, which drops the child, which is what `kill_on_drop` acts on.
+    // Borrowing it here instead would leave a wedged sandbox running.
+    let run = async move {
+        // Both pipes are read while the child runs, and concurrently: a child
+        // that fills the pipe we are not reading blocks forever.
+        let (stdout, stderr, status) = tokio::join!(
+            drain_capped_async(&mut stdout),
+            drain_capped_async(&mut stderr),
+            child.wait(),
+        );
+        (stdout, stderr, status)
+    };
+    match tokio::time::timeout(bound, run).await {
+        Ok((stdout, stderr, Ok(status))) => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok((_, _, Err(e))) => Err(smoke(step, e)),
         Err(_) => Err(smoke(
             step,
             format!("did not finish within {PROBE_STEP_TIMEOUT_SECS}s"),
@@ -1462,6 +1550,22 @@ mod tests {
         // sandbox with `lo` alone (1 interface against 16), which the probe
         // reports as "the host network is reachable under a grant". Presence
         // alone passes either way.
+        //
+        // Exactly one of each, asserted before the ordering. A second
+        // `--unshare-all` *after* `--share-net` would re-unshare the network
+        // while a first-occurrence comparison still read as correctly ordered —
+        // so the count is pinned and the comparison is then unambiguous, rather
+        // than picking an occurrence and hoping it is the one that matters.
+        assert_eq!(
+            a.iter().filter(|x| *x == "--unshare-all").count(),
+            1,
+            "the builder must unshare the namespaces exactly once: {a:?}"
+        );
+        assert_eq!(
+            a.iter().filter(|x| *x == "--share-net").count(),
+            1,
+            "the builder must share the network exactly once: {a:?}"
+        );
         let unshare = a.iter().position(|x| x == "--unshare-all").unwrap();
         let share = a.iter().position(|x| x == "--share-net").unwrap();
         assert!(
@@ -1476,33 +1580,45 @@ mod tests {
         // A grant is the only way a host path becomes writable, and `--bind` is
         // the only bubblewrap flag that makes one. Read-only would silently
         // grant nothing.
+        //
+        // Two paths on purpose, one under `/usr` and one under `/etc`: the `/etc`
+        // binds are emitted by a later loop than the `/usr` ones, so a grant loop
+        // moved above it would shadow an `/etc` grant while a check against
+        // `/usr` alone still passed.
         let g = Grants {
-            write: [PathBuf::from("/var/lib")].into(),
+            write: [PathBuf::from("/var/lib"), PathBuf::from("/etc/ssl/certs")].into(),
             network: false,
         };
         let a = build_argv(Path::new("/jobs/t/j"), &g, "x");
-        assert!(
-            a.windows(3)
-                .any(|w| w[0] == "--bind" && w[1] == "/var/lib" && w[2] == "/var/lib"),
-            "a granted path must be bound read-write, got {a:?}"
-        );
-        // Presence is not enough here either: a later bind wins, so a grant
-        // mounted *before* the read-only base is covered by it and grants
-        // nothing. Measured: `--bind /usr/share /usr/share` then
-        // `--ro-bind /usr /usr` leaves `/usr/share` read-only.
-        let grant_at = a
-            .windows(3)
-            .position(|w| w[0] == "--bind" && w[1] == "/var/lib")
-            .unwrap();
-        let base_at = a
-            .windows(3)
-            .position(|w| w[0] == "--ro-bind" && w[2] == "/usr")
-            .unwrap();
-        assert!(
-            grant_at > base_at,
-            "the grant at {grant_at} precedes --ro-bind /usr at {base_at}, which mounts over \
-             it and silently grants nothing"
-        );
+        for granted in ["/var/lib", "/etc/ssl/certs"] {
+            assert!(
+                a.windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == granted && w[2] == granted),
+                "{granted} must be bound read-write, got {a:?}"
+            );
+        }
+        // Presence is not enough here either: a later mount wins, so a grant
+        // mounted *before* a read-only bind is covered by it and grants nothing.
+        // Every grant must follow **every** read-only bind, not just the `/usr`
+        // one. Measured: `--bind /usr/share /usr/share` then
+        // `--ro-bind /usr /usr` leaves `/usr/share` read-only where the
+        // production order leaves it writable, and the same rule holds for
+        // `/etc/ssl/certs`.
+        let last_ro = a
+            .iter()
+            .rposition(|x| x == "--ro-bind")
+            .expect("the read-only base must be bound");
+        for granted in ["/var/lib", "/etc/ssl/certs"] {
+            let at = a
+                .windows(3)
+                .position(|w| w[0] == "--bind" && w[1] == granted)
+                .expect("asserted present above");
+            assert!(
+                at > last_ro,
+                "the grant for {granted} at {at} precedes the last read-only bind at \
+                 {last_ro}, which mounts over it and silently grants nothing"
+            );
+        }
         // And nothing is bound read-write without a grant.
         let none = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
         assert!(
@@ -1884,14 +2000,26 @@ exit 0"#,
 
         // A bare 127 — an older script, or a shell that ignored the guard — must
         // fail closed too, because `sh` runs `echo exit=$?` whatever curl does.
-        let e = verdict_loopback(&output_of("exit=127\n", "sh: curl: not found\n", 0), &none)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("cannot tell"), "got {e:?}");
-        assert!(
-            e.contains("127"),
-            "the code it saw must be named, got {e:?}"
-        );
+        // The catch-all is the whole safety property, so more than one code has
+        // to exercise it: 6 is DNS failure and 52 is "empty reply from server",
+        // neither producible by this command on a working sandbox, both
+        // reachable if the sandbox substitutes its own curl. Every unexpected
+        // code must fail closed and name itself, under either grant.
+        for code in ["127", "6", "52"] {
+            for grants in [&none, &net] {
+                let e = verdict_loopback(&output_of(&format!("exit={code}\n"), "", 0), grants)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    e.contains("cannot tell"),
+                    "exit {code} must fail closed, got {e:?}"
+                );
+                assert!(
+                    e.contains(&format!("curl exited {code}")),
+                    "exit {code} must be named, got {e:?}"
+                );
+            }
+        }
     }
 
     /// Both states of the grant, so neither is assumed.
@@ -1930,6 +2058,82 @@ exit 0"#,
             Err(IsolationUnavailable::NotInstalled) => {}
             other => panic!("expected NotInstalled, got {other:?}"),
         }
+    }
+
+    /// The guard is what makes `curl=missing` reachable at all, so the verdict's
+    /// branch for it is dead code without this. Measured: with the guard removed,
+    /// a curl-less host emits `exit=127` and the operator is told "cannot tell
+    /// whether the host network is reachable: curl exited 127" instead of being
+    /// told curl is not installed. Still fail-closed, so this is message quality
+    /// rather than safety — but the script's doc claims it proves curl ran, and
+    /// nothing else asserts that.
+    #[test]
+    fn the_loopback_script_proves_curl_is_there() {
+        let script = loopback_script(4321);
+        assert!(
+            script.contains("command -v curl"),
+            "the loopback step must prove curl is installed, got {script:?}"
+        );
+        assert!(
+            script.contains("curl=missing"),
+            "and must say so when it is not, got {script:?}"
+        );
+        assert!(
+            script.contains("http://127.0.0.1:4321/"),
+            "and must probe the port it was given, got {script:?}"
+        );
+        // The verdict reads this exact token, so the two cannot drift.
+        assert!(
+            script.contains("exit=$?"),
+            "and must report curl's own exit code, got {script:?}"
+        );
+    }
+
+    /// A sandboxed process is untrusted, so its output must not be able to grow
+    /// this process's memory. `wait_with_output` collects all of it; the probe
+    /// must cap what it keeps **while still draining** the pipe — a reader that
+    /// stopped at the cap would block the child on a full pipe and turn a merely
+    /// noisy job into the 10s step timeout, which is what this asserts against.
+    #[tokio::test]
+    async fn a_chatty_sandbox_is_captured_without_growing() {
+        let scratch = tempfile::tempdir().unwrap();
+        // ~1 MB per stream: past `MAX_PROBE_TEXT` by three orders of magnitude,
+        // and past a 64 KiB pipe buffer, so both halves of the discipline are
+        // exercised by one invocation.
+        let (_dir, bin) = stub_bwrap_running(
+            "i=0\n\
+             while [ $i -lt 10000 ]; do\n\
+               echo 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n\
+               echo 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' >&2\n\
+               i=$((i+1))\n\
+             done\n\
+             exit 0",
+        );
+        let out = run_in_sandbox(
+            &bin,
+            scratch.path(),
+            &Grants::default(),
+            "x",
+            scratch.path(),
+            "the chatty step",
+        )
+        .await
+        .expect("a chatty child must complete, not deadlock on a full pipe");
+        assert!(out.status.success());
+        assert!(
+            out.stdout.len() <= MAX_PROBE_TEXT,
+            "stdout must be capped at {MAX_PROBE_TEXT}, kept {}",
+            out.stdout.len()
+        );
+        assert!(
+            out.stderr.len() <= MAX_PROBE_TEXT,
+            "stderr must be capped at {MAX_PROBE_TEXT}, kept {}",
+            out.stderr.len()
+        );
+        assert!(
+            !out.stdout.is_empty() && !out.stderr.is_empty(),
+            "and the cap keeps the head, not nothing"
+        );
     }
 
     /// A curl step with no timeout of its own turns a blackholed network into a
