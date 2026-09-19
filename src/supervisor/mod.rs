@@ -748,6 +748,11 @@ impl Supervisor {
         self.grants.read().unwrap().describe()
     }
 
+    /// What the operator currently holds, as parts, for the dashboard.
+    pub fn grants_held(&self) -> Vec<String> {
+        self.grants.read().unwrap().describe_parts()
+    }
+
     /// Record a grant change in the audit log. A grant belongs to no task, so
     /// the row is written with a NULL `task_id`; see
     /// [`TaskStore::record_grant_audit`].
@@ -787,10 +792,10 @@ impl Supervisor {
         // term there would cost one approval round-trip and change nothing
         // about what runs.
         //
-        // A `match` rather than `needs_approval() || !missing.is_empty()`:
-        // `needs_approval()` is a pure function of the isolation decision and
-        // has no grant set to look at, so it cannot express the second term.
-        // Keeping both terms in one `match` on the mode makes the exemption
+        // A `match` rather than `unavailable() || !missing.is_empty()`: a
+        // predicate on the isolation decision alone has no grant set to look at,
+        // so it cannot express the second term. Keeping both terms in one `match`
+        // on the mode makes the exemption
         // structural — there is exactly one place `Unconfined` is answered, and
         // it answers before either term is evaluated.
         match &self.shell_isolation {
@@ -819,9 +824,22 @@ impl Supervisor {
     }
 
     fn would_use_shell(&self, task: &crate::supervisor::task::Task) -> bool {
-        self.registry
-            .select_for(&task.required_capabilities)
-            .is_some_and(|b| b.name() == "shell")
+        // Ask the **planner**, because that is what the executor does. The
+        // obvious alternative — `registry.select_for(&task.required_capabilities)`
+        // — is a different question: `select_for` requires ONE backend to
+        // satisfy EVERY requested capability, while `Planner` sets
+        // `job.backend = required_capabilities.first()` and the `Orchestrator`
+        // resolves that name. So for `["shell", "reasoning"]` `select_for`
+        // answers `None` (no single backend is both) while the executor still
+        // dispatches a shell job: the gate would not fire, and the task would
+        // fail as a job instead of parking for approval — the exact outcome this
+        // gate exists to prevent. Deriving both from one plan is what keeps them
+        // from drifting apart again.
+        crate::supervisor::planner::Planner::new()
+            .plan(task)
+            .jobs
+            .iter()
+            .any(|j| j.backend == "shell")
     }
 
     pub fn register_test_reasoning_backend<F, Fut>(&mut self, f: F)
@@ -1475,15 +1493,14 @@ impl Supervisor {
         // LAYER 1 — route-time gate. This asks the same registry the executor
         // uses, rather than duplicating a routing predicate that could drift.
         //
-        // `needs_approval()` is the whole condition, and it is `false` for
-        // `Unconfined`: `sandbox = "none"` is the operator's consent, and under
-        // it nothing is gated (spec §4).
+        // `shell_gate_reason` returning `None` is the whole condition for
+        // "no gate", and it returns `None` for `Unconfined`: `sandbox = "none"`
+        // is the operator's consent, and under it nothing is gated (spec §4).
         //
-        // Known and deliberate at this step: the `RequireApproval` arm below
-        // builds its `reason` from `task.risk_level`, so a task parked *here*
-        // is told "medium-risk task requires approval" when the real cause is
-        // the missing sandbox. Task 8 replaces this with `shell_gate_reason`,
-        // which names the sandbox.
+        // The `RequireApproval` arm below no longer builds its `reason` from
+        // `task.risk_level`: it takes `gate_reason` when there is one, so a task
+        // parked because of the sandbox says so instead of reporting a risk
+        // level that was never the cause.
         let decision = self.policy.decide(&task);
         // The gate **shadows** the policy's decision rather than replacing it:
         // the `None` arm is the policy's own answer, so the two cannot drift.
@@ -3103,8 +3120,8 @@ mod tests {
     /// The registry is registered **deliberately**: the gate asks it, so with an
     /// empty registry `select_for` returns `None`, the gate never fires, and the
     /// task auto-executes — the test would pass for the wrong reason. This is
-    /// also the only proof that `Isolation::needs_approval` has a production
-    /// caller at all.
+    /// also the only proof that `shell_gate_reason` has a production caller at
+    /// all.
     #[tokio::test]
     async fn a_shell_task_is_parked_for_approval_when_isolation_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();

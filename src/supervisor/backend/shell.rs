@@ -608,8 +608,8 @@ mod tests {
     /// never established.
     ///
     /// This is the fourth direction `M14` is pinned from. The other three are in
-    /// `sandbox`: the variant the default carries, the `needs_approval` predicate
-    /// for every cause, and the message. A default that quietly became
+    /// `sandbox`: the variant the default carries, the `advice()` text for every
+    /// cause, and the message. A default that quietly became
     /// `Sandboxed` would run a job through a boundary that was never proven; one
     /// that became `Unconfined` would run it with no boundary at all. Both die
     /// here, on the `spawned` marker as well as on the status.

@@ -190,6 +190,111 @@ async fn enable_bearer_and_get_token(base: &str, cookie: &str) -> String {
 
 // ── The guard ───────────────────────────────────────────────────────────────
 
+/// The dashboard grant routes: list, grant, revoke, and refuse a bad body.
+///
+/// Each refusal is asserted to be a **400**, not merely non-200: a route that
+/// answered 500 for a malformed body would be indistinguishable from a broken
+/// dashboard, and a route that answered 200 would have granted something.
+#[tokio::test]
+async fn the_dashboard_grant_routes_list_grant_revoke_and_refuse() {
+    let (base, _dir, _supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    async fn held(base: &str, client: &reqwest::Client, cookie: &str) -> serde_json::Value {
+        let r = client
+            .get(format!("{base}/api/supervisor/grants"))
+            .header("Cookie", cookie)
+            .send()
+            .await
+            .expect("list grants");
+        assert_eq!(r.status(), 200);
+        let body: serde_json::Value = r.json().await.expect("grant json");
+        body["held"].clone()
+    }
+    async fn post(
+        base: &str,
+        client: &reqwest::Client,
+        route: &str,
+        body: serde_json::Value,
+        cookie: &str,
+    ) -> reqwest::Response {
+        client
+            .post(format!("{base}/api/supervisor/grants/{route}"))
+            .header("Cookie", cookie)
+            .header("x-haos-green-csrf", "1")
+            .json(&body)
+            .send()
+            .await
+            .expect("grant post")
+    }
+
+    assert_eq!(
+        held(&base, &client, &cookie).await,
+        serde_json::json!([]),
+        "a fresh dashboard holds nothing"
+    );
+
+    let r = post(
+        &base,
+        &client,
+        "allow",
+        serde_json::json!({"path": "/usr"}),
+        &cookie,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "allow /usr must succeed");
+    assert_eq!(
+        held(&base, &client, &cookie).await,
+        serde_json::json!(["write /usr"])
+    );
+
+    let r = post(
+        &base,
+        &client,
+        "deny",
+        serde_json::json!({"path": "/usr"}),
+        &cookie,
+    )
+    .await;
+    assert_eq!(r.status(), 200, "deny /usr must succeed");
+    assert_eq!(held(&base, &client, &cookie).await, serde_json::json!([]));
+
+    let r = post(
+        &base,
+        &client,
+        "allow",
+        serde_json::json!({"network": true}),
+        &cookie,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        held(&base, &client, &cookie).await,
+        serde_json::json!(["network"])
+    );
+
+    // Every malformed body is a 400. `network: false` is in the list on
+    // purpose: it is ambiguous, and reading it as a revocation would let an
+    // ambiguous body revoke a grant.
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"path": "/", "network": true}),
+        serde_json::json!({"network": false}),
+        serde_json::json!({"path": "/"}),
+        serde_json::json!({"path": "relative/path"}),
+        serde_json::json!({"path": "/nonexistent-haos-green-grant"}),
+    ] {
+        let r = post(&base, &client, "allow", body.clone(), &cookie).await;
+        assert_eq!(r.status(), 400, "body {body} must be refused with 400");
+    }
+    assert_eq!(
+        held(&base, &client, &cookie).await,
+        serde_json::json!(["network"]),
+        "a refused request must change nothing"
+    );
+}
+
 #[tokio::test]
 async fn a_protected_route_without_a_session_is_unauthorized() {
     let (base, _dir) = spawn_test_server().await;
@@ -244,7 +349,7 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
     // header is sent on all of them so the request reaches the authentication
     // check rather than being stopped by the CSRF gate first: this test is
     // about authentication.
-    let cases: [(&str, &str, Option<serde_json::Value>); 24] = [
+    let cases: [(&str, &str, Option<serde_json::Value>); 27] = [
         ("GET", "/api/settings", None),
         (
             "POST",
@@ -288,6 +393,20 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
         ("POST", "/api/supervisor/tasks/nope/resume", None),
         ("POST", "/api/supervisor/tasks/nope/cancel", None),
         ("POST", "/api/supervisor/tasks/nope/approve", None),
+        // The grant surface. `/allow` widens the shell boundary — it is the
+        // route on which a missing guard would hand a caller the filesystem —
+        // so it belongs in the sweep more than any of the lifecycle routes.
+        ("GET", "/api/supervisor/grants", None),
+        (
+            "POST",
+            "/api/supervisor/grants/allow",
+            Some(serde_json::json!({"path": "/usr"})),
+        ),
+        (
+            "POST",
+            "/api/supervisor/grants/deny",
+            Some(serde_json::json!({"path": "/usr"})),
+        ),
         // The log surface (Phase 4). The log is the most revealing thing the
         // dashboard holds — targets, paths, task ids, error text — so a missing
         // guard here would leak more than any other route.
@@ -1478,7 +1597,13 @@ fn test_supervisor(
         memory.connection(),
     );
     supervisor.register_test_reasoning_backend(|prompt| async move { Ok(format!("ran:{prompt}")) });
-    std::sync::Arc::new(supervisor)
+    // The sandbox root, mirroring `main.rs`. Without it `Supervisor::allow_path`
+    // refuses every grant — the ancestor check needs the root, and the
+    // supervisor is built to refuse rather than guess — so the dashboard grant
+    // routes would answer 400 for a reason that has nothing to do with the
+    // request under test.
+    let root = artifacts.parent().unwrap_or(artifacts).to_path_buf();
+    std::sync::Arc::new(supervisor.with_sandbox_root(root))
 }
 
 /// Start the dashboard with a live supervisor attached, and hand back the

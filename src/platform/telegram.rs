@@ -239,6 +239,13 @@ pub(crate) const MAX_SUPERVISE_TEXT_CHARS: usize = crate::supervisor::MAX_TASK_T
 /// and echoed.
 pub(crate) const MAX_TASK_ID_CHARS: usize = 64;
 
+/// The longest host path `/allow` or `/deny` will look at.
+///
+/// `PATH_MAX` is 4096 on Linux, so anything longer cannot be a path that
+/// resolves anyway — the bound is here so the refusal, which echoes the raw
+/// string, cannot be made to carry an arbitrarily large argument.
+pub(crate) const MAX_GRANT_PATH_CHARS: usize = 4096;
+
 /// Longest task title rendered on a `/tasks` line, in characters. Titles are
 /// already capped at 80 by `IntakeRouter::normalize`; this is the display cap.
 const MAX_TASK_TITLE_CHARS: usize = 60;
@@ -376,6 +383,13 @@ async fn audit_note(supervisor: &Supervisor, actor: &SupervisorActor, reason: &s
 /// cumulative state, and an operator issuing two grants needs to see the set,
 /// not the delta.
 async fn allow_command(arg: &str, actor: &SupervisorActor, supervisor: &Supervisor) -> String {
+    // Bounded like every other argument, and for the same reason: the refusal
+    // echoes the raw string, and `bounded_reply` truncates the *reply* but not
+    // the work done to build it. `MAX_TASK_TEXT_CHARS` and `MAX_TASK_ID_CHARS`
+    // exist for exactly this; a grant path had no bound until this one.
+    if arg.chars().count() > MAX_GRANT_PATH_CHARS {
+        return format!("Refused: that path is longer than {MAX_GRANT_PATH_CHARS} characters.");
+    }
     match supervisor.allow_path(arg) {
         Ok(path) => format!(
             "Granted write access to {}.\nHeld now: {}{}",
@@ -396,6 +410,9 @@ async fn allow_command(arg: &str, actor: &SupervisorActor, supervisor: &Supervis
 
 /// `/deny <absolute-path>` — revoke a write grant.
 async fn deny_command(arg: &str, actor: &SupervisorActor, supervisor: &Supervisor) -> String {
+    if arg.chars().count() > MAX_GRANT_PATH_CHARS {
+        return format!("Refused: that path is longer than {MAX_GRANT_PATH_CHARS} characters.");
+    }
     match supervisor.deny_path(arg) {
         Ok(path) => format!(
             "Revoked write access to {}.\nHeld now: {}{}",

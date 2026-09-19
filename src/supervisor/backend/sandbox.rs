@@ -410,14 +410,21 @@ impl Isolation {
 /// add a version spawn to every job to defend against an attacker who could
 /// equally replace the binary the check would call.
 ///
-/// **Forward note (Task 8).** `grants` here is the **startup snapshot**
-/// `main.rs` takes immediately above the call, and that snapshot is empty. So
-/// the `--share-net` branch of [`build_argv`] and the "grant held" arm of
-/// [`verdict_loopback`] are unreachable in production today: a later
-/// `/allow-net` reaches the argv (which reads the live grant set per job) but is
-/// never probe-verified. Task 8 owns the grant commands and must decide whether
-/// a new grant is probed before it is honoured, or whether the argv is trusted
-/// on the strength of the startup probe alone.
+/// **The decision Task 8 took, recorded here because it is a real limit.**
+/// `grants` is the **startup snapshot** `main.rs` takes immediately above the
+/// call, and that snapshot is empty — grants start empty and are issued later
+/// through `/allow` and `/allow_net`. So the `--share-net` branch of
+/// [`build_argv`] and the "grant held" arm of [`verdict_loopback`] are
+/// **unreachable in production**: a later `/allow_net` reaches the argv (which
+/// reads the live grant set per job) but is never probe-verified.
+///
+/// The argv is trusted on the strength of the startup probe alone. That is a
+/// deliberate trade — re-probing on every grant would put a bubblewrap launch
+/// between the operator's command and its effect, and the probe cannot test the
+/// operator's *actual* path anyway — but it has a consequence worth naming: if
+/// `--share-net` ever regressed, `/allow_net` would grant nothing and nothing
+/// would say so. The grant is a widening of the boundary, not a promise that the
+/// widening works.
 async fn prove_boundary(grants: &Grants) -> Result<(), IsolationUnavailable> {
     check_bwrap_version()?;
     probe(grants).await
@@ -568,8 +575,11 @@ fn strip_dashes(raw: &str) -> &str {
 }
 
 impl Grants {
-    /// What is held, for the operator and the dashboard.
-    pub fn describe(&self) -> String {
+    /// What is held, as parts, for the dashboard's JSON.
+    ///
+    /// [`Self::describe`] is built from this, so the bot's `/grants` line and
+    /// the dashboard's list cannot say different things.
+    pub fn describe_parts(&self) -> Vec<String> {
         let mut parts: Vec<String> = self
             .write
             .iter()
@@ -578,6 +588,12 @@ impl Grants {
         if self.network {
             parts.push("network".to_string());
         }
+        parts
+    }
+
+    /// What is held, for the operator and the dashboard.
+    pub fn describe(&self) -> String {
+        let parts = self.describe_parts();
         if parts.is_empty() {
             "nothing is granted".to_string()
         } else {
@@ -1789,7 +1805,8 @@ const HOME_MARKERS: [&str; 2] = ["haos-green.db", "web-auth.toml"];
 /// choosing outside the root, because the creation is `mkdirat` on a descriptor
 /// rather than a path (measured before that change: 1472 of 8246 refusals over
 /// 15 s of swapping had created `elsewhere/job-1`, first hit after 4 refusals).
-/// The two cases left are both harmless:
+/// **Neither case left is harmless**, and saying so is the point of this
+/// paragraph — the spec carries the same correction:
 ///
 /// - the writer *moves* the verified directory outside the root, and the level
 ///   below is then created inside it. That directory is one the writer could
@@ -1803,10 +1820,12 @@ const HOME_MARKERS: [&str; 2] = ["haos-green.db", "web-auth.toml"];
 ///   `--bind-fd <fd>` mounted the original inode.)
 ///
 /// Both need a local writer with write access to the sandbox root. That is not
-/// free: `/allow <root>` is grantable, and the default root is the same
-/// directory the chat agent's shell tool uses as its working directory, so the
-/// precondition is recorded in the spec — **no write grant may cover the sandbox
-/// root** — rather than assumed here.
+/// free — the default root is the same directory the chat agent's shell tool
+/// uses as its working directory — so the precondition is **enforced** rather
+/// than assumed: [`Grants::resolve_path`] refuses the root and every ancestor of
+/// it at issue time, which is what stops `/allow <root>` from handing the root
+/// back. A *sibling* of the root stays grantable, and a writer confined to a
+/// sibling cannot reach the root.
 pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<JobDir> {
     let task_id = one_component(task_id, "task id")?;
     let job_id = one_component(job_id, "job id")?;

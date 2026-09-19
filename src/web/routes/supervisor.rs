@@ -64,6 +64,117 @@ pub fn router() -> Router<WebState> {
         .route("/api/supervisor/tasks/{id}/resume", post(resume_task))
         .route("/api/supervisor/tasks/{id}/cancel", post(cancel_task))
         .route("/api/supervisor/tasks/{id}/approve", post(approve_task))
+        .route("/api/supervisor/grants", get(list_grants))
+        .route("/api/supervisor/grants/allow", post(allow_grant))
+        .route("/api/supervisor/grants/deny", post(deny_grant))
+}
+
+/// A grant request. Exactly one of the two fields is set: a host path, or the
+/// host network.
+#[derive(serde::Deserialize)]
+struct GrantRequest {
+    path: Option<String>,
+    network: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct GrantList {
+    held: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct GrantResponse {
+    held: Vec<String>,
+    /// Present only when the change took effect but its audit row could not be
+    /// written. The change is **already in force**, so this is not an error and
+    /// must not be reported as one — but the operator has to be told, or the
+    /// audit log silently develops holes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+/// The audit actor for every dashboard grant change.
+///
+/// The dashboard has exactly one operator identity, so there is nothing more
+/// specific to record than the surface. The Telegram commands record the numeric
+/// user id, which *is* more specific — that is what each surface's
+/// authentication actually establishes, not an inconsistency.
+const DASHBOARD_ACTOR: &str = "dashboard";
+
+/// The body of every malformed grant request.
+const GRANT_SHAPE: &str = "send exactly one of `path` or `network`";
+
+async fn list_grants(State(state): State<WebState>) -> Response {
+    let supervisor = match state.supervisor_or_unavailable() {
+        Ok(supervisor) => supervisor,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    Json(GrantList {
+        held: supervisor.grants_held(),
+    })
+    .into_response()
+}
+
+async fn allow_grant(State(state): State<WebState>, Json(body): Json<GrantRequest>) -> Response {
+    change_grant(state, body, true).await
+}
+
+async fn deny_grant(State(state): State<WebState>, Json(body): Json<GrantRequest>) -> Response {
+    change_grant(state, body, false).await
+}
+
+/// Apply one grant change and audit it.
+///
+/// A refusal here is about the **path**, so it is a **400** carrying the
+/// refusal reason — not a 409. These routes take no task id and change no task
+/// state, so there is no lifecycle pre-check to fail.
+async fn change_grant(state: WebState, body: GrantRequest, allow: bool) -> Response {
+    let supervisor = match state.supervisor_or_unavailable() {
+        Ok(supervisor) => supervisor,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
+    // Exactly one field. `network: false` is rejected rather than read as a
+    // revocation: `/deny` is a separate route, and guessing which of two
+    // meanings an ambiguous body carries is how a revocation becomes a grant.
+    let applied: anyhow::Result<String> = match (&body.path, body.network) {
+        (Some(path), None) if allow => supervisor
+            .allow_path(path)
+            .map(|p| format!("grant write {}", p.display())),
+        (Some(path), None) => supervisor
+            .deny_path(path)
+            .map(|p| format!("revoke write {}", p.display())),
+        (None, Some(true)) => {
+            if allow {
+                supervisor.allow_network();
+                Ok("grant the host network namespace".to_string())
+            } else {
+                supervisor.deny_network();
+                Ok("revoke the host network namespace".to_string())
+            }
+        }
+        _ => return (StatusCode::BAD_REQUEST, GRANT_SHAPE).into_response(),
+    };
+
+    let reason = match applied {
+        Ok(reason) => reason,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    };
+
+    let warning = match supervisor.audit_grant(DASHBOARD_ACTOR, &reason).await {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "the grant took effect but its audit row was not written");
+            Some(format!(
+                "the change took effect, but its audit row was not written: {e:#}"
+            ))
+        }
+    };
+    Json(GrantResponse {
+        held: supervisor.grants_held(),
+        warning,
+    })
+    .into_response()
 }
 
 /// The body of every "no such task" answer.

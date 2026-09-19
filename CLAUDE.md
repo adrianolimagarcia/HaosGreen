@@ -485,6 +485,7 @@ that is neither an IP nor a CIDR range.
 | `GET /api/settings`, `POST /api/settings/password`, `POST /api/settings/bearer`, `PUT /api/settings/allow-ips` | Credentials and the live allowlist. |
 | `POST`, `GET /api/chat/sessions`; `GET`, `POST /api/chat/sessions/{id}/messages`; `POST /api/chat/sessions/{id}/cancel` | The chat surface. The `POST` on messages is `text/event-stream`. |
 | `GET`, `POST /api/supervisor/tasks`; `GET /api/supervisor/tasks/{id}`; `POST /api/supervisor/tasks/{id}/{pause,resume,cancel,approve}` | Supervisor surface. |
+| `GET /api/supervisor/grants`; `POST /api/supervisor/grants/{allow,deny}` | Grant surface. The body is `{"path": "..."}` or `{"network": true}` — exactly one — and a refusal is **400** carrying the reason, because it is about the path, not about task state. |
 | `GET /api/logs`, `GET /api/logs/stream` | Log history, and a live tail that is not a replay. |
 | `GET /api/a2a/status`, `/peers`, `/outbound`; `PUT /api/a2a/outbound`; `POST /api/a2a/test` | A2A manager. |
 
@@ -816,7 +817,20 @@ is why it is a brake and not a boundary.
 A shell job's boundary can be widened by naming a capability, never by asking
 for one. `Grants` holds a set of writable host paths and a network flag, and the
 operator releases them one at a time with `/allow`, `/deny`, `/allow_net`,
-`/deny_net` and reads them back with `/grants`.
+`/deny_net` and reads them back with `/grants` — or, without the Telegram
+surface, through `GET /api/supervisor/grants` and
+`POST /api/supervisor/grants/{allow,deny}` on the dashboard, which audit as the
+fixed actor `"dashboard"`.
+
+> **A grant is standing, not per-job consent.** Nothing derives a job's needs
+> from its command: `Task::declared_grants` exists, both layers read it, and the
+> planner copies it onto every job — but **no production code ever writes it**.
+> So `/allow /var/lib` is bound into *every later shell job* until it is
+> revoked, rather than being released for one job that asked. The design spec
+> describes a per-job declaration that was never implemented; the enforcement
+> path (`shell_gate_reason`, and the `Failed` job in `ShellBackend::run`) is
+> real and tested but unreachable in production, because the set it checks is
+> always empty. Read the spec's §3 as intent, not as shipped behaviour.
 
 **The command names use underscores, not hyphens.** Telegram `BotCommand` names
 must match `[a-z0-9_]{1,32}`, so `/allow-net` is not a command Telegram will
@@ -923,8 +937,11 @@ Known bounds — documented, not hidden:
 - `kill_on_drop` kills only the **direct** child — a backgrounded grandchild of
   a compound `sh -c` can survive, and an in-flight MCP tool call is abandoned
   rather than stopped (`McpBackend` has no timeout or cancellation). A `shell`
-  job is the **exception**: its argv carries `--die-with-parent`, so its
-  descendants die with the sandbox instead of being reparented. Proven by
+  job is the **exception, but only when it is sandboxed**: its argv then carries
+  `--die-with-parent`, so its descendants die with the sandbox instead of being
+  reparented. Under `sandbox = "none"` there is no argv — the job is a plain
+  `sh -c` with `kill_on_drop`, so a backgrounded grandchild is reparented and
+  survives exactly like every other backend. Proven by
   `tests/shell_sandbox_live.rs::killing_the_supervisor_leaves_no_descendant`,
   which fails only after its 20 s deadline when that flag is removed — the
   flag is load-bearing, not decorative;
