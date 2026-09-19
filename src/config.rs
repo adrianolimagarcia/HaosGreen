@@ -59,6 +59,8 @@ pub struct SupervisorConfig {
     pub artifacts_dir: std::path::PathBuf,
     #[serde(default)]
     pub risk: RiskThresholdsConfig,
+    #[serde(default)]
+    pub shell: ShellSandboxConfig,
 }
 
 impl Default for SupervisorConfig {
@@ -67,7 +69,21 @@ impl Default for SupervisorConfig {
             default_autonomy_mode: default_autonomy_mode(),
             artifacts_dir: default_artifacts_dir(),
             risk: RiskThresholdsConfig::default(),
+            shell: ShellSandboxConfig::default(),
         }
+    }
+}
+
+impl SupervisorConfig {
+    /// Validate the `[supervisor]` block.
+    ///
+    /// Every field here also fails closed at use time; the point of checking up
+    /// front is that the failure is *loud* and happens once at load instead of
+    /// silently per job. Unlike the `[web]` and `[a2a]` blocks there is no
+    /// listener to skip: the supervisor's shell backend is always registered, so
+    /// a value this build cannot interpret is not something to carry on with.
+    pub fn validate(&self) -> Result<()> {
+        self.shell.validate()
     }
 }
 
@@ -536,6 +552,65 @@ pub struct RiskThresholdsConfig {
     /// with the M1–M6 policy where Medium-risk tasks auto-execute.
     #[serde(default)]
     pub auto_execute_only_low: bool,
+}
+
+fn default_shell_sandbox() -> String {
+    "bwrap".to_string()
+}
+
+/// `[supervisor.shell]`.
+///
+/// One key, deliberately. The host network namespace is a **runtime grant**
+/// (`/allow-net`), not a startup setting: a config key is decided once, at rest,
+/// by whoever edits `config.toml`, while the escape path it opens is exercised
+/// per job. A writable host path is a grant for the same reason (`/allow
+/// <path>`). So neither is configured here (spec §4).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShellSandboxConfig {
+    /// `"bwrap"` (sandboxed) or `"none"` (unsandboxed, the operator's explicit
+    /// consent, and nothing else is gated). An unknown value is refused rather
+    /// than defaulted — see [`Self::validate`] and [`Self::is_unconfined`].
+    #[serde(default = "default_shell_sandbox")]
+    pub sandbox: String,
+}
+
+impl Default for ShellSandboxConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: default_shell_sandbox(),
+        }
+    }
+}
+
+impl ShellSandboxConfig {
+    /// Refuse any mode this build cannot honour.
+    ///
+    /// There is no safe default for an unrecognised value. Reading it as
+    /// `"bwrap"` refuses shell jobs an operator may have meant to allow; reading
+    /// it as `"none"` removes the sandbox because of a typo, which is the worst
+    /// outcome this key can have. So the value is neither guessed at nor
+    /// silently accepted: it stops the load (see [`Config::load`]).
+    pub fn validate(&self) -> Result<()> {
+        match self.sandbox.as_str() {
+            "bwrap" | "none" => Ok(()),
+            other => {
+                bail!("[supervisor.shell].sandbox must be \"bwrap\" or \"none\", got {other:?}")
+            }
+        }
+    }
+
+    /// Is this the operator's standing consent to run shell jobs unconfined?
+    ///
+    /// **Equality against the literal `"none"`, never a `_` arm and never
+    /// `!= "bwrap"`.** This predicate is the one place the unconfined mode is
+    /// selected, so any other shape is a fail-open: a typo — `"None"`,
+    /// `"none "`, `"chroot"` — would read as consent and run a shell job with
+    /// no boundary at all (spec §4). `validate()` refuses those values at load;
+    /// this returns `false` for them anyway, so the decision is fail-closed even
+    /// if a caller never validated.
+    pub fn is_unconfined(&self) -> bool {
+        self.sandbox == "none"
+    }
 }
 
 fn default_autonomy_mode() -> String {
@@ -1115,11 +1190,29 @@ impl Config {
         Ok(warnings)
     }
 
+    /// Read and validate `config.toml`.
+    ///
+    /// Validation happens here, before [`Self::resolve`] creates any directory,
+    /// because this is the single choke point every entry point goes through: a
+    /// validator that each caller has to remember to invoke is one that will
+    /// eventually not be invoked.
+    ///
+    /// [`SupervisorConfig::validate`] is the one check that is *fatal*. The
+    /// `[web]` and `[a2a]` blocks are validated where their listeners start,
+    /// because a misconfiguration there costs a listener and not the bot — but
+    /// `[supervisor.shell].sandbox` selects whether a shell job runs inside a
+    /// sandbox, and an unrecognised value has no safe reading. Refusing to start
+    /// is the only answer that cannot be wrong.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
         let mut config: Config =
             toml::from_str(&content).with_context(|| "Failed to parse config file")?;
+
+        config
+            .supervisor
+            .validate()
+            .with_context(|| format!("Invalid config in {}", path.display()))?;
 
         let warnings = config
             .resolve()
@@ -1486,6 +1579,201 @@ mod tests {
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.supervisor.default_autonomy_mode, "standard");
         assert_eq!(cfg.supervisor.artifacts_dir, std::path::PathBuf::new());
+    }
+
+    // ── [supervisor.shell] ──────────────────────────────────────────────────
+    //
+    // One key, and it decides whether a supervisor shell job runs inside a
+    // sandbox at all. It has exactly two ways to be taken wrongly: silently
+    // accepted when misspelled, and read as the operator's consent to run
+    // unconfined when misspelled. The tests below pin both.
+
+    #[test]
+    fn shell_sandbox_defaults_to_bwrap_with_an_empty_grant_set() {
+        let c = ShellSandboxConfig::default();
+        assert_eq!(c.sandbox, "bwrap");
+        // The shipped default is the **empty** grant set: no writable host path
+        // and no host network. Nothing here decides otherwise — the network is
+        // a runtime grant (`/allow-net`), not a setting (spec §4), so there is
+        // no key to read and nothing to default.
+        let g = crate::supervisor::backend::sandbox::Grants::default();
+        assert!(g.write.is_empty(), "no host path is writable by default");
+        assert!(!g.network, "the host network is not shared by default");
+    }
+
+    #[test]
+    fn shell_sandbox_defaults_when_the_section_is_missing() {
+        // The overwhelming majority of installs have no `[supervisor.shell]`
+        // block. They must get the sandbox, not an unconfined default.
+        let cfg: Config = toml::from_str(base_toml()).unwrap();
+        assert_eq!(cfg.supervisor.shell.sandbox, "bwrap");
+        assert!(!cfg.supervisor.shell.is_unconfined());
+    }
+
+    #[test]
+    fn an_unknown_sandbox_mode_is_refused() {
+        let c = ShellSandboxConfig {
+            sandbox: "chroot".into(),
+        };
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("sandbox"), "unexpected error: {err}");
+        assert!(
+            err.contains("chroot"),
+            "the error must quote the offending value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn both_documented_modes_are_accepted() {
+        for m in ["bwrap", "none"] {
+            let c = ShellSandboxConfig { sandbox: m.into() };
+            assert!(c.validate().is_ok(), "{m} must be accepted");
+        }
+    }
+
+    /// The failure mode this key must never have: a typo read as the operator's
+    /// standing consent to run shell jobs unconfined.
+    ///
+    /// `"none"` is consent to *nothing being gated* (spec §4), so the predicate
+    /// that answers "is this the consent?" has to be an equality against the
+    /// literal — never a `_` arm, and never `!= "bwrap"`, which is the same
+    /// mistake with the branches swapped.
+    #[test]
+    fn an_unknown_sandbox_mode_is_not_consent_to_run_unconfined() {
+        for m in [
+            "chroot", "None", "NONE", "none ", " none", "bwrap2", "no", "", "off", "false",
+        ] {
+            let c = ShellSandboxConfig { sandbox: m.into() };
+            assert!(
+                !c.is_unconfined(),
+                "{m:?} must not select the unconfined mode"
+            );
+        }
+        // And the literal does select it, or the key would be inert and the
+        // assertion above would hold for a predicate that is always false.
+        let c = ShellSandboxConfig {
+            sandbox: "none".into(),
+        };
+        assert!(c.is_unconfined());
+    }
+
+    #[test]
+    fn supervisor_validate_refuses_an_unknown_sandbox_mode() {
+        let cfg = SupervisorConfig {
+            shell: ShellSandboxConfig {
+                sandbox: "chroot".into(),
+            },
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("[supervisor.shell].sandbox"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn supervisor_validate_accepts_the_shipped_default() {
+        assert!(SupervisorConfig::default().validate().is_ok());
+    }
+
+    /// The wiring test — the point of this task.
+    ///
+    /// `ShellSandboxConfig::validate()` existing is not the property; being
+    /// *called* is. A misspelled mode in `config.toml` must stop the process at
+    /// load, before any shell job can be routed, and it must never be resolved
+    /// to one of the two modes.
+    #[test]
+    fn config_load_refuses_an_unknown_shell_sandbox_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+                [telegram]
+                bot_token = "tok"
+                allowed_user_ids = [1]
+                [openrouter]
+                api_key = "key"
+                [general]
+                home = "{}"
+                [supervisor.shell]
+                sandbox = "chroot"
+                "#,
+                home.display()
+            ),
+        )
+        .unwrap();
+
+        // `{:#}` is anyhow's whole-chain rendering, which is what `main` prints
+        // when the `?` above it reaches `fn main()`. The plain `Display` shows
+        // only the outermost context ("Invalid config in …") and would let the
+        // operator's typo go unnamed.
+        let err = format!("{:#}", Config::load(&cfg_path).unwrap_err());
+        assert!(
+            err.contains("[supervisor.shell].sandbox"),
+            "loading must fail, naming the key, got: {err}"
+        );
+        assert!(
+            err.contains("chroot"),
+            "the error must quote the offending value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_load_accepts_both_documented_shell_sandbox_modes() {
+        for m in ["bwrap", "none"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let cfg_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &cfg_path,
+                format!(
+                    r#"
+                    [telegram]
+                    bot_token = "tok"
+                    allowed_user_ids = [1]
+                    [openrouter]
+                    api_key = "key"
+                    [general]
+                    home = "{}"
+                    [supervisor.shell]
+                    sandbox = "{m}"
+                    "#,
+                    home.display()
+                ),
+            )
+            .unwrap();
+
+            let cfg = Config::load(&cfg_path).unwrap_or_else(|e| panic!("{m} must load: {e}"));
+            assert_eq!(cfg.supervisor.shell.sandbox, m);
+        }
+    }
+
+    #[test]
+    fn the_example_config_ships_the_shell_sandbox_on() {
+        // `config.example.toml` is what users copy. If it ever ships
+        // `sandbox = "none"` — or drops the block so a reader never sees the
+        // key — an operator gets unconfined shell jobs without having decided
+        // anything. Same reasoning as `web_disabled_by_default`.
+        let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        assert_eq!(cfg.supervisor.shell.sandbox, "bwrap");
+        assert!(!cfg.supervisor.shell.is_unconfined());
+        assert!(cfg.supervisor.validate().is_ok());
+    }
+
+    #[test]
+    fn an_empty_shell_sandbox_table_still_defaults_to_bwrap() {
+        // An operator who writes the table and comments the key out — the most
+        // likely way to "leave it alone" — must get the sandbox, not `""`.
+        // `""` is not consent (`is_unconfined` is an equality), but it would
+        // still be refused at load, so the default is what keeps a harmless
+        // edit harmless.
+        let cfg: Config =
+            toml::from_str(&format!("{}\n[supervisor.shell]\n", base_toml())).unwrap();
+        assert_eq!(cfg.supervisor.shell.sandbox, "bwrap");
     }
 
     #[test]

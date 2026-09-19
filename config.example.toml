@@ -249,6 +249,30 @@ Be concise and helpful."""
 # user_model_cron = "0 0 3 * * SUN"           # Weekly user model refresh (6-field cron)
 # compaction_model = "qwen/qwen3-8b"          # Cheaper model for compaction summary + USER.md flush (default: current model)
 
+# ── Supervisor (optional; defaults apply if section omitted) ────────────────
+#
+# The autonomous task runner. Its other keys — `default_autonomy_mode`
+# (docs/GUIDE.md), `artifacts_dir` and the `[supervisor.risk]` gates
+# (CLAUDE.md) — are left out here; only the shell sandbox is written out.
+#
+# It is written out, rather than commented like the sections below, on purpose:
+# this is the one key that decides whether a shell job has a boundary at all,
+# and an operator should have to see it to change it. `"bwrap"` is the same
+# value a config with no `[supervisor.shell]` table gets.
+
+[supervisor.shell]
+# "bwrap" runs shell jobs inside a bubblewrap sandbox (requires bwrap >= 0.12.0).
+# "none" runs them unconfined, and IS your consent — nothing else is gated.
+#
+# Any other value is refused when the config is loaded: the process will not
+# start. A misspelled mode must never be read as consent to run unconfined.
+sandbox = "bwrap"
+
+# Nothing else is configured here on purpose. A writable host path and the host
+# network namespace are not settings but runtime grants the operator names at the
+# moment they are used — /allow <path> and /allow-net — standing until /deny or
+# /deny-net, and revoked by a restart. Neither substitutes for a missing sandbox.
+
 # ── A2A (Agent2Agent) protocol (optional; DISABLED by default) ──────────────
 #
 # Lets other A2A agents on your LAN/VPN discover this bot and send it tasks.
