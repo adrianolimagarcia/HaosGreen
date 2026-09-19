@@ -676,6 +676,7 @@ impl Default for LoginLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn hash_then_verify_round_trips() {
@@ -1368,6 +1369,118 @@ mod tests {
         }
     }
 
+    // ── Claiming every permit of the process-wide gate ──────────────────────
+
+    /// Serialises the tests that need **all** of the process-wide gate.
+    ///
+    /// Two tests below need every permit: one to prove that a verification
+    /// cannot run while the gate is exhausted, the other to prove that a
+    /// verification goes to the blocking pool. Holding *every* permit of a
+    /// shared semaphore is not a safe thing to do concurrently, because tokio's
+    /// semaphore fills a queued waiter **incrementally**: `poll_acquire`
+    /// subtracts the available permits from the counter before the waiter is
+    /// enqueued, and `assign_permits` then hands it each permit released while
+    /// it is still queued. Two concurrent claimants therefore each hold part of
+    /// the gate and wait for the part the other holds — and neither ever
+    /// releases, because neither is running.
+    ///
+    /// That wait is permanent and completely silent: no CPU, no output, no
+    /// failing test, just a suite that never finishes. It is the intermittent
+    /// full-suite hang this lock exists to prevent, and
+    /// `two_whole_gate_claims_never_overlap` is the regression test for it.
+    ///
+    /// One claimant is always safe — a single whole-gate waiter is filled to
+    /// four as the transient single-permit holders release, and every other
+    /// caller in this process takes exactly one permit and never waits while
+    /// holding one, so no cycle can form. So this is not a timeout around the
+    /// symptom: it makes "hold the whole gate" a serialised operation instead
+    /// of a deadlocking one, and `claim_the_whole_gate` is the only way left to
+    /// reach the gate from a test.
+    static WHOLE_GATE_CLAIM: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    /// How many tasks hold a [`WholeGateClaim`] right now. At most one; more is
+    /// the deadlock above, and is asserted rather than waited out.
+    static WHOLE_GATE_CLAIMANTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Exclusive right to hold every permit of the process-wide gate.
+    ///
+    /// Permits are handed back with [`WholeGateClaim::release_one`] and
+    /// [`WholeGateClaim::release_all`] while the claim itself is still held, so
+    /// a test can free the gate for the work it is measuring without letting a
+    /// second claimant in.
+    struct WholeGateClaim {
+        _exclusive: tokio::sync::MutexGuard<'static, ()>,
+        permits: Vec<tokio::sync::SemaphorePermit<'static>>,
+    }
+
+    impl WholeGateClaim {
+        /// Called with the exclusive lock already held.
+        ///
+        /// The count is incremented — and checked — *before* a single permit is
+        /// taken, so a second claimant fails here with its own name rather than
+        /// after taking part of the gate and deadlocking.
+        fn new(exclusive: tokio::sync::MutexGuard<'static, ()>) -> Self {
+            let claim = WholeGateClaim {
+                _exclusive: exclusive,
+                permits: Vec::new(),
+            };
+            let claimants = WHOLE_GATE_CLAIMANTS.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_eq!(
+                claimants, 1,
+                "two tasks are claiming every permit of the process-wide KDF gate at once. \
+                 tokio's semaphore fills a whole-gate waiter one permit at a time, so they \
+                 would each hold part of the gate and wait for the part the other holds — a \
+                 permanent, silent deadlock. Claim the gate with `claim_the_whole_gate`."
+            );
+            claim
+        }
+
+        /// Hand back one permit, keeping the claim.
+        fn release_one(&mut self) {
+            self.permits.pop();
+        }
+
+        /// Hand back every permit, keeping the claim.
+        fn release_all(&mut self) {
+            self.permits.clear();
+        }
+    }
+
+    impl Drop for WholeGateClaim {
+        fn drop(&mut self) {
+            // Hand the permits back *before* the exclusive lock. Field order
+            // alone would drop the guard first (it is declared first), which
+            // would let the next claimant in while this one still held permits.
+            self.permits.clear();
+            WHOLE_GATE_CLAIMANTS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Claim every permit of the process-wide gate, exclusively.
+    ///
+    /// Bounded, because a claimant that is never filled *is* the silent hang
+    /// described on [`WHOLE_GATE_CLAIM`]: `supervisor::bounded` turns it into a
+    /// failure naming this test instead of a wedged binary.
+    async fn claim_the_whole_gate() -> WholeGateClaim {
+        let exclusive = WHOLE_GATE_CLAIM
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut claim = WholeGateClaim::new(exclusive);
+        crate::supervisor::bounded("the whole-gate claim in web::auth::tests", async {
+            for _ in 0..MAX_CONCURRENT_KDF_OPERATIONS {
+                claim.permits.push(
+                    kdf_semaphore()
+                        .acquire()
+                        .await
+                        .expect("the gate is never closed"),
+                );
+            }
+        })
+        .await;
+        claim
+    }
+
     /// The gate must really bound how many Argon2 operations run at once.
     ///
     /// This is a memory bound as much as a CPU one: each operation allocates
@@ -1386,13 +1499,11 @@ mod tests {
         assert!(verify_password("correct horse", &hash));
         let cost = started.elapsed();
 
-        // Wait until *all* permits are free, then hold them. Unlike
-        // `try_acquire` in a loop this cannot be raced by a test running in
-        // parallel in the same process.
-        let all = kdf_semaphore()
-            .acquire_many(MAX_CONCURRENT_KDF_OPERATIONS as u32)
-            .await
-            .expect("the gate is never closed");
+        // Wait until *all* permits are free, then hold them — and hold them
+        // alone: `claim_the_whole_gate` is exclusive, so a test running in
+        // parallel in the same process can neither race this nor deadlock
+        // against it.
+        let mut claim = claim_the_whole_gate().await;
 
         let mut pending =
             tokio::spawn(async move { verify_password_async("correct horse", &hash).await });
@@ -1404,7 +1515,7 @@ mod tests {
             cost * 3
         );
 
-        drop(all);
+        claim.release_all();
         assert!(
             tokio::time::timeout(Duration::from_secs(60), pending)
                 .await
@@ -1488,7 +1599,9 @@ mod tests {
     /// The permits are taken and handed back by this test rather than left
     /// alone, because the gate is process-wide: a test running in parallel
     /// could otherwise hold it and make the assertion below pass for the wrong
-    /// reason.
+    /// reason. `claim_the_whole_gate` takes them exclusively, so no other test
+    /// can hold the gate for the duration of this one — and the two whole-gate
+    /// tests cannot deadlock against each other either.
     #[test]
     fn the_kdf_runs_on_the_blocking_pool_not_the_runtime_thread() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1507,17 +1620,9 @@ mod tests {
             assert!(verify_password("correct horse", &hash));
             let cost = started.elapsed();
 
-            // Hold every permit individually so exactly one can be handed back
-            // later.
-            let mut permits = Vec::new();
-            for _ in 0..MAX_CONCURRENT_KDF_OPERATIONS {
-                permits.push(
-                    kdf_semaphore()
-                        .acquire()
-                        .await
-                        .expect("the gate is never closed"),
-                );
-            }
+            // Hold every permit — exclusively, and individually, so exactly one
+            // can be handed back later.
+            let mut claim = claim_the_whole_gate().await;
 
             // Occupy the one and only blocking thread.
             let (release, parked) = std::sync::mpsc::channel::<()>();
@@ -1537,7 +1642,7 @@ mod tests {
             // queued verification is the next to be served, and from here the
             // only thing that can still be holding it up is the saturated
             // blocking pool.
-            drop(permits.pop());
+            claim.release_one();
             assert!(
                 tokio::time::timeout(cost * 3, &mut pending).await.is_err(),
                 "the verification finished within {:?} of a permit being free, while \
@@ -1546,7 +1651,7 @@ mod tests {
                 cost * 3
             );
 
-            drop(permits);
+            claim.release_all();
             drop(release);
             assert!(tokio::time::timeout(Duration::from_secs(60), pending)
                 .await
@@ -1554,6 +1659,61 @@ mod tests {
                 .unwrap());
             hog.await.unwrap();
         });
+    }
+
+    /// Regression: at most one task may hold every permit of the gate.
+    ///
+    /// This is the invariant that keeps `the_kdf_gate_bounds_concurrency` and
+    /// `the_kdf_runs_on_the_blocking_pool_not_the_runtime_thread` from wedging
+    /// the whole suite (see [`WHOLE_GATE_CLAIM`] for the mechanism). Two
+    /// threads are released together by a barrier, each claims the whole gate,
+    /// and each records how long it held it. If the claim stops being
+    /// exclusive the two windows overlap, and the assertion below fails
+    /// immediately — it does not wait for the deadlock, which by construction
+    /// would never end.
+    #[test]
+    fn two_whole_gate_claims_never_overlap() {
+        use std::sync::{Arc, Barrier};
+
+        let start = Arc::new(Barrier::new(2));
+        let held: Arc<Mutex<Vec<(Instant, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                let held = Arc::clone(&held);
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async move {
+                        start.wait();
+                        let _claim = claim_the_whole_gate().await;
+                        let entered = Instant::now();
+                        // Long enough that two claimants which are not
+                        // serialised must overlap.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        held.lock().unwrap().push((entered, Instant::now()));
+                    });
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let held = held.lock().unwrap();
+        assert_eq!(held.len(), 2, "both claims must have run to completion");
+        let (first, second) = (held[0], held[1]);
+        assert!(
+            first.1 <= second.0 || second.1 <= first.0,
+            "two tasks held every permit of the process-wide KDF gate at the same time \
+             ({first:?} and {second:?}). tokio's semaphore fills a whole-gate waiter one \
+             permit at a time, so with a hash in flight these two would each hold part of \
+             the gate and wait for the part the other holds — forever, and silently"
+        );
     }
 
     /// Peak resident set size in KiB, from `/proc/self/status` (Linux only).
