@@ -802,6 +802,22 @@ mod tests {
     /// Host-independent on purpose: the `"none"` half never touches `bwrap` at
     /// all, and the default half asserts only that it is **not** `Unconfined`,
     /// which holds whether or not bubblewrap is installed on the test host.
+    ///
+    /// **The unknown-value half was missing, and a mutation proved it.** Changing
+    /// [`Isolation::resolve`]'s `shell.is_unconfined()` to `shell.sandbox !=
+    /// "bwrap"` — which reads a typo as the operator's consent to run unconfined,
+    /// the exact failure mode `an_unknown_sandbox_mode_is_not_consent_to_run_unconfined`
+    /// names in its own doc comment — left this test **and every other test in
+    /// the suite** green, because that one pins the *predicate*
+    /// `is_unconfined()` and this one only ever tried `"none"` and `"bwrap"`.
+    /// Neither exercised the function production actually calls with a value
+    /// that is neither.
+    ///
+    /// `ShellSandboxConfig::validate()` refuses such a value at load, so the
+    /// path is unreachable today. That is the reason to pin it rather than a
+    /// reason not to: two independent guards where only one is tested is one
+    /// guard, and the load-time one is a config-file check that anything
+    /// constructing a `ShellSandboxConfig` in code walks straight past.
     #[tokio::test]
     async fn only_the_literal_none_resolves_to_the_unconfined_mode() {
         let none = ShellSandboxConfig {
@@ -820,6 +836,19 @@ mod tests {
             ),
             "the shipped default must never resolve to the unconfined mode"
         );
+
+        // Neither is anything else. `validate()` refuses these at load, so this
+        // is defence in depth rather than a reachable path — see the doc comment.
+        for m in ["chroot", "None", "NONE", "bwrap2", "", "none "] {
+            let c = ShellSandboxConfig { sandbox: m.into() };
+            assert!(
+                !matches!(
+                    Isolation::resolve(&c, &Grants::default()).await,
+                    Isolation::Unconfined
+                ),
+                "{m:?} must not resolve to the unconfined mode"
+            );
+        }
     }
 
     /// The `"none"` mode must not merely skip the *refusal* — it must not spawn
