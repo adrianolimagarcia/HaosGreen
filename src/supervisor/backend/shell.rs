@@ -51,10 +51,24 @@ impl ShellBackend {
 
 // Containment used to live here, as `validate()`: a substring check for `cd /`,
 // `cd ..` and `../`. It is **deleted**, not weakened — it was never containment
-// (command substitution, `pushd` and any number of other forms walk past it)
-// and the boundary is now the sandbox itself, built in
-// `supervisor::backend::sandbox`: a hardened argv whose only writable host path
-// is the job's own directory, bound by descriptor.
+// (command substitution, `pushd` and any number of other forms walk past it).
+//
+// What replaced it is `supervisor::backend::sandbox`, and it is not one thing:
+//
+// - under `Isolation::Sandboxed`, the boundary is the bubblewrap argv built in
+//   `supervisor::backend::sandbox` — a hardened argv whose only writable host
+//   path is the job's own directory, bound by descriptor;
+// - under `Isolation::Unconfined` there is **no boundary at all**. The operator
+//   chose that with `[supervisor.shell].sandbox = "none"` (spec §4), and this
+//   backend runs `sh -c` in the job directory exactly as it did before the
+//   sandbox existed. Nothing in this file contains such a job;
+// - under `Isolation::Unavailable` nothing runs at all.
+//
+// And even under `Sandboxed`, "the only writable host path is the job's own
+// directory" is true only while no write grant is held: each grant adds a
+// read-write `--bind` of a host path the operator named by hand (spec §3). The
+// sentence is scoped that way here because a claim that is false in two of three
+// modes is worse than no claim.
 
 #[async_trait::async_trait]
 impl Backend for ShellBackend {
@@ -158,12 +172,21 @@ impl Backend for ShellBackend {
                 // holding it across the `spawn` below would make this future
                 // non-`Send`.
                 let held = self.grants.read().unwrap().clone();
-                // `built` owns the descriptor the argv names, so the duplicate
-                // is open when the child is spawned and closed when this arm
-                // ends — after the spawn, never before it.
+                // `built` owns the descriptor the argv names, so it is open when
+                // the child is spawned and closed when this arm ends — after the
+                // spawn, never before it.
+                //
+                // `built.command` is the **only** place `FD_CLOEXEC` is cleared,
+                // and it does so in the child, between `fork` and `exec`. Doing
+                // it here instead would publish a handle into this job's
+                // directory to every child this process spawns from any thread
+                // while `built` is alive — the probe's `bwrap` invocations,
+                // every other job's sandbox — and a second job's shell could
+                // then read and write the first job's directory through
+                // `/proc/self/fd`, past every mount in its own argv.
                 let built = sandbox::build_argv(&job_dir, &held, &cmd)?;
-                Command::new("bwrap")
-                    .args(built.argv())
+                let mut sandboxed: Command = built.command("bwrap").into();
+                sandboxed
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -217,6 +240,50 @@ mod tests {
     use super::*;
     use crate::config::ShellSandboxConfig;
     use crate::supervisor::backend::sandbox::{Grants, Isolation, IsolationUnavailable};
+
+    /// The fail-closed default, from the outside: a `ShellBackend` built without
+    /// an explicit decision must refuse to run — and must not name a cause it
+    /// never established.
+    ///
+    /// This is the fourth direction `M14` is pinned from. The other three are in
+    /// `sandbox`: the variant the default carries, the `needs_approval` predicate
+    /// for every cause, and the message. A default that quietly became
+    /// `Sandboxed` would run a job through a boundary that was never proven; one
+    /// that became `Unconfined` would run it with no boundary at all. Both die
+    /// here, on the `spawned` marker as well as on the status.
+    #[tokio::test]
+    async fn a_backend_without_a_decision_refuses_to_spawn_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("spawned");
+        // `ShellBackend::new` and nothing else — no `with_isolation`.
+        let b = ShellBackend::new(dir.path().into());
+        let mut job = crate::supervisor::job::Job::new(
+            "t",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            "shell",
+        );
+        job.prompt = Some(format!("touch '{}'", spawned.display()));
+
+        let out = b.run(&mut job, &RunContext::new()).await.unwrap();
+        assert!(
+            matches!(out.status, crate::supervisor::job::JobStatus::Failed),
+            "a backend with no decision must refuse, got {:?}",
+            out.status
+        );
+        assert!(
+            !spawned.exists(),
+            "the refusal must happen before any spawn: {} exists",
+            spawned.display()
+        );
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("no isolation decision")),
+            "the refusal must name the real cause rather than a guessed one, got {:?}",
+            out.errors
+        );
+    }
 
     /// The boundary is absent, so nothing may be spawned — and the refusal has
     /// to name the cause, the standing way out, and the grant vocabulary. A
@@ -335,6 +402,14 @@ mod tests {
     /// and a substring check is not containment. The property it stood for is
     /// kept: a command that heuristic refused is no longer refused, and it is
     /// passed through **verbatim**, which the shell proves by running it.
+    ///
+    /// What it does **not** show, and must not be read as showing: the two
+    /// launches are not distinguished by it. `pwd -P` after `cd ..` is
+    /// `<job-dir>/..` under `Unconfined` and under the sandbox alike, because
+    /// the argv's `--chdir` puts the sandbox in the same directory — so this
+    /// test passes identically whichever arm ran, and it is deliberately built
+    /// on `Unconfined` where `sh -c` is the documented behaviour. The mode
+    /// distinction lives in `the_sandboxed_launch_is_a_real_sandbox`.
     #[tokio::test]
     async fn a_command_the_old_heuristic_refused_reaches_the_shell_verbatim() {
         let dir = tempfile::tempdir().unwrap();
@@ -370,6 +445,200 @@ mod tests {
         );
     }
 
+    /// C1, end to end and with a real bubblewrap: job B's sandbox must not be
+    /// able to read or write job A's directory.
+    ///
+    /// This is the experiment the review ran, as a test. Job A's argv is built
+    /// and **held alive** — which is what `run_in_sandbox` does across its
+    /// `await` — and then job B runs in a *different* job directory. With
+    /// `FD_CLOEXEC` cleared in the parent, B's `bwrap` inherits A's descriptor
+    /// and B's command reaches A's directory through `/proc/self/fd`, past every
+    /// mount in its own argv.
+    ///
+    /// The failure is asserted on the **host filesystem**, not only on the
+    /// transcript: `WRITTEN-BY-B` appearing inside job A's directory is the
+    /// breach, and it is the assertion that cannot be satisfied by a command
+    /// that merely printed something odd.
+    #[tokio::test]
+    async fn a_second_job_cannot_read_or_write_the_first_jobs_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let job_a = sandbox::resolve_job_dir(root.path(), "task-a", "job-a").unwrap();
+        let job_b = sandbox::resolve_job_dir(root.path(), "task-b", "job-b").unwrap();
+        assert_ne!(
+            job_a.path(),
+            job_b.path(),
+            "the two jobs must be different directories, or the test proves nothing"
+        );
+        std::fs::write(job_a.path().join("SECRET-A"), "A").unwrap();
+
+        // Gate: the property below is bubblewrap's behaviour, so it needs a
+        // bubblewrap that really works. The host is asked **independently of the
+        // code under test** — a hand-written argv, straight at `bwrap` — so a
+        // resolver that refused on a host that can sandbox fails here instead of
+        // skipping, which is what makes this a check on `M16` rather than a test
+        // that passes under it. The skip branch is not a silent pass either: it
+        // asserts the fail-closed outcome the resolver owes.
+        //
+        // `host_path` is held for the whole test, because everything below that
+        // spawns `bwrap` — this gate, `Isolation::resolve` and `b.run` — lets it
+        // resolve through `PATH`. Without it a stub test on another libtest
+        // thread answers for this host, and the gate reports a host that cannot
+        // sandbox on a machine that can: the test would then take the skip
+        // branch and prove nothing. `RealPath` is required by
+        // `bwrap_can_sandbox_here` precisely so that omission is a compile error.
+        let host_path = sandbox::tests::real_path();
+        let host_can = sandbox::tests::bwrap_can_sandbox_here(&host_path).await;
+        let isolation =
+            Isolation::resolve(&ShellSandboxConfig::default(), &Grants::default()).await;
+        if !host_can {
+            sandbox::tests::no_real_bwrap(
+                "a_second_job_cannot_read_or_write_the_first_jobs_directory",
+            );
+            assert!(
+                matches!(isolation, Isolation::Unavailable(_)),
+                "with no boundary proven the only other outcome is a refusal, got {isolation:?}"
+            );
+            return;
+        }
+        assert_eq!(
+            isolation,
+            Isolation::Sandboxed,
+            "this host builds a sandbox, so `resolve` refusing ({isolation:?}) is a bug in \
+             the resolver and not a property of the host"
+        );
+
+        // Job A's argv, alive for the whole of job B's run.
+        let held_a = sandbox::build_argv(&job_a, &Grants::default(), "true").unwrap();
+
+        let b = ShellBackend::new(root.path().into()).with_isolation(Isolation::Sandboxed);
+        let mut job = crate::supervisor::job::Job::new(
+            "task-b",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            "shell",
+        );
+        job.id = "job-b".into();
+        job.prompt = Some(sandbox::tests::JOB_DIR_SCAN.into());
+        let out = crate::supervisor::bounded(
+            "the second sandboxed job",
+            b.run(&mut job, &RunContext::new()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(out.status, crate::supervisor::job::JobStatus::Succeeded),
+            "job B must run, or this test proves nothing: {:?}",
+            out.errors
+        );
+        assert!(
+            !out.summary.contains("leaked="),
+            "job B reached job A's directory through an inherited descriptor:\n{}",
+            out.summary
+        );
+        assert_eq!(
+            std::fs::read_to_string(job_a.path().join("SECRET-A")).unwrap(),
+            "A",
+            "job A's file was rewritten through a leaked descriptor"
+        );
+        assert!(
+            !job_a.path().join("WRITTEN-BY-B").exists(),
+            "job B's sandbox wrote into job A's directory: {} exists",
+            job_a.path().join("WRITTEN-BY-B").display()
+        );
+        drop(held_a);
+    }
+
+    /// The sandboxed launch is a **real** sandbox, asserted against the host.
+    ///
+    /// Every assertion here is false under a launch that runs `sh -c` instead of
+    /// `bwrap` — which is the mutant (`M15`) that this test exists to kill, and
+    /// which the whole suite passed before it existed. `/etc/shadow` is the
+    /// read that proves the mount set; `hostname` is the UTS namespace; `$HOME`
+    /// and the write are the job's own directory.
+    #[tokio::test]
+    async fn the_sandboxed_launch_is_a_real_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        // Held for the whole test — see the C1 test above: this gate,
+        // `Isolation::resolve` and `b.run` all let `bwrap` resolve through
+        // `PATH`, and a stub test on another libtest thread would otherwise
+        // answer for this host and turn a real machine into a skip.
+        let host_path = sandbox::tests::real_path();
+        let host_can = sandbox::tests::bwrap_can_sandbox_here(&host_path).await;
+        let isolation =
+            Isolation::resolve(&ShellSandboxConfig::default(), &Grants::default()).await;
+        if !host_can {
+            sandbox::tests::no_real_bwrap("the_sandboxed_launch_is_a_real_sandbox");
+            assert!(
+                matches!(isolation, Isolation::Unavailable(_)),
+                "with no boundary proven the only other outcome is a refusal, got {isolation:?}"
+            );
+            return;
+        }
+        assert_eq!(
+            isolation,
+            Isolation::Sandboxed,
+            "this host builds a sandbox, so `resolve` refusing ({isolation:?}) is a bug in \
+             the resolver and not a property of the host"
+        );
+        let b = ShellBackend::new(root.path().into()).with_isolation(isolation);
+        let mut job = crate::supervisor::job::Job::new(
+            "task-1",
+            crate::supervisor::job::JobType::ShellJob,
+            "shell",
+            "shell",
+        );
+        job.id = "job-1".into();
+        // One command, five properties, each tagged so a failure names itself.
+        job.prompt = Some(
+            "if [ -e /etc/shadow ]; then echo shadow=present; else echo shadow=absent; fi; \
+             if [ -r /etc/passwd ]; then echo passwd=readable; else echo passwd=unreadable; fi; \
+             echo hostname=$(hostname); \
+             echo home=$HOME; \
+             touch wrote-in-the-sandbox && echo write=ok || echo write=failed"
+                .into(),
+        );
+        let out =
+            crate::supervisor::bounded("the sandboxed launch", b.run(&mut job, &RunContext::new()))
+                .await
+                .unwrap();
+        let job_dir = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join(&job.task_id)
+            .join(&job.id);
+
+        assert!(
+            matches!(out.status, crate::supervisor::job::JobStatus::Succeeded),
+            "the sandboxed launch must run the command, got {:?}",
+            out.errors
+        );
+        assert!(
+            out.summary.contains("shadow=absent"),
+            "the command was not sandboxed — /etc/shadow is visible: {}",
+            out.summary
+        );
+        assert!(
+            out.summary.contains("hostname=haos-sandbox"),
+            "the command did not run under the argv's UTS namespace, so it did not run \
+             under bubblewrap: {}",
+            out.summary
+        );
+        assert!(
+            out.summary.contains(&format!("home={}", job_dir.display())),
+            "HOME must be the job directory, which only the argv sets: {}",
+            out.summary
+        );
+        assert!(
+            out.summary.contains("write=ok"),
+            "the job directory must be writable inside the sandbox: {}",
+            out.summary
+        );
+        assert!(
+            job_dir.join("wrote-in-the-sandbox").exists(),
+            "the write must land in the job's own directory on the host"
+        );
+    }
+
     /// The output plumbing: status, stdout into `summary`, exit code into
     /// evidence.
     ///
@@ -377,8 +646,14 @@ mod tests {
     /// command: `ShellBackend::new` fails closed to `Unavailable`, so a backend
     /// built without an explicit decision refuses everything, and these tests
     /// are about the launch and capture path rather than about the boundary.
-    /// The boundary has its own tests, and the sandboxed launch is covered by
-    /// `sandbox`'s argv tests plus the real-bwrap suite.
+    ///
+    /// The boundary has its own tests. The **sandboxed** launch used to be
+    /// claimed to be covered by `sandbox`'s argv tests plus "the real-bwrap
+    /// suite" — that was wrong twice over: the argv tests stop at the argv and
+    /// never reach a spawn, so they cannot see which arm ran, and no real-bwrap
+    /// suite existed in this commit (Task 9 owns it). It is covered here now, by
+    /// `the_sandboxed_launch_is_a_real_sandbox` and
+    /// `a_second_job_cannot_read_or_write_the_first_jobs_directory`.
     #[tokio::test]
     async fn shell_backend_runs_a_command_and_reports_its_output() {
         let dir = tempfile::tempdir().unwrap();

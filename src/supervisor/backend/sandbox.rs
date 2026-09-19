@@ -234,7 +234,14 @@ fn describe_status(status: std::process::ExitStatus) -> String {
 /// operator sees *why* rather than "unavailable".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IsolationUnavailable {
-    /// `bwrap` is not on `PATH`.
+    /// **No decision was made.** Nothing was probed, so nothing is known about
+    /// this host. This is [`Isolation`]'s `Default`, and it is deliberately not
+    /// [`Self::NotInstalled`]: a backend that was merely never handed a decision
+    /// has not established that bubblewrap is missing, and telling the operator
+    /// to install a package they probably already have is a wrong cause with a
+    /// plausible-sounding message — the worst kind.
+    NotDecided,
+    /// `bwrap` is not on `PATH`. Established by actually looking.
     NotInstalled,
     /// `bwrap --version` failed, or its output could not be parsed.
     VersionUnreadable(String),
@@ -247,6 +254,11 @@ pub enum IsolationUnavailable {
 impl std::fmt::Display for IsolationUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotDecided => write!(
+                f,
+                "no isolation decision was made for this backend, so nothing is known \
+                 about bubblewrap on this host"
+            ),
             Self::NotInstalled => write!(f, "bubblewrap is not installed"),
             Self::VersionUnreadable(e) => write!(f, "cannot read the bubblewrap version: {e}"),
             Self::VersionTooOld((major, minor, patch)) => write!(
@@ -287,10 +299,14 @@ pub enum Isolation {
 }
 
 impl Default for Isolation {
-    /// Fail closed. A backend built without an explicit decision must not spawn
-    /// anything.
+    /// Fail closed, and **say which failure**. A backend built without an
+    /// explicit decision must not spawn anything — but it must not claim
+    /// `bubblewrap is not installed` either, which is a cause it never
+    /// established and which would send the operator to install a package that
+    /// is very likely already there. `NotDecided` is the honest variant: the
+    /// probe never ran, so nothing is known about this host.
     fn default() -> Self {
-        Isolation::Unavailable(IsolationUnavailable::NotInstalled)
+        Isolation::Unavailable(IsolationUnavailable::NotDecided)
     }
 }
 
@@ -302,11 +318,16 @@ impl Isolation {
     /// the consenting one. `ShellSandboxConfig::validate` has already refused
     /// such a value at load; this is the second, independent guarantee.
     ///
-    /// The consenting branch is taken **before** the probe, and that order is
-    /// load-bearing rather than an optimisation: the mode exists for a host
-    /// with no usable bubblewrap, so probing first would spawn `bwrap` on
-    /// exactly the host the mode is for and report a failure the operator has
-    /// already consented to.
+    /// The consenting branch is taken **before** the probe. The value returned is
+    /// identical either way — this is not load-bearing for the decision, and an
+    /// earlier version of this comment overstated it as such. What the order
+    /// buys is real but narrower: on a host whose `bwrap` is missing, wedged or
+    /// simply slow, probing first would spawn it for nothing — up to
+    /// [`PROBE_TIMEOUT`] on the version check plus
+    /// [`PROBE_STEP_TIMEOUT_SECS`] per probe step, at startup, in a mode the
+    /// operator has already decided needs no sandbox at all. Pinned by
+    /// `the_consenting_mode_is_decided_without_spawning_bubblewrap`, which
+    /// fails if the probe is reached.
     pub async fn resolve(shell: &crate::config::ShellSandboxConfig, grants: &Grants) -> Self {
         if shell.is_unconfined() {
             return Isolation::Unconfined;
@@ -353,6 +374,26 @@ impl Isolation {
 /// rather than at the first spawn. Both failures are
 /// [`IsolationUnavailable`], which is the same *kind* of outcome as "not
 /// installed" — there is no "present but insecure, carry on" state.
+///
+/// **Residual — the floor is checked once, against a different resolution than
+/// the spawn uses.** Both halves of this run `bwrap` from `PATH`, and every job
+/// re-resolves `bwrap` from `PATH` again at spawn (`shell.rs`). `PATH` is
+/// process state, so a `bwrap` swapped or downgraded between startup and a job
+/// is not re-checked: the job would then run a binary that never passed the
+/// floor. It is a residual rather than a hole because the swap needs write
+/// access to a directory on the supervisor's own `PATH`, which is already game
+/// over for a process that is about to run `bwrap`; re-checking per job would
+/// add a version spawn to every job to defend against an attacker who could
+/// equally replace the binary the check would call.
+///
+/// **Forward note (Task 8).** `grants` here is the **startup snapshot**
+/// `main.rs` takes immediately above the call, and that snapshot is empty. So
+/// the `--share-net` branch of [`build_argv`] and the "grant held" arm of
+/// [`verdict_loopback`] are unreachable in production today: a later
+/// `/allow-net` reaches the argv (which reads the live grant set per job) but is
+/// never probe-verified. Task 8 owns the grant commands and must decide whether
+/// a new grant is probed before it is honoured, or whether the argv is trusted
+/// on the strength of the startup probe alone.
 async fn prove_boundary(grants: &Grants) -> Result<(), IsolationUnavailable> {
     check_bwrap_version()?;
     probe(grants).await
@@ -533,6 +574,14 @@ fn push_ro_bind_if_present(a: &mut Vec<String>, root: &Path, path: &str) {
 /// `Debug` is derived because `unwrap_err()` on a `Result<JobDir, _>` needs it
 /// — and because the path and the descriptor number are exactly what a reader
 /// of a failing test wants to see.
+///
+/// The descriptor is `O_PATH`, held for the **whole job** — it is alive across
+/// `wait_with_output` in `shell.rs`, which is the entire duration of a shell
+/// job. It is close-on-exec, so it leaks into no child, but an open descriptor
+/// still pins the inode: a `<root>/<task-id>/<job-id>` renamed or deleted while
+/// the job runs keeps its directory alive until the job ends. That is accepted
+/// rather than overlooked — the pin is what makes `--bind-fd` name the inode
+/// that was checked, which is the entire reason the descriptor exists.
 #[derive(Debug)]
 pub struct JobDir {
     path: PathBuf,
@@ -544,26 +593,25 @@ impl JobDir {
         &self.path
     }
 
-    /// A duplicate of the descriptor with `FD_CLOEXEC` **cleared**, so the child
-    /// inherits exactly this one. `try_clone` dups with `F_DUPFD_CLOEXEC`, so the
-    /// duplicate is close-on-exec until this clears it; the original keeps the
-    /// flag and is closed when `JobDir` drops. Bind the result to a name that
-    /// outlives the `spawn` call — a dropped descriptor is a closed one.
+    /// A duplicate of the descriptor, still **close-on-exec**.
     ///
-    /// Clearing the flag on the duplicate and never on the original is the whole
-    /// of this method. Cleared on the original, the descriptor would be inherited
-    /// by **every** later `exec` in this process, including the probe's own
-    /// `bwrap` invocations and every other job's child.
-    pub fn inheritable_fd(&self) -> anyhow::Result<OwnedFd> {
-        let dup = self.fd.try_clone()?;
-        // SAFETY: `dup` is an open descriptor owned by `dup` for the call.
-        if unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
-            anyhow::bail!(
-                "cannot make the job directory inheritable: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(dup)
+    /// `try_clone` dups with `F_DUPFD_CLOEXEC`, and the flag is deliberately left
+    /// exactly as it is. Clearing it here would clear it in the **parent's**
+    /// descriptor table, and `FD_CLOEXEC` is a property of the descriptor, not of
+    /// the `exec` that is about to happen: from that moment the descriptor is
+    /// inherited by every child this process spawns, from any thread, for as long
+    /// as this duplicate is open. That is not a theoretical window — the probe
+    /// holds its `SandboxArgv` across an `await` of up to
+    /// [`PROBE_STEP_TIMEOUT_SECS`] per step, and the supervisor shares the
+    /// process with the web and Telegram chat paths and the MCP stdio servers.
+    ///
+    /// The flag is cleared **in the child** instead, between `fork` and `exec`,
+    /// by [`SandboxArgv::command`] — the only sanctioned way to spawn this
+    /// descriptor. `fcntl` is async-signal-safe, so the child is the one place
+    /// the clear is safe as well as sufficient, and no other thread can observe
+    /// it.
+    pub fn duplicate_fd(&self) -> anyhow::Result<OwnedFd> {
+        Ok(self.fd.try_clone()?)
     }
 }
 
@@ -578,14 +626,56 @@ impl JobDir {
 #[derive(Debug)]
 pub struct SandboxArgv {
     argv: Vec<String>,
-    /// Held for its `Drop`, never read: the descriptor must still be open when
-    /// the child is spawned, and this value outlives that spawn.
-    _job_fd: OwnedFd,
+    /// The duplicate `--bind-fd` names. It must still be open when the child is
+    /// spawned, so this value has to outlive the `spawn` — see
+    /// [`Self::command`], which is the only way to build the command that reads
+    /// it.
+    job_fd: OwnedFd,
 }
 
 impl SandboxArgv {
     pub fn argv(&self) -> &[String] {
         &self.argv
+    }
+
+    /// A `std::process::Command` that runs `program` with this argv, with the
+    /// job descriptor made inheritable **in the child**.
+    ///
+    /// This is the whole of C1's fix, and the only place `FD_CLOEXEC` is cleared.
+    /// Doing it here rather than in the parent is what keeps the descriptor
+    /// private: the flag lives in the descriptor table of the process that
+    /// clears it, so a parent-side clear publishes a handle into the sandbox
+    /// root to every child of this process — including other jobs' `bwrap`, which
+    /// then hands it straight to their sandboxed shell through `/proc/self/fd`.
+    ///
+    /// The caller must keep `self` alive until it has spawned: a dropped
+    /// `SandboxArgv` closes the descriptor, and the `fcntl` below then fails in
+    /// the child with `EBADF` — which surfaces as a spawn error, never as an
+    /// unsandboxed run.
+    pub fn command(&self, program: impl AsRef<OsStr>) -> std::process::Command {
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&self.argv);
+        let fd = self.job_fd.as_raw_fd();
+        // SAFETY: `pre_exec` runs between `fork` and `exec`, in the child. The
+        // closure does exactly one thing — the single `fcntl` below — because
+        // that region is not a place where anything else is safe: no allocation
+        // (`Error::last_os_error` is an errno wrapper, not an allocation), no
+        // lock (this process holds locks on other threads that do not exist in
+        // the child), no other syscall that could observe a half-forked state.
+        // `fcntl` is on POSIX's async-signal-safe list, which is the standard
+        // the closure has to meet. `fd` is a plain `i32` copied in, so the
+        // closure owns nothing that could be freed after the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd
     }
 }
 
@@ -609,9 +699,11 @@ impl SandboxArgv {
 /// refused when it covers the root (Task 8 Step 3b).
 pub fn build_argv(job_dir: &JobDir, grants: &Grants, command: &str) -> anyhow::Result<SandboxArgv> {
     let dir = job_dir.path().to_string_lossy().to_string();
-    // The duplicate the child inherits. Taken here, moved into the returned
-    // value, and therefore open for as long as the argv it belongs to.
-    let job_fd = job_dir.inheritable_fd()?;
+    // The duplicate `--bind-fd` names. Taken here, moved into the returned
+    // value, and therefore open for as long as the argv it belongs to. It stays
+    // close-on-exec: `SandboxArgv::command` is what clears the flag, in the
+    // child.
+    let job_fd = job_dir.duplicate_fd()?;
     let mut a: Vec<String> = vec![
         "--unshare-all".into(),
         // Explicit: --unshare-all only does --unshare-user-try, which is
@@ -715,10 +807,7 @@ pub fn build_argv(job_dir: &JobDir, grants: &Grants, command: &str) -> anyhow::R
         "-c".into(),
         command.to_string(),
     ]);
-    Ok(SandboxArgv {
-        argv: a,
-        _job_fd: job_fd,
-    })
+    Ok(SandboxArgv { argv: a, job_fd })
 }
 
 /// Bound on one probe invocation, in seconds.
@@ -1171,10 +1260,13 @@ async fn run_in_sandbox(
 ) -> Result<std::process::Output, IsolationUnavailable> {
     // `built` owns the descriptor the argv names, and it is alive here past the
     // `spawn` below — which is the whole reason it is one value rather than a
-    // list of strings.
+    // list of strings. It is also what keeps the descriptor **close-on-exec in
+    // this process**: the flag is cleared in the child by `built.command`, so
+    // this argv being alive across the `await` at the end of this function does
+    // not publish the sandbox root to every other child of this process.
     let built = build_argv(job_dir, grants, command).map_err(|e| smoke(step, e))?;
-    let mut cmd = tokio::process::Command::new(bwrap);
-    cmd.args(built.argv())
+    let mut cmd: tokio::process::Command = built.command(bwrap).into();
+    cmd
         // The probe's own cwd: `--chdir` is what puts the sandbox in the job
         // directory, and inheriting this one is exactly the silent pass the
         // cwd check exists to catch.
@@ -1582,9 +1674,86 @@ pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Say, in the test output, that a test needing a **real** bubblewrap did
+    /// not get one — and why.
+    ///
+    /// The property such a test asserts is what bubblewrap does, so it cannot be
+    /// faked on a host without it. Every caller must still assert something in
+    /// this branch (the fail-closed outcome the resolver owes), because a
+    /// silent `return` is exactly the "passes for the wrong reason" shape this
+    /// suite forbids. This exists so the skip is at least visible in
+    /// `--nocapture` output rather than indistinguishable from a real pass.
+    pub(crate) fn no_real_bwrap(test: &str) {
+        eprintln!(
+            "NOT RUN {test}: no bubblewrap on this host passes the smoke probe, so the \
+             sandbox this test builds could not be built here. It runs on any host with \
+             bubblewrap >= {}.{}.{} (and is not skipped there).",
+            MIN_BWRAP.0, MIN_BWRAP.1, MIN_BWRAP.2
+        );
+    }
+
+    /// Can **this host** build a bubblewrap sandbox?
+    ///
+    /// Deliberately asked without going through anything this crate decides: a
+    /// hand-written argv, using the same flags the production argv requires,
+    /// spawned straight at `bwrap`. That independence is the whole point of the
+    /// function. A gate that asked [`Isolation::resolve`] would be taking its
+    /// answer from the code under test, and a resolver whose probe always failed
+    /// would then look exactly like a host without bubblewrap — which is how
+    /// mutant `M16` survived the first version of these tests.
+    ///
+    /// The flags are the ones a host must support for the production argv to
+    /// work at all (`--unshare-user` and the `--disable-userns` pair, which need
+    /// kernel support for user namespaces and for writing
+    /// `user.max_user_namespaces`). A host that cannot do this legitimately
+    /// cannot sandbox, and the callers skip.
+    ///
+    /// **The [`RealPath`] is a parameter, not a convention.** This function
+    /// spawns `bwrap` through `PATH`, so a [`PathOnly`] stub alive on another
+    /// libtest thread answers for the host: the gate would report that this host
+    /// cannot sandbox while the host can, and the caller would take the skip
+    /// branch and pass without asserting anything. Requiring the guard makes
+    /// that mistake a compile error.
+    pub(crate) async fn bwrap_can_sandbox_here(_held: &RealPath) -> bool {
+        let out = tokio::process::Command::new("bwrap")
+            .args([
+                "--unshare-all",
+                "--unshare-user",
+                "--disable-userns",
+                "--assert-userns-disabled",
+                "--new-session",
+                "--die-with-parent",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "/bin/sh",
+                "-c",
+                "exit 0",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        matches!(out, Ok(status) if status.success())
+    }
 
     /// A fake `bwrap` in a fresh temporary directory that reports a version we
     /// choose. This is what makes the version floor testable without a
@@ -1608,31 +1777,76 @@ mod tests {
         (dir, path)
     }
 
-    /// Serializes the tests that install a stub `bwrap` on `PATH`.
+    /// Serializes every test that lets `bwrap` resolve through `PATH`.
     ///
     /// `PATH` is process-global and libtest runs these tests on many threads, so
     /// without this one test's stub could answer another test's `bwrap` lookup.
-    /// Only [`PathOnly`] takes it, and the rule it enforces is worth stating:
-    /// **no test may assert a *successful* probe through `PATH`**. Every other
-    /// test in this module either names its binary explicitly
-    /// (`check_bwrap_version_at`, `probe_at`) or asserts only that the mode is
-    /// not `Unconfined`, which holds whichever binary answers.
+    /// Two kinds of test take it, and the rule they are under is worth stating:
+    /// **a test may not assert a *successful* `bwrap` lookup through `PATH`
+    /// without holding [`RealPath`]** — either it installs a stub, and then the
+    /// answer is the stub's by design, or it needs the host's own binary, and
+    /// then it must hold the lock for as long as it spawns. A test that asserts
+    /// only that the mode is **not** `Unconfined` is under neither rule: that
+    /// holds whichever binary answers, so it may read `PATH` freely.
     static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// `PATH` with one directory **prepended**, with [`PATH_LOCK`] held, restored
+    /// The host's own `PATH`, exclusively — the other half of [`PATH_LOCK`].
+    ///
+    /// Hold one for as long as the test spawns `bwrap` through `PATH`, or asks
+    /// [`bwrap_can_sandbox_here`], which does. While it is held no [`PathOnly`]
+    /// can be alive, so the lookup cannot land on a stub.
+    ///
+    /// **This guard exists because the convention it replaces was violated.**
+    /// The three tests that need the host's bubblewrap asked
+    /// `bwrap_can_sandbox_here` and `Isolation::resolve` without the lock. On a
+    /// host with bubblewrap 0.12.0 installed, `cargo test --lib
+    /// supervisor::backend` then failed — order-dependently, and only under that
+    /// filter — with:
+    ///
+    /// ```text
+    /// this host builds a sandbox, so `resolve` refusing
+    /// (Unavailable(VersionTooOld((0, 11, 9)))) is a bug in the resolver
+    /// ```
+    ///
+    /// `0.11.9` is another test's stub and 0.12.0 is what is installed, so the
+    /// message asserted a bug in `resolve` that did not exist, about a host
+    /// state that never existed. The guard is passed to `bwrap_can_sandbox_here`
+    /// as a **parameter** so that omitting it is a compile error rather than an
+    /// intermittent one.
+    pub(crate) struct RealPath {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// Take [`RealPath`]. A poisoned lock means another test panicked while
+    /// holding it; the guard is still what serializes this, so take it back
+    /// rather than cascading the failure.
+    pub(crate) fn real_path() -> RealPath {
+        RealPath {
+            _lock: PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// `PATH` with one directory **prepended**, with [`RealPath`] held, restored
     /// on drop — including when the test panics, or one failing test would leave
     /// every later `bwrap` lookup in this binary pointing at a stub.
+    ///
+    /// **Residual:** the lock only serializes the tests that take it. A thread
+    /// outside it that calls `execvp` while this guard is alive can still resolve
+    /// `bwrap` through the stub — libtest runs these tests on many threads and
+    /// `PATH` is process state, so no lock this module can take closes that. It
+    /// is acceptable because the only tests that spawn `bwrap` through `PATH` are
+    /// the ones in this module and the three in `shell.rs` that hold
+    /// [`RealPath`], and because the alternative — naming the binary explicitly —
+    /// is already what the rest of this module does (`check_bwrap_version_at`,
+    /// `probe_at`).
     struct PathOnly {
         saved: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: RealPath,
     }
 
     impl PathOnly {
         fn new(dir: &Path) -> Self {
-            // A poisoned lock means another test panicked while holding it; the
-            // guard is still what serializes this, so take it back rather than
-            // cascading the failure.
-            let lock = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = real_path();
             let saved = std::env::var_os("PATH");
             // Prepended, **not** substituted, and the difference is measured:
             // every other stub in this module is a shell script that calls the
@@ -1659,6 +1873,49 @@ mod tests {
                 Some(path) => std::env::set_var("PATH", path),
                 None => std::env::remove_var("PATH"),
             }
+        }
+    }
+
+    /// Both guards take the **same** lock — the property that makes [`RealPath`]
+    /// exclude a stub, asserted without a thread and without a sleep.
+    ///
+    /// A thread-based version of this test was written first and **measured to
+    /// have no teeth**: with `PathOnly` moved to a private mutex it still passed,
+    /// because nothing orders the reader's `real_path()` against the moment the
+    /// stub is dropped. `try_lock` on the lock the guard is supposed to hold is
+    /// the version that cannot be satisfied by luck — it is taken while the guard
+    /// under test is alive, so a guard that does not hold it is visible at once,
+    /// and it cannot fail spuriously, because a *concurrent* holder makes
+    /// `try_lock` fail as well.
+    ///
+    /// **Residual, stated rather than hidden:** that same property means the
+    /// assertion is only *specific* while no other test holds the lock. Run alone
+    /// (`cargo test --lib both_path_guards_take_the_same_lock`) it catches either
+    /// half of the mutation. Under a full parallel suite another stub test
+    /// holding the lock could mask it — which is why the enforcement the three
+    /// host-dependent tests actually rely on is the **parameter** on
+    /// `bwrap_can_sandbox_here`, not this test. This pins the guard's definition;
+    /// the compiler pins its use.
+    #[test]
+    fn both_path_guards_take_the_same_lock() {
+        let (_dir, stub) = stub_bwrap_reporting("bubblewrap 0.11.9");
+        {
+            let _stub = PathOnly::new(stub.parent().unwrap());
+            assert!(
+                PATH_LOCK.try_lock().is_err(),
+                "`PathOnly` installed a stub `bwrap` without holding `PATH_LOCK`, so a test \
+                 that needs the host's own binary can read `PATH` while the stub answers for \
+                 it — the order-dependent failure this guard exists to close"
+            );
+        }
+        {
+            let _held = real_path();
+            assert!(
+                PATH_LOCK.try_lock().is_err(),
+                "`real_path` returned without holding `PATH_LOCK`, so it excludes nothing: it \
+                 would hand out the token `bwrap_can_sandbox_here` requires while a stub is \
+                 installed"
+            );
         }
     }
 
@@ -1848,18 +2105,162 @@ mod tests {
         );
     }
 
+    /// I2. The **happy path** of the decision Task 5 exists to make.
+    ///
+    /// Every other test in this module that runs the real probe asserts only
+    /// that the mode is *not* `Unconfined`, which holds whether the probe passed
+    /// or failed. So a `resolve` whose probe always failed after the version
+    /// floor — mutant `M16` — kept the whole suite green, and the feature could
+    /// have been dead on every working host with nothing to show for it. This is
+    /// the one assertion that closes it.
+    ///
+    /// It is the only test here whose *passing* requires a working bubblewrap,
+    /// so it is gated — but the gate is asked of the **host**, not of the code
+    /// under test: `bwrap_can_sandbox_here` runs a hand-written argv straight at
+    /// `bwrap`. So when the host can sandbox and `resolve` still refuses, the
+    /// test **fails** rather than skipping, which is what makes it a check on
+    /// `M16` instead of a check that passes under it.
+    #[tokio::test]
+    async fn resolve_returns_sandboxed_when_the_boundary_is_proven() {
+        // Held for the whole test: both `resolve` below and the gate let `bwrap`
+        // resolve through `PATH`, and a stub test on another libtest thread
+        // would otherwise answer for this host.
+        let held = real_path();
+        // The gate is asked **first** and of the host, so the branch below is a
+        // property of this machine rather than of the code under test. Asking it
+        // second, only when `resolve` had already refused, is what let a stub
+        // turn a real host into an apparent resolver bug.
+        let host_can = bwrap_can_sandbox_here(&held).await;
+        let got = Isolation::resolve(
+            &crate::config::ShellSandboxConfig::default(),
+            &Grants::default(),
+        )
+        .await;
+        if !host_can {
+            no_real_bwrap("resolve_returns_sandboxed_when_the_boundary_is_proven");
+            assert!(
+                matches!(got, Isolation::Unavailable(_)),
+                "with no boundary proven the only other outcome is a refusal, got {got:?}"
+            );
+            return;
+        }
+        assert_eq!(
+            got,
+            Isolation::Sandboxed,
+            "this host builds a sandbox, so `resolve` refusing ({got:?}) is a bug in the \
+             resolver and not a property of the host: the shipped default config on a host \
+             with a working bubblewrap must resolve to the sandboxed mode, and anything \
+             else means shell jobs are refused for no reason"
+        );
+        assert!(
+            !got.needs_approval(),
+            "a proven boundary must not park every shell task for approval"
+        );
+    }
+
+    /// The consenting branch is taken **before** the probe — and this is what
+    /// makes that claim checkable rather than a comment.
+    ///
+    /// The mode returns the same value either way, so nothing about the decision
+    /// distinguishes the order: mutant `M12` (probe first) survives every test
+    /// that only looks at the result. What it costs is a `bwrap` spawn that
+    /// cannot change the answer — and on a host whose `bwrap` is missing, wedged
+    /// or slow, that is a pointless spawn and up to `PROBE_TIMEOUT` plus
+    /// `PROBE_STEP_TIMEOUT_SECS` per step of startup latency in a mode the
+    /// operator has already said needs no sandbox. The stub records that it ran,
+    /// so the spawn is what is asserted, not the value.
+    #[tokio::test]
+    async fn the_consenting_mode_is_decided_without_spawning_bubblewrap() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("bwrap-was-spawned");
+        let (_dir, stub) = stub_bwrap_running(&format!("touch '{}'\nexit 1", marker.display()));
+        let _path = PathOnly::new(stub.parent().unwrap());
+
+        let got = Isolation::resolve(
+            &crate::config::ShellSandboxConfig {
+                sandbox: "none".into(),
+            },
+            &Grants::default(),
+        )
+        .await;
+
+        assert_eq!(
+            got,
+            Isolation::Unconfined,
+            "the literal \"none\" is the operator's standing consent"
+        );
+        assert!(
+            !marker.exists(),
+            "resolving the consenting mode spawned bwrap: {} exists. The mode exists for \
+             a host with no usable bubblewrap, so probing it first is a spawn that cannot \
+             change the answer",
+            marker.display()
+        );
+    }
+
     /// Layer 1's only question, pinned for all three modes. `Unconfined` is the
     /// operator's consent, so nothing is gated (spec §4) — parking their shell
     /// tasks anyway would be the same operator loop the refusal message opens,
     /// one layer up.
+    ///
+    /// `M14` (`Isolation::default()` no longer failing closed) used to die on the
+    /// last assertion alone, and only for the modes it happened to produce. It is
+    /// pinned here from three directions instead: the **variant** the default
+    /// carries, the predicate for **every** `Unavailable` cause rather than one,
+    /// and the message, which must not name a cause the default never
+    /// established. The fourth direction is in `shell`: a `ShellBackend` built
+    /// without a decision must refuse to run.
     #[test]
     fn needs_approval_is_true_only_when_the_boundary_is_absent() {
         assert!(!Isolation::Sandboxed.needs_approval());
         assert!(!Isolation::Unconfined.needs_approval());
-        assert!(Isolation::Unavailable(IsolationUnavailable::NotInstalled).needs_approval());
+        for cause in [
+            IsolationUnavailable::NotDecided,
+            IsolationUnavailable::NotInstalled,
+            IsolationUnavailable::VersionUnreadable("no output".into()),
+            IsolationUnavailable::VersionTooOld((0, 11, 9)),
+            IsolationUnavailable::SmokeTestFailed("the base properties".into()),
+        ] {
+            assert!(
+                Isolation::Unavailable(cause.clone()).needs_approval(),
+                "every unavailable cause must be gated, {cause:?} is not"
+            );
+        }
+        assert_eq!(
+            Isolation::default(),
+            Isolation::Unavailable(IsolationUnavailable::NotDecided),
+            "the default must fail closed, and must not claim a cause it never \
+             established"
+        );
         assert!(
             Isolation::default().needs_approval(),
             "the default fails closed"
+        );
+    }
+
+    /// A backend that was merely never given a decision must not report
+    /// "bubblewrap is not installed".
+    ///
+    /// That is a cause it never established, and it is the worst kind of wrong
+    /// message: plausible enough to be acted on. The operator would go and
+    /// install a package that is very likely already installed, and the real
+    /// fault — a wiring bug that never passed the probe result along — would stay
+    /// invisible. `NotDecided` is the honest variant.
+    #[test]
+    fn the_undecided_default_does_not_claim_bubblewrap_is_missing() {
+        let message = IsolationUnavailable::NotDecided.to_string();
+        assert!(
+            !message.contains("not installed"),
+            "the undecided default must not name a cause it never established: {message}"
+        );
+        assert!(
+            message.contains("no isolation decision"),
+            "it must say what actually happened: {message}"
+        );
+        assert_ne!(
+            IsolationUnavailable::NotDecided,
+            IsolationUnavailable::NotInstalled,
+            "the two causes are different facts and must stay distinguishable"
         );
     }
 
@@ -2203,6 +2604,21 @@ mod tests {
         (dir, jd)
     }
 
+    /// Look for a **usable** handle to a job directory among the inherited
+    /// descriptors, and report what it found.
+    ///
+    /// `[ -d "$f" ]` follows the `/proc/self/fd` magic symlink, and the `-e`
+    /// test then asks whether `SECRET-A` can really be reached *through that
+    /// descriptor* — so a printed `leaked=` is a handle, not a flag value. The
+    /// descriptor is `O_PATH`, which is exactly what `/proc/self/fd/N/SECRET-A`
+    /// resolves through.
+    pub(crate) const JOB_DIR_SCAN: &str = "for f in /proc/self/fd/*; do \
+         if [ -d \"$f\" ] && [ -e \"$f/SECRET-A\" ]; then \
+           echo \"leaked=$f\"; \
+           printf 'read='; cat \"$f/SECRET-A\"; echo; \
+         fi; \
+       done";
+
     /// The production argv for a job in a fresh root. The `TempDir` is returned
     /// with it so the root outlives the descriptor the argv names.
     fn argv_of(grants: &Grants, command: &str) -> (tempfile::TempDir, SandboxArgv) {
@@ -2347,8 +2763,7 @@ mod tests {
             .position(|x| x == "--bind-fd")
             .unwrap_or_else(|| panic!("the job directory must be bound by descriptor: {a:?}"));
         // The number is a *live* descriptor, and it is the duplicate the argv
-        // value is holding open — not a constant, and not the original, which
-        // is close-on-exec and therefore closed by the time bubblewrap runs.
+        // value is holding open — not a constant, and not the original.
         let named: i32 = a[at + 1].parse().expect("--bind-fd takes a number");
         // SAFETY: `named` is only ever a descriptor this process holds; a wrong
         // number reports `EBADF` rather than doing anything.
@@ -2358,11 +2773,19 @@ mod tests {
             "the descriptor the argv names is not open: F_GETFD = {flags}, errno {}",
             std::io::Error::last_os_error()
         );
-        assert_eq!(
+        // It **stays** close-on-exec here, and that is C1's fix rather than a
+        // regression. The flag belongs to the parent's descriptor table, so
+        // clearing it at this point publishes the descriptor to every child this
+        // process spawns — the probe's other `bwrap` invocations, every other
+        // job's sandbox — and a second job can then read and write the first
+        // job's directory through `/proc/self/fd`. `SandboxArgv::command` clears
+        // it in the child instead; that the child really does see it is pinned by
+        // `only_the_spawned_child_inherits_the_job_directory_descriptor`.
+        assert_ne!(
             flags & libc::FD_CLOEXEC,
             0,
-            "the descriptor the argv names is close-on-exec, so bubblewrap would \
-             not inherit it"
+            "the descriptor the argv names must stay close-on-exec in the PARENT; \
+             clearing it here is C1"
         );
         assert_eq!(a[at + 2], dir, "the bind destination is the job directory");
         assert!(
@@ -3925,55 +4348,83 @@ exit 0"#,
         );
     }
 
-    /// `inheritable_fd` clears `FD_CLOEXEC` on the **duplicate only**, and the
-    /// child really does inherit it.
+    /// `FD_CLOEXEC` is cleared **only in the child that is about to exec**, and
+    /// that child really does inherit the descriptor.
     ///
-    /// Both halves are load-bearing and they pull in opposite directions:
+    /// This replaces `the_inheritable_duplicate_reaches_the_child_and_the_original_stays_cloexec`,
+    /// which asserted the **opposite** of the property it claimed to guard: it
+    /// required `FD_CLOEXEC` to be clear on the duplicate *in the parent's*
+    /// descriptor table and then spawned an unrelated `sh` to prove that the
+    /// flag was clear. That is exactly C1 — the unrelated `sh` in that test was
+    /// the leak, not the intended child — so the test was green while the
+    /// vulnerability was present, and it would have gone red the moment the
+    /// vulnerability was fixed. Both halves are kept here and both are now true:
     ///
-    /// - cleared on the **original**, the descriptor is inherited by every later
-    ///   `exec` in this process — the probe's `bwrap` invocations, every other
-    ///   job's child — which is a handle into the sandbox root held by processes
-    ///   that have no business holding one;
-    /// - left set on the **duplicate**, the child never sees it and
-    ///   `bwrap --bind-fd` fails with a descriptor that is not open.
+    /// - the duplicate stays close-on-exec **in the parent**, so no other child
+    ///   of this process can inherit it (see
+    ///   `an_unrelated_child_never_inherits_the_job_directory_descriptor`);
+    /// - the child spawned through [`SandboxArgv::command`] does see it, because
+    ///   the flag is cleared there, between `fork` and `exec`.
     ///
-    /// The `readlink` is what makes the second half real rather than a flag
-    /// check: it is a child process, spawned the way production spawns one,
-    /// naming the directory through the descriptor it was handed.
+    /// The `readlink` is what makes the second half an observation rather than a
+    /// flag check, and it needs no bubblewrap: the program spawned is a stub
+    /// that ignores its arguments, so the production `command()` — argv,
+    /// `pre_exec` and all — is what is being exercised.
     #[tokio::test]
-    async fn the_inheritable_duplicate_reaches_the_child_and_the_original_stays_cloexec() {
+    async fn only_the_spawned_child_inherits_the_job_directory_descriptor() {
         let (_root, jd) = test_job_dir();
-        let dup = jd.inheritable_fd().unwrap();
-        // SAFETY: both descriptors are open for the duration of the call.
+        let built = build_argv(&jd, &Grants::default(), "true").unwrap();
+        // SAFETY: every descriptor here is open for the duration of the call.
         let fd_flags = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) };
 
-        let original = fd_flags(jd.fd.as_raw_fd());
-        assert!(original >= 0, "the original descriptor is not open");
+        // The number `--bind-fd` names, read out of the argv rather than from a
+        // second accessor: the argv is what bubblewrap actually reads, so a
+        // mismatch between the two is a failure this test should see.
+        let argv = built.argv();
+        let at = argv
+            .iter()
+            .position(|s| s == "--bind-fd")
+            .expect("the argv must bind the job directory by descriptor");
+        let named: i32 = argv[at + 1]
+            .parse()
+            .expect("the descriptor number in the argv must be a number");
+
         assert_ne!(
-            dup.as_raw_fd(),
+            named,
             jd.fd.as_raw_fd(),
-            "the duplicate must be a second descriptor, not the original"
+            "the argv must name a duplicate, never the original"
         );
-        assert_eq!(
-            original & libc::FD_CLOEXEC,
-            libc::FD_CLOEXEC,
-            "the original must stay close-on-exec, or every later exec in this \
-             process inherits a handle into the sandbox root"
-        );
-        let duplicated = fd_flags(dup.as_raw_fd());
-        assert!(duplicated >= 0, "the duplicate is not open");
-        assert_eq!(
-            duplicated & libc::FD_CLOEXEC,
+        assert_ne!(
+            fd_flags(jd.fd.as_raw_fd()) & libc::FD_CLOEXEC,
             0,
-            "the duplicate must be inheritable, or the child cannot see it at all"
+            "the original must stay close-on-exec"
         );
+        assert_ne!(
+            fd_flags(named) & libc::FD_CLOEXEC,
+            0,
+            "the duplicate must stay close-on-exec IN THE PARENT: clearing it here is \
+             C1 — the descriptor becomes inheritable by every child this process \
+             spawns, from any thread, for as long as the argv is alive"
+        );
+
+        // A stub program that ignores the bwrap argv it is handed and names the
+        // descriptor. Spawned through the production path, so the child-side
+        // clear is the one under test.
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join("stub");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nreadlink /proc/self/fd/{named}\n"),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let out = crate::supervisor::bounded(
             "the descriptor-inheritance check",
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("readlink /proc/self/fd/{}", dup.as_raw_fd()))
-                .output(),
+            tokio::process::Command::from(built.command(&stub)).output(),
         )
         .await
         .expect("the child must run");
@@ -3987,6 +4438,62 @@ exit 0"#,
             jd.path().to_string_lossy(),
             "the child must inherit exactly this descriptor, naming the job directory"
         );
+    }
+
+    /// C1. An **unrelated** child must not be able to reach the job directory.
+    ///
+    /// This is the whole point of clearing `FD_CLOEXEC` in the child rather than
+    /// in the parent. The flag lives in the parent's descriptor table, so
+    /// clearing it there makes the descriptor inheritable by every `exec` this
+    /// process performs — from any thread, for as long as the [`SandboxArgv`] is
+    /// alive. That window is microseconds in `shell.rs` but up to
+    /// [`PROBE_STEP_TIMEOUT_SECS`] **per probe step** in `run_in_sandbox`, where
+    /// the argv is deliberately held across the `await`, and the supervisor
+    /// shares this process with the web/Telegram chat paths and MCP stdio
+    /// servers. A second job's sandbox then inherits a handle to the first
+    /// job's directory and can read and write it through `/proc/self/fd`,
+    /// bypassing the mounts entirely — which contradicts the module's own
+    /// invariant that the only writable host path is the job's own directory.
+    ///
+    /// The scan is what makes this an observation rather than a flag check: a
+    /// child that can **open `SECRET-A` through the descriptor** has a real
+    /// handle into the sandbox root, whatever the flag bits say.
+    ///
+    /// Deliberately no `bwrap`: the leak is a property of this process's
+    /// descriptor table, so the test runs on a host without bubblewrap and
+    /// cannot be skipped away. The sandboxed end of the same property is
+    /// `a_second_job_cannot_read_or_write_the_first_jobs_directory` in
+    /// `shell`.
+    #[tokio::test]
+    async fn an_unrelated_child_never_inherits_the_job_directory_descriptor() {
+        let (_root, jd) = test_job_dir();
+        std::fs::write(jd.path().join("SECRET-A"), "A").unwrap();
+        // Held alive across the spawn, exactly as `run_in_sandbox` holds it
+        // across its `await`.
+        let held = build_argv(&jd, &Grants::default(), "true").unwrap();
+
+        let out = crate::supervisor::bounded(
+            "the unrelated child",
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(JOB_DIR_SCAN)
+                .output(),
+        )
+        .await
+        .expect("the unrelated child must run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("leaked="),
+            "an unrelated child inherited a descriptor into the job directory; it \
+             reported:\n{stdout}\n(the descriptor must be close-on-exec in the parent and \
+             cleared only in the child that is about to exec bwrap)"
+        );
+        assert!(
+            !stdout.contains("read=A"),
+            "an unrelated child read the job directory's contents through an inherited \
+             descriptor:\n{stdout}"
+        );
+        drop(held);
     }
 
     /// A FIFO at a level is refused **at that level**, not accepted as a
