@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -1025,6 +1025,50 @@ async fn run_in_sandbox(
             format!("did not finish within {PROBE_STEP_TIMEOUT_SECS}s"),
         )),
     }
+}
+
+/// Resolve and validate the per-job sandbox directory.
+///
+/// This directory is the **only** writable host path in the argv, which makes
+/// it the critical part of the boundary. Every check below is a hard error.
+///
+/// The returned path is canonical, and is a strict descendant of `root` — never
+/// equal to it — so a job can never write at the root itself.
+pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
+    if !root.is_absolute() {
+        anyhow::bail!("sandbox root {} is not absolute", root.display());
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|e| anyhow::anyhow!("cannot create sandbox root {}: {e}", root.display()))?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", root.display()))?;
+    if root == Path::new("/") {
+        anyhow::bail!("the sandbox root must not be /");
+    }
+    // A root that directly holds config.toml would make the job directory's
+    // parent the directory holding the API key and every peer token.
+    if root.join("config.toml").exists() {
+        anyhow::bail!(
+            "the sandbox root {} holds config.toml; point it at a dedicated \
+             directory such as <home>/workspace",
+            root.display()
+        );
+    }
+    let dir = root.join(task_id).join(job_id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
+    // Re-canonicalise AFTER creation: a pre-existing symlink at this path is
+    // caught here, which is also the CVE-2026-87766 precondition.
+    let dir = std::fs::canonicalize(&dir)
+        .map_err(|e| anyhow::anyhow!("cannot canonicalise {}: {e}", dir.display()))?;
+    if !dir.starts_with(&root) || dir == root {
+        anyhow::bail!(
+            "the job sandbox {} resolved outside the sandbox root {}",
+            dir.display(),
+            root.display()
+        );
+    }
+    Ok(dir)
 }
 
 #[cfg(test)]
@@ -2203,5 +2247,95 @@ exit 0"#,
             .to_string();
         assert!(e.contains("curl did not run"), "got {e:?}");
         assert!(e.contains("curl: not found"), "got {e:?}");
+    }
+
+    // --- the per-job sandbox directory (spec §1.3) --------------------------
+    //
+    // The job directory is the **only** writable host path in the argv, so every
+    // refusal here is a hard error. Each test below names the *reason* for the
+    // refusal, not merely that one happened: `unwrap_err()` is satisfied by any
+    // failure at all, including one that comes from a later step, and a guard
+    // that is never reached still passes it.
+
+    #[test]
+    fn refuses_the_filesystem_root_as_the_root() {
+        let e = resolve_job_dir(Path::new("/"), "t", "j").unwrap_err();
+        assert!(e.to_string().contains("/"), "{e}");
+        // The line above is the plan's assertion, and by itself it has no
+        // teeth: every message this function can produce quotes a path, so
+        // deleting the `/` guard and letting the failure come from
+        // `create_dir_all("/t/j")` satisfies it just as well — which is exactly
+        // what a non-root runner observes. This pins the reason.
+        assert!(e.to_string().contains("must not be /"), "{e}");
+    }
+
+    #[test]
+    fn refuses_a_root_that_holds_config_toml() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "x").unwrap();
+        let e = resolve_job_dir(home.path(), "t", "j").unwrap_err();
+        assert!(e.to_string().contains("config.toml"), "{e}");
+        // The root holds the API key and every peer token (spec §1.3), so the
+        // refusal has to name that file rather than a downstream failure.
+        assert!(!home.path().join("t").exists(), "{e}");
+    }
+
+    #[test]
+    fn a_workspace_root_is_accepted_and_the_job_dir_is_created() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let got = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
+        assert!(got.is_dir());
+        assert!(got.starts_with(std::fs::canonicalize(&ws).unwrap()));
+        assert_ne!(
+            got,
+            std::fs::canonicalize(&ws).unwrap(),
+            "never the root itself"
+        );
+        // The layout is normative (`<root>/<task-id>/<job-id>`, spec §1.3).
+        // Containment and "is a directory" both still hold for a path that
+        // dropped the job id — and then two jobs of one task would share a
+        // directory, which is the thing per-job directories exist to prevent.
+        assert_eq!(
+            got,
+            std::fs::canonicalize(&ws)
+                .unwrap()
+                .join("task-1")
+                .join("job-1"),
+        );
+    }
+
+    #[test]
+    fn a_symlinked_job_dir_pointing_out_of_the_root_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(ws.join("task-1")).unwrap();
+        std::fs::create_dir_all(home.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("elsewhere"), ws.join("task-1/job-1")).unwrap();
+        let e = resolve_job_dir(&ws, "task-1", "job-1").unwrap_err();
+        assert!(e.to_string().contains("outside"), "{e}");
+    }
+
+    /// A relative root is resolved against whatever the process's cwd happens to
+    /// be, which is not a decision the operator made. Refused, not guessed at.
+    #[test]
+    fn a_relative_root_is_refused() {
+        let e = resolve_job_dir(Path::new("workspace"), "t", "j").unwrap_err();
+        assert!(e.to_string().contains("not absolute"), "{e}");
+    }
+
+    /// The invariant is *strictly* below the root, never equal to it (spec
+    /// §1.3), and empty ids are the way that clause is reachable: `root.join("")`
+    /// is the root again. Without the `dir == root` term the job would be handed
+    /// the root itself — all of `<home>/workspace` bound read-write, which is
+    /// the one thing per-job directories exist to prevent.
+    #[test]
+    fn empty_ids_do_not_resolve_to_the_root_itself() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let e = resolve_job_dir(&ws, "", "").unwrap_err();
+        assert!(e.to_string().contains("outside the sandbox root"), "{e}");
     }
 }
