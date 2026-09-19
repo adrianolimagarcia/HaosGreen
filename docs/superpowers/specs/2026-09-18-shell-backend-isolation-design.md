@@ -524,21 +524,38 @@ Binding them keeps a property that would otherwise silently regress: today
 fetches a URL works. A sandbox that broke HTTPS would be a functional
 regression, not a security win.
 
-#### Authorization is declared before the run, not discovered during it
+#### Authorization is resolved before the run, not discovered during it
 
 `bubblewrap` builds its argv before the process starts; a bind cannot be added
 to a running sandbox. So authorization cannot be reactive — the supervisor
 cannot watch a job fail and then widen its own sandbox. It is resolved **before**
-the job runs:
+the job runs, and it is resolved by the **operator**, ahead of time:
 
-1. The task declares the grants it needs (`Grants { write: Vec<PathBuf>, network:
-   bool }`). In practice the planner derives this from the job's command; a
-   declaration that is missing a grant fails closed and the job is refused, it
-   does not fall back to a wider sandbox.
-2. The supervisor subtracts the grants already held. If nothing is missing, the
-   job runs.
-3. Otherwise the task is parked and the operator is asked, by name, for each
-   missing grant — the path, and why the task wants it.
+1. The operator releases capabilities one at a time — `/allow <path>`,
+   `/allow_net`, or the dashboard's grant routes. Each is a standing release
+   until revoked, and each is audited.
+2. `build_argv` binds exactly what is held: the sandboxed launch gets the paths
+   in `Grants::write` read-write and the host network namespace only when
+   `Grants::network` is set. Nothing is inferred from the command.
+3. A task that would select the shell backend while there is **no usable
+   boundary at all** is parked for approval at route time, and `ShellBackend::run`
+   refuses it at run time. That is the whole gate, and it is about the boundary
+   existing — not about what the job wants to reach.
+
+> **Revision 6 deleted the per-job declaration, and this section used to describe
+> it.** It read: "the task declares the grants it needs … in practice the planner
+> derives this from the job's command; a declaration that is missing a grant
+> fails closed and the job is refused." None of that shipped. `Task::declared_grants`
+> existed and both layers read it, but **no production code ever wrote it** — not
+> `submit`, not the planner, not either operator surface — so the set under
+> comparison was always empty, the park could not fire, and the Layer-2 refusal
+> in `ShellBackend::run` was unreachable. The field, the planner's copy,
+> `Grants::missing`, `Grants::covers` and `supervisor::park_reason` were all
+> removed rather than left in place: an enforcement path that cannot fire, with
+> documentation asserting that it does, is worse than no path at all — the next
+> reader budgets trust it has not earned. Per-job declaration was never a
+> requirement, so nothing was lost; the ask-for-authorization an operator
+> actually has is step 3.
 
 ```rust
 struct Grants {

@@ -769,35 +769,25 @@ impl Supervisor {
     /// fires and the test would pass for the wrong reason.
     /// The Layer-1 park reason for a task, or `None` if it is not gated.
     ///
-    /// Extracted from `submit` so the gate is reachable from a test holding a
-    /// task that **declares a capability**. `submit` cannot produce one in this
-    /// revision — nothing populates `Task::declared_grants` from operator input
-    /// yet — so a gate driven only through `submit` can never be shown to fire
-    /// on the grant term, and a test that cannot make the gate fire cannot tell
-    /// a working exemption from a gate that never runs.
+    /// **There is exactly one term, and it is the isolation decision.** A second
+    /// term used to sit beside it — a task that *declared* a capability the
+    /// operator had not granted was parked and the reason named the `/allow`
+    /// that would release it. Nothing ever wrote `Task::declared_grants`, so
+    /// that term could not fire in production, and it is deleted along with the
+    /// field. What remains is the half an operator can actually reach: a task
+    /// that would select the shell backend is parked for approval when there is
+    /// no usable boundary to run it in.
     pub fn shell_gate_reason(&self, task: &crate::supervisor::task::Task) -> Option<String> {
         if !self.would_use_shell(task) {
             return None;
         }
-        // **The whole gate is skipped under `Unconfined`, and that is spec §4,
-        // not an optimisation.** "With `sandbox = \"none\"` nothing is gated:
-        // that mode *is* the operator's consent, and Layer 1 does not apply."
-        // The exemption is therefore the *outer* decision, not the isolation
-        // term alone. Both terms exist to stop a job reaching a boundary wider
-        // than the operator sanctioned: `Unavailable` because there is no
-        // boundary to reach at all, and a missing grant because the sandboxed
-        // launch would bind more than was granted. Under `Unconfined` there is
-        // no argv and no bind: Layer 2 runs `sh -c` in the job directory and
-        // reads neither `Grants` nor `declared_grants`. Parking on the grant
-        // term there would cost one approval round-trip and change nothing
-        // about what runs.
-        //
-        // A `match` rather than `unavailable() || !missing.is_empty()`: a
-        // predicate on the isolation decision alone has no grant set to look at,
-        // so it cannot express the second term. Keeping both terms in one `match`
-        // on the mode makes the exemption
-        // structural — there is exactly one place `Unconfined` is answered, and
-        // it answers before either term is evaluated.
+        // **The gate is skipped under `Unconfined`, and that is spec §4, not an
+        // optimisation.** "With `sandbox = \"none\"` nothing is gated: that
+        // mode *is* the operator's consent, and Layer 1 does not apply." The
+        // term exists to stop a job reaching a boundary wider than the operator
+        // sanctioned, and `Unconfined` has no boundary to widen: Layer 2 runs
+        // `sh -c` in the job directory and builds no argv at all. Parking there
+        // would cost an approval round-trip and change nothing about what runs.
         match &self.shell_isolation {
             Isolation::Unconfined => None,
             Isolation::Unavailable(reason) => Some(format!(
@@ -806,20 +796,11 @@ impl Supervisor {
                  [supervisor.shell].sandbox = \"none\". A grant cannot replace a missing \
                  sandbox; `/allow <path>` and `/allow-net` release a capability."
             )),
-            Isolation::Sandboxed => {
-                let held = self.grants.read().unwrap().clone();
-                let missing = held.missing(&task.declared_grants);
-                if missing.is_empty() {
-                    None
-                } else {
-                    Some(park_reason(
-                        &held,
-                        &task.declared_grants,
-                        &task.id,
-                        &task.user_request,
-                    ))
-                }
-            }
+            // A sandboxed boundary that exists is the operator's consent to
+            // use it. What may be *reached* through it is the grants' business,
+            // and `build_argv` binds exactly what is held — no more, and never
+            // less.
+            Isolation::Sandboxed => None,
         }
     }
 
@@ -1579,16 +1560,6 @@ impl Supervisor {
 /// Why a shell task was parked, naming each grant it needs, the command that
 /// releases it, and what the task is trying to do. The operator is never told
 /// only "approval required" — spec §3 asks for the path **and** the reason.
-pub fn park_reason(held: &Grants, declared: &Grants, task_id: &str, request: &str) -> String {
-    let missing = held.missing(declared);
-    format!(
-        "task {task_id} declares {} it does not hold, for: {request}. Grant {} by name, then \
-         approve the task again with `/approve {task_id}`.",
-        missing.join(", "),
-        if missing.len() == 1 { "it" } else { "them" }
-    )
-}
-
 /// Await `fut` under a bound, so a run that never finishes fails **the calling
 /// test** with a named message instead of wedging the whole binary.
 ///
@@ -3000,119 +2971,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    /// A shell task that declares a capability the operator has not granted is
-    /// parked, and the reason names **the capability and the command that
-    /// releases it** — not merely "approval required".
-    ///
-    /// Driven through `shell_gate_reason` rather than `submit`, and that is a
-    /// real limitation rather than a preference: nothing populates
-    /// `Task::declared_grants` from operator input in this revision, so a task
-    /// reaching `submit` can never carry a declaration. A gate that cannot be
-    /// made to fire cannot be shown to work, and a test that cannot make it fire
-    /// cannot tell a working gate from one that never runs.
-    #[tokio::test]
-    async fn a_shell_task_declaring_an_ungranted_capability_is_parked_and_named() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
-        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
-        sup.registry
-            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
-        let sup = sup.with_shell_isolation(Isolation::Sandboxed);
-
-        let mut task = crate::supervisor::task::Task::new("t", "run the build");
-        task.task_type = crate::supervisor::task::TaskType::OpsAutomation;
-        task.risk_level = crate::supervisor::task::RiskLevel::Medium;
-        task.required_capabilities = vec!["shell".into()];
-        task.declared_grants
-            .write
-            .insert(std::path::PathBuf::from("/etc"));
-
-        let reason = sup
-            .shell_gate_reason(&task)
-            .expect("an ungranted declaration must park the task");
-        assert!(reason.contains("/etc"), "must name the path: {reason}");
-        assert!(
-            reason.contains("/allow /etc"),
-            "must name the command that releases it: {reason}"
-        );
-        assert!(
-            reason.contains(&task.id),
-            "must name the task to approve: {reason}"
-        );
-    }
-
-    /// The gate releases as soon as the capability is granted, and the grant is
-    /// seen **through the operator's own handle** — which is what proves the
-    /// supervisor and the shell backend share one `Arc<RwLock<Grants>>` rather
-    /// than each holding a copy. Two copies would park a task for a grant the
-    /// backend already had.
-    #[tokio::test]
-    async fn the_gate_releases_once_the_capability_is_granted_through_the_operators_handle() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
-        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
-        sup.registry
-            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
-        let grants = std::sync::Arc::new(std::sync::RwLock::new(Grants::default()));
-        let sup = sup
-            .with_shell_isolation(Isolation::Sandboxed)
-            .with_grants(grants.clone());
-
-        let mut task = crate::supervisor::task::Task::new("t", "run the build");
-        task.task_type = crate::supervisor::task::TaskType::OpsAutomation;
-        task.risk_level = crate::supervisor::task::RiskLevel::Medium;
-        task.required_capabilities = vec!["shell".into()];
-        task.declared_grants
-            .write
-            .insert(std::path::PathBuf::from("/etc"));
-
-        assert!(
-            sup.shell_gate_reason(&task).is_some(),
-            "ungranted must park"
-        );
-        grants
-            .write()
-            .unwrap()
-            .grant_write("/etc", dir.path())
-            .unwrap();
-        assert!(
-            sup.shell_gate_reason(&task).is_none(),
-            "once granted, the gate must release: {:?}",
-            sup.shell_gate_reason(&task)
-        );
-    }
-
-    /// **The grant term does not apply under `Unconfined`, and this is spec §4
-    /// at Layer 1.**
-    ///
-    /// `sandbox = "none"` *is* the operator's consent, so a declaration buys the
-    /// job nothing and parking on it would cost an approval round-trip that
-    /// changes nothing about what runs. Without this test, a gate that parked
-    /// every mode would look correct.
-    #[tokio::test]
-    async fn an_unconfined_supervisor_does_not_park_on_the_grant_term() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
-        let mut sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
-        sup.registry
-            .register(std::sync::Arc::new(ShellBackend::new(dir.path().into())));
-        let sup = sup.with_shell_isolation(Isolation::Unconfined);
-
-        let mut task = crate::supervisor::task::Task::new("t", "run the build");
-        task.task_type = crate::supervisor::task::TaskType::OpsAutomation;
-        task.risk_level = crate::supervisor::task::RiskLevel::Medium;
-        task.required_capabilities = vec!["shell".into()];
-        task.declared_grants
-            .write
-            .insert(std::path::PathBuf::from("/etc"));
-
-        assert!(
-            sup.shell_gate_reason(&task).is_none(),
-            "Unconfined is consent: got {:?}",
-            sup.shell_gate_reason(&task)
-        );
     }
 
     /// A shell task is parked for approval when the boundary is absent.

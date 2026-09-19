@@ -61,7 +61,6 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         // declaring nothing. Declarations are consumed by the run that created
         // the job and are not persisted; a resumed job therefore re-declares
         // through its task rather than through the row. See `Grants`.
-        declared_grants: Default::default(),
     })
 }
 
@@ -491,7 +490,6 @@ impl TaskStore {
                     // declaring nothing. Declarations are consumed by the run that created
                     // the job and are not persisted; a resumed job therefore re-declares
                     // through its task rather than through the row. See `Grants`.
-                    declared_grants: Default::default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

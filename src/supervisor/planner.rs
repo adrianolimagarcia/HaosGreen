@@ -48,15 +48,10 @@ impl Planner {
                 &format!("Review the executor result for: {}", t.title),
             ));
         }
-        // Stamped here rather than at each `Job::new` call site: the declaration
-        // belongs to the task, and every job the planner creates inherits it. A
-        // per-call-site copy would be three places to forget when a fourth job
-        // type is added, and the failure mode of forgetting is silent — the job
-        // declares nothing, so Layer 2 has nothing to refuse and the sandbox
-        // binds less than the task asked for.
-        for j in jobs.iter_mut() {
-            j.declared_grants = t.declared_grants.clone();
-        }
+        // A `declared_grants` stamp used to sit here, copying the task's
+        // declaration onto every job it created. Both sides of that copy are
+        // gone: nothing ever wrote the task's side, so every job it stamped got
+        // an empty set.
         Plan {
             jobs,
             parallel_groups: vec![],

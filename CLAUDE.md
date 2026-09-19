@@ -825,15 +825,20 @@ surface, through `GET /api/supervisor/grants` and
 `POST /api/supervisor/grants/{allow,deny}` on the dashboard, which audit as the
 fixed actor `"dashboard"`.
 
-> **A grant is standing, not per-job consent.** Nothing derives a job's needs
-> from its command: `Task::declared_grants` exists, both layers read it, and the
-> planner copies it onto every job — but **no production code ever writes it**.
-> So `/allow /var/lib` is bound into *every later shell job* until it is
-> revoked, rather than being released for one job that asked. The design spec
-> describes a per-job declaration that was never implemented; the enforcement
-> path (`shell_gate_reason`, and the `Failed` job in `ShellBackend::run`) is
-> real and tested but unreachable in production, because the set it checks is
-> always empty. Read the spec's §3 as intent, not as shipped behaviour.
+> **A grant is standing, not per-job consent, and there is no per-job mechanism
+> at all.** `/allow /var/lib` is bound into *every later shell job* until it is
+> revoked, rather than being released for one job that asked. Nothing derives a
+> job's needs from its command, and nothing compares what a job wants against
+> what is held: a `Task::declared_grants` field once existed for exactly that,
+> with both layers reading it and the planner copying it onto every job — but
+> **no production code ever wrote it**, so the park could never fire and the
+> Layer-2 refusal in `ShellBackend::run` was unreachable. The field, the copy,
+> `Grants::missing`, `Grants::covers` and `supervisor::park_reason` are
+> **deleted**, not merely unused. What remains is the gate an operator can
+> actually reach: a task that would select the shell backend is parked for
+> approval when there is no usable boundary to run it in, and refuses at run
+> time for the same reason. The spec's §3 describes this, and records what it
+> used to claim.
 
 **The command names use underscores, not hyphens.** Telegram `BotCommand` names
 must match `[a-z0-9_]{1,32}`, so `/allow-net` is not a command Telegram will

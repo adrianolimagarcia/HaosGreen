@@ -73,13 +73,6 @@ pub struct Job {
     pub status: JobStatus,
     pub result: Option<JobOutput>,
     pub error: Option<String>,
-    /// The capabilities this job declares it needs. Empty means "nothing
-    /// beyond its own job directory", which is the shipped default.
-    ///
-    /// `#[serde(default)]` so a job row written before this field existed reads
-    /// back as "declares nothing" rather than failing to load.
-    #[serde(default)]
-    pub declared_grants: crate::supervisor::backend::sandbox::Grants,
 }
 
 impl Job {
@@ -101,7 +94,6 @@ impl Job {
             status: JobStatus::Pending,
             result: None,
             error: None,
-            declared_grants: Default::default(),
         }
     }
 }

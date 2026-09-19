@@ -2702,6 +2702,16 @@ The job's declaration — `job.declared_grants`, and the refusal that names the
 missing grant — is added in Task 8, which owns the grant semantics. This task
 wires the grant set in; it does not yet compare it against anything.
 
+> **Revision 6: none of that survived.** `Task::declared_grants` was added and
+> both layers did read it, exactly as this step describes — but **no production
+> code ever wrote it**, so the comparison was always against an empty set, the
+> park could not fire, and the Layer-2 refusal was unreachable. The field, the
+> planner's copy, `Grants::missing`, `Grants::covers` and
+> `supervisor::park_reason` were all **deleted**, and this plan is left as the
+> record of what was attempted. What shipped is the half that runs: a task that
+> would select the shell backend is parked when there is no usable boundary, and
+> refuses at run time for the same reason. See the spec's §3.
+
 `validate()` is now dead — the sandbox is the containment. Delete it and its
 `"sandbox-violation"` error string, and replace the TODO at `shell.rs:19-23`
 with a comment pointing at this module. Deleting it is required: `src/lib.rs`

@@ -681,40 +681,6 @@ impl Grants {
     pub fn revoke_network(&mut self) {
         self.network = false;
     }
-
-    /// What `declared` asks for that is not held, named the way the operator
-    /// has to name it. Used verbatim in the park reason and in the Layer-2
-    /// refusal, so the two cannot say different things.
-    pub fn missing(&self, declared: &Grants) -> Vec<String> {
-        let mut out = Vec::new();
-        for d in &declared.write {
-            // Canonicalised on both sides: `/etc/../etc` and a symlink to /etc
-            // resolve to the same entry. An **exact** match, never a prefix — a
-            // grant covers the path named and not its children.
-            let canon = std::fs::canonicalize(d).unwrap_or_else(|_| d.clone());
-            if !self.write.contains(&canon) {
-                out.push(format!(
-                    "a writable host path {} — grant it with `/allow {}`",
-                    d.display(),
-                    d.display()
-                ));
-            }
-        }
-        if declared.network && !self.network {
-            out.push("the host network namespace — grant it with `/allow_net`".to_string());
-        }
-        out
-    }
-
-    /// Does the held set cover everything this declaration asks for?
-    /// Test-only: production asks [`Self::missing`] so it can *name* what is
-    /// absent, and a bare `bool` throws that away. It was `pub` with no
-    /// production caller, which `#![deny(dead_code)]` does not catch inside a
-    /// `pub mod` chain — the same shape as `SandboxArgv::argv`.
-    #[cfg(test)]
-    pub fn covers(&self, declared: &Grants) -> bool {
-        self.missing(declared).is_empty()
-    }
 }
 
 /// Append `--ro-bind <path> <path>` for `path`, if it exists under `root`.
@@ -2293,39 +2259,6 @@ pub(crate) mod tests {
         // `/…/ws-evil` must be grantable while `/…/ws` is the root.
         assert!(Grants::resolve_path(evil.to_str().unwrap(), &ws).is_ok());
         assert!(Grants::resolve_path(ws.to_str().unwrap(), &ws).is_err());
-    }
-
-    /// A grant covers the path **named**, never its children.
-    #[test]
-    fn a_grant_covers_the_path_named_and_not_its_children() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let mut held = Grants::default();
-        held.grant_write("/etc", &root).unwrap();
-
-        let mut exact = Grants::default();
-        exact.write.insert(PathBuf::from("/etc"));
-        assert!(
-            held.covers(&exact),
-            "the granted path itself must be covered"
-        );
-
-        let mut child = Grants::default();
-        child.write.insert(PathBuf::from("/etc/ssl"));
-        assert!(
-            !held.covers(&child),
-            "a grant must not silently extend to children"
-        );
-
-        let mut net = Grants::default();
-        net.grant_network();
-        assert!(!held.covers(&net), "network is a separate capability");
-        assert!(net.covers(&net));
-        net.revoke_network();
-        assert!(!net.covers(&Grants {
-            network: true,
-            ..Default::default()
-        }));
     }
 
     /// A revocation must work on a path that no longer exists — otherwise a
