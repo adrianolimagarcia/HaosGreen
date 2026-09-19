@@ -251,6 +251,45 @@ pub enum IsolationUnavailable {
     SmokeTestFailed(String),
 }
 
+impl IsolationUnavailable {
+    /// The advice to give the operator for **this** cause.
+    ///
+    /// Cause-dependent on purpose, and the reason is `NotDecided`'s own doc: a
+    /// single hardcoded message is what makes a plausible-sounding wrong cause
+    /// possible, and "install bubblewrap" is the guess an operator will act on.
+    /// A cause that never probed anything must say so instead of naming a
+    /// package.
+    pub fn advice(&self) -> &'static str {
+        match self {
+            Self::NotDecided => {
+                "No isolation decision ever reached this backend, so nothing is known \
+                 about bubblewrap on this host. This is a **wiring bug, not a host \
+                 problem** — do not install anything; the startup path that calls \
+                 `Isolation::resolve` has to hand its result to the backend."
+            }
+            Self::NotInstalled => {
+                "Install bubblewrap >= 0.12.0, or set \
+                 [supervisor.shell].sandbox = \"none\" to run shell jobs unconfined."
+            }
+            Self::VersionUnreadable(_) => {
+                "bubblewrap is present but its version could not be read; repair or \
+                 reinstall bubblewrap >= 0.12.0, or set \
+                 [supervisor.shell].sandbox = \"none\" to run shell jobs unconfined."
+            }
+            Self::VersionTooOld(_) => {
+                "Upgrade bubblewrap to >= 0.12.0, or set \
+                 [supervisor.shell].sandbox = \"none\" to run shell jobs unconfined."
+            }
+            Self::SmokeTestFailed(_) => {
+                "bubblewrap is installed and new enough, but it cannot build a sandbox \
+                 on this host — investigate the host (blocked nested user namespaces \
+                 are the usual cause) rather than installing anything, or set \
+                 [supervisor.shell].sandbox = \"none\" to run shell jobs unconfined."
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for IsolationUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -634,6 +673,18 @@ pub struct SandboxArgv {
 }
 
 impl SandboxArgv {
+    /// The argv, **including** the `--bind-fd` number that only
+    /// [`Self::command`] knows how to make inheritable.
+    ///
+    /// Test-only, and `#[cfg(test)]` is what enforces it: handing this argv to a
+    /// plain `Command` spawns `bwrap` with a descriptor that is still
+    /// close-on-exec, which `bwrap` reports as `Can't find source path
+    /// /proc/self/fd/N`. That fails **closed**, so it was never a leak — but the
+    /// doc above called `command()` "the only sanctioned way" while leaving the
+    /// unsanctioned one public and reachable from production code. Every call
+    /// site is in `#[cfg(test)] mod tests`, so the invariant is now a compile
+    /// error rather than a convention.
+    #[cfg(test)]
     pub fn argv(&self) -> &[String] {
         &self.argv
     }
@@ -1750,8 +1801,14 @@ pub(crate) mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+            .status();
+        // Bounded like every other await on spawned work in this suite. A wedged
+        // `bwrap` here would otherwise hang the whole libtest binary **silently**
+        // — libtest has no per-test timeout and prints nothing about a test still
+        // in flight, so the run would sit with every worker idle and name
+        // nothing. Not observed; this is the project's own rule applied to the
+        // one helper that was missing it.
+        let out = crate::supervisor::bounded("the bubblewrap capability gate", out).await;
         matches!(out, Ok(status) if status.success())
     }
 
@@ -1834,11 +1891,28 @@ pub(crate) mod tests {
     /// outside it that calls `execvp` while this guard is alive can still resolve
     /// `bwrap` through the stub — libtest runs these tests on many threads and
     /// `PATH` is process state, so no lock this module can take closes that. It
-    /// is acceptable because the only tests that spawn `bwrap` through `PATH` are
-    /// the ones in this module and the three in `shell.rs` that hold
-    /// [`RealPath`], and because the alternative — naming the binary explicitly —
+    /// is not closable this way. The alternative — naming the binary explicitly —
     /// is already what the rest of this module does (`check_bwrap_version_at`,
-    /// `probe_at`).
+    /// `probe_at`), and that is what keeps the **production** paths out of a
+    /// stub's reach.
+    ///
+    /// It is **not** closed for the tests themselves, and an earlier version of
+    /// this comment claimed it was ("the only tests that spawn `bwrap` through
+    /// `PATH` are the ones in this module and the three in `shell.rs` that hold
+    /// [`RealPath`]"). That was false. The tests that spawn `bwrap` through
+    /// `PATH` are: in this module,
+    /// `only_the_literal_none_is_consent_and_an_unknown_value_is_proved` (five
+    /// spawns, unguarded); and in `shell.rs`,
+    /// `only_the_literal_none_resolves_to_the_unconfined_mode` (unguarded) plus
+    /// the three that do hold [`RealPath`]. A stub *can* answer one of them.
+    ///
+    /// The residual is benign for a specific reason, not by luck: those
+    /// unguarded tests assert only `!matches!(got, Isolation::Unconfined)`, which
+    /// is a property of the `ShellSandboxConfig` (`is_unconfined()` is
+    /// `sandbox == "none"`) and not of whichever `bwrap` answered — so no stub
+    /// can make them pass or fail wrongly. That is a property of those
+    /// assertions, not of the guard, and it stops being true the moment one of
+    /// them asserts anything about bubblewrap itself.
     struct PathOnly {
         saved: Option<std::ffi::OsString>,
         _lock: RealPath,
@@ -2152,10 +2226,15 @@ pub(crate) mod tests {
              with a working bubblewrap must resolve to the sandboxed mode, and anything \
              else means shell jobs are refused for no reason"
         );
-        assert!(
-            !got.needs_approval(),
-            "a proven boundary must not park every shell task for approval"
-        );
+        // No `assert!(!got.needs_approval())` here. It used to sit at this
+        // point and it could never fail: `needs_approval()` is
+        // `matches!(self, Unavailable(_))`, so once `got == Sandboxed` is
+        // asserted above the second assertion is a tautology. It read as the
+        // "Layer 1 does not park this task" check while testing nothing. The
+        // real property now lives where the gate does —
+        // `supervisor::tests::a_shell_task_is_parked_for_approval_when_isolation_is_unavailable`
+        // and `..._a_shell_task_is_not_gated_when_the_operator_chose_none`, both
+        // of which were shown to fail under mutation.
     }
 
     /// The consenting branch is taken **before** the probe — and this is what

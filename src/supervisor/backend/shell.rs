@@ -388,12 +388,11 @@ impl Backend for ShellBackend {
                 summary: String::new(),
                 evidence: vec![],
                 errors: vec![format!(
-                    "refusing to run a shell job without isolation: {reason}. \
-                     Install bubblewrap >= 0.12.0, or set \
-                     [supervisor.shell].sandbox = \"none\" to run shell jobs \
-                     unconfined. A writable host path and the host network are \
-                     released by name — `/allow <path>` and `/allow-net` — and \
-                     neither substitutes for a sandbox that is not there."
+                    "refusing to run a shell job without isolation: {reason}. {advice} \
+                     A writable host path and the host network are released by name — \
+                     `/allow <path>` and `/allow-net` — and neither substitutes for a \
+                     sandbox that is not there.",
+                    advice = reason.advice()
                 )],
                 changed_files: vec![],
                 next_step: None,
@@ -609,6 +608,23 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("no isolation decision")),
             "the refusal must name the real cause rather than a guessed one, got {:?}",
+            out.errors
+        );
+        // The whole reason `NotDecided` exists is that a plausible-sounding wrong
+        // cause is the worst kind. `contains("no isolation decision")` alone let
+        // the contradiction ship: the message named the right cause and then
+        // advised installing a package nothing had looked for.
+        assert!(
+            !out.errors
+                .iter()
+                .any(|e| e.contains("Install bubblewrap") || e.contains("Upgrade bubblewrap")),
+            "a backend that was never handed a decision must not be told to install or \
+             upgrade bubblewrap: nothing was probed, so that is a guess. Got {:?}",
+            out.errors
+        );
+        assert!(
+            out.errors.iter().any(|e| e.contains("wiring bug")),
+            "the NotDecided cause must name itself as a wiring bug, got {:?}",
             out.errors
         );
     }
