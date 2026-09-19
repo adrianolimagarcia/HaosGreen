@@ -510,10 +510,62 @@ async fn main() -> Result<()> {
             "supervisor".to_string(),
         ),
     ));
+    // One shared grant set, empty at startup: the operator grants a writable host
+    // path or the host network by name, and it is revoked by a restart.
+    let grants: Arc<std::sync::RwLock<haos_green::supervisor::backend::sandbox::Grants>> =
+        Arc::new(std::sync::RwLock::new(Default::default()));
+
+    // The ONE reader of `[supervisor.shell].sandbox`. `"none"` is the operator's
+    // standing consent (spec §4) and resolves to `Unconfined` without touching
+    // bwrap; every other value resolves through the version floor and the smoke
+    // probe, which are **one** result — the floor is a precondition and the probe
+    // is what asserts the boundary the argv claims. An unrecognised value cannot
+    // reach the consenting branch: `Config::load` refused it, and `is_unconfined`
+    // is an equality against the literal.
+    //
+    // `probe` is async, so this is in an async context (`main` is).
+    //
+    // `Isolation::resolve` takes a `&Grants`, and `grants` here is the
+    // `Arc<RwLock<Grants>>` shared with every `ShellBackend` — so it is handed a
+    // **snapshot**, taken by name. Passing `&grants` would not compile
+    // (`RwLock<T>` implements no `Deref`, so there is no deref step from
+    // `&Arc<RwLock<Grants>>` to `&Grants`), and inlining
+    // `&grants.read().unwrap().clone()` would hold the guard across the `await`,
+    // which makes this future non-`Send`. Bound first, the guard is released
+    // before the probe runs, so the probe spawns bwrap without the grant set
+    // locked.
+    let held_at_startup = grants.read().unwrap().clone();
+    let isolation = haos_green::supervisor::backend::sandbox::Isolation::resolve(
+        &config.supervisor.shell,
+        &held_at_startup,
+    )
+    .await;
+    match &isolation {
+        haos_green::supervisor::backend::sandbox::Isolation::Unavailable(e) => tracing::warn!(
+            reason = %e,
+            "shell jobs will be refused: the bubblewrap sandbox is unavailable"
+        ),
+        // The operator asked for this, and the spec requires they be told what it
+        // means — loudly, once, at startup, not only in the file they edited.
+        haos_green::supervisor::backend::sandbox::Isolation::Unconfined => tracing::warn!(
+            "[supervisor.shell].sandbox = \"none\": shell jobs run UNCONFINED — no \
+             filesystem, process or network boundary, and no grant is required. Set \
+             it back to \"bwrap\" to restore the sandbox."
+        ),
+        haos_green::supervisor::backend::sandbox::Isolation::Sandboxed => {}
+    }
+
+    // The root is `config.sandbox.allowed_directory` — the resolved sandbox root
+    // — and not a free variable, and the backend stays wrapped in the
+    // `register(Arc::new(…))` that puts it in the registry: a `ShellBackend`
+    // built and not registered is the "defined and never wired" defect this plan
+    // has hit four times.
     sup_registry.register(std::sync::Arc::new(
         haos_green::supervisor::backend::shell::ShellBackend::new(
             config.sandbox.allowed_directory.clone(),
-        ),
+        )
+        .with_isolation(isolation)
+        .with_grants(Arc::clone(&grants)),
     ));
 
     let _supervisor = Arc::new(haos_green::supervisor::Supervisor::new(

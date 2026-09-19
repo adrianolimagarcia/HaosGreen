@@ -262,6 +262,102 @@ impl std::fmt::Display for IsolationUnavailable {
 
 impl std::error::Error for IsolationUnavailable {}
 
+/// What the shell backend may do, resolved **once** at startup.
+///
+/// This is the only reader of `[supervisor.shell].sandbox`. It is an enum and
+/// not a `Result`, because "the boundary was proven" and "the operator chose to
+/// have none" are different facts and only one of them is a failure. Collapsing
+/// them into `Ok(())` is what would make `sandbox = "none"` still spawn `bwrap`
+/// — and fail on a host without it, which is the host the mode exists for.
+///
+/// `PartialEq` is here for the tests that pin the precedence table; there is no
+/// production comparison of two `Isolation` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Isolation {
+    /// `sandbox = "bwrap"` and both the version floor and the smoke probe
+    /// passed. Jobs run inside the argv `build_argv` produces.
+    Sandboxed,
+    /// `sandbox = "none"`: the operator's standing consent (spec §4). Nothing
+    /// is gated — Layer 1 does not park the task and Layer 2 does not refuse it
+    /// — and no `bwrap` is spawned.
+    Unconfined,
+    /// `sandbox = "bwrap"` and the boundary could not be proven. Refuse; never
+    /// fall back to `sh -c`.
+    Unavailable(IsolationUnavailable),
+}
+
+impl Default for Isolation {
+    /// Fail closed. A backend built without an explicit decision must not spawn
+    /// anything.
+    fn default() -> Self {
+        Isolation::Unavailable(IsolationUnavailable::NotInstalled)
+    }
+}
+
+impl Isolation {
+    /// Resolve the configured mode into the decision.
+    ///
+    /// `is_unconfined()` is an equality against the literal `"none"` (Task 4),
+    /// so a value that is neither mode takes the **proving** branch here, never
+    /// the consenting one. `ShellSandboxConfig::validate` has already refused
+    /// such a value at load; this is the second, independent guarantee.
+    ///
+    /// The consenting branch is taken **before** the probe, and that order is
+    /// load-bearing rather than an optimisation: the mode exists for a host
+    /// with no usable bubblewrap, so probing first would spawn `bwrap` on
+    /// exactly the host the mode is for and report a failure the operator has
+    /// already consented to.
+    pub async fn resolve(shell: &crate::config::ShellSandboxConfig, grants: &Grants) -> Self {
+        if shell.is_unconfined() {
+            return Isolation::Unconfined;
+        }
+        Self::from_boundary(prove_boundary(grants).await)
+    }
+
+    /// The probe outcome, as the mode. A function of its own so that every cell
+    /// of the precedence table can be pinned on a host that passes — a host
+    /// without a working bubblewrap cannot exercise the `Ok` arm through
+    /// [`Self::resolve`], and a host with one cannot exercise the `Err` arm.
+    ///
+    /// The reason travels into the variant rather than being flattened: the
+    /// operator acts on the difference between "not installed" and "older than
+    /// the version that fixes the CVE".
+    fn from_boundary(boundary: Result<(), IsolationUnavailable>) -> Self {
+        match boundary {
+            Ok(()) => Isolation::Sandboxed,
+            Err(reason) => Isolation::Unavailable(reason),
+        }
+    }
+
+    /// Does Layer 1 have to park a shell task for approval?
+    ///
+    /// Only when the boundary is **absent**. `Unconfined` is the operator's
+    /// consent, so nothing is gated (spec §4) — and this is the whole of what
+    /// Task 7 needs from this type, which is why it is a method here rather
+    /// than a second read of the config key there.
+    ///
+    /// **Task 8 deletes this.** Once the gate carries a second term it `match`es
+    /// on the mode directly, so this predicate would have no production caller
+    /// left and would be a second representation of a decision that must have
+    /// exactly one.
+    pub fn needs_approval(&self) -> bool {
+        matches!(self, Isolation::Unavailable(_))
+    }
+}
+
+/// The version floor and the smoke probe, as **one** result.
+///
+/// This is `check_bwrap_version`'s only production caller: the floor is a
+/// precondition and the probe is what asserts the boundary the argv claims, so
+/// a binary that is installed but older than [`MIN_BWRAP`] refuses jobs here
+/// rather than at the first spawn. Both failures are
+/// [`IsolationUnavailable`], which is the same *kind* of outcome as "not
+/// installed" — there is no "present but insecure, carry on" state.
+async fn prove_boundary(grants: &Grants) -> Result<(), IsolationUnavailable> {
+    check_bwrap_version()?;
+    probe(grants).await
+}
+
 /// Locate `bwrap` on `PATH` and confirm it is a version we may rely on.
 ///
 /// An older version is reported as [`IsolationUnavailable::VersionTooOld`] —
@@ -414,6 +510,85 @@ fn push_ro_bind_if_present(a: &mut Vec<String>, root: &Path, path: &str) {
     }
 }
 
+/// A job's sandbox directory: where it is, and a descriptor for it.
+///
+/// The path is for naming the directory — logs, the workspace record, the
+/// `--chdir` inside the sandbox. The descriptor is what the argv binds, because
+/// bubblewrap re-resolves a path and cannot re-resolve a descriptor. Only
+/// [`resolve_job_dir`] constructs one, so a path that has not been through the
+/// checks cannot reach [`build_argv`].
+///
+/// Measured on bubblewrap 0.12.0, with `<root>/<task-id>` renamed away and a
+/// symlink to a second directory left in its place **after** this value was
+/// built:
+///
+/// ```text
+/// path-based bind (symlink swapped in):  out='WRONG-TARGET'
+/// fd-based bind  (descriptor held):      out='bound-by-inode'
+/// ```
+///
+/// The path is re-resolved by a different process at a different time; the
+/// descriptor names the inode this function checked.
+///
+/// `Debug` is derived because `unwrap_err()` on a `Result<JobDir, _>` needs it
+/// — and because the path and the descriptor number are exactly what a reader
+/// of a failing test wants to see.
+#[derive(Debug)]
+pub struct JobDir {
+    path: PathBuf,
+    fd: OwnedFd,
+}
+
+impl JobDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A duplicate of the descriptor with `FD_CLOEXEC` **cleared**, so the child
+    /// inherits exactly this one. `try_clone` dups with `F_DUPFD_CLOEXEC`, so the
+    /// duplicate is close-on-exec until this clears it; the original keeps the
+    /// flag and is closed when `JobDir` drops. Bind the result to a name that
+    /// outlives the `spawn` call — a dropped descriptor is a closed one.
+    ///
+    /// Clearing the flag on the duplicate and never on the original is the whole
+    /// of this method. Cleared on the original, the descriptor would be inherited
+    /// by **every** later `exec` in this process, including the probe's own
+    /// `bwrap` invocations and every other job's child.
+    pub fn inheritable_fd(&self) -> anyhow::Result<OwnedFd> {
+        let dup = self.fd.try_clone()?;
+        // SAFETY: `dup` is an open descriptor owned by `dup` for the call.
+        if unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+            anyhow::bail!(
+                "cannot make the job directory inheritable: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(dup)
+    }
+}
+
+/// The argv for a sandboxed run, **together with the descriptor it names**.
+///
+/// The two cannot be separated. `bwrap --bind-fd N` opens the descriptor when
+/// it starts, so a caller that dropped the duplicate before `spawn` would hand
+/// `bwrap` a number that is no longer open — and a bare `Vec<String>` is
+/// exactly the shape that lets that happen. Holding the descriptor here means
+/// the argv cannot exist without it, and dropping this value is the only way to
+/// close it.
+#[derive(Debug)]
+pub struct SandboxArgv {
+    argv: Vec<String>,
+    /// Held for its `Drop`, never read: the descriptor must still be open when
+    /// the child is spawned, and this value outlives that spawn.
+    _job_fd: OwnedFd,
+}
+
+impl SandboxArgv {
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+}
+
 /// Build the full bubblewrap argv. **Order is normative** — see the tests.
 ///
 /// `job_dir` must already have passed [`resolve_job_dir`].
@@ -421,8 +596,22 @@ fn push_ro_bind_if_present(a: &mut Vec<String>, root: &Path, path: &str) {
 /// `grants` is what the operator holds **now**: each write grant adds a
 /// read-write `--bind`, and the network grant adds `--share-net`. This is where
 /// authorization becomes a bind — there is nowhere else it can happen.
-pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String> {
-    let dir = job_dir.to_string_lossy().to_string();
+///
+/// The job directory itself is bound by **descriptor** (`--bind-fd`), not by
+/// path, and the difference is measured rather than theoretical — see
+/// [`JobDir`]. The path-based form re-resolves `<root>/<task-id>` when bubblewrap
+/// runs, so a symlink swapped in after [`resolve_job_dir`] returned makes
+/// bubblewrap mount a directory of the writer's choosing read-write as the job's
+/// sandbox. `--bind-fd` mounts the inode the descriptor names.
+///
+/// The **grants** keep their `--bind`: a grant is a host path the operator
+/// named, it is not what the job's own sandbox is built from, and it is already
+/// refused when it covers the root (Task 8 Step 3b).
+pub fn build_argv(job_dir: &JobDir, grants: &Grants, command: &str) -> anyhow::Result<SandboxArgv> {
+    let dir = job_dir.path().to_string_lossy().to_string();
+    // The duplicate the child inherits. Taken here, moved into the returned
+    // value, and therefore open for as long as the argv it belongs to.
+    let job_fd = job_dir.inheritable_fd()?;
     let mut a: Vec<String> = vec![
         "--unshare-all".into(),
         // Explicit: --unshare-all only does --unshare-user-try, which is
@@ -514,8 +703,11 @@ pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String>
         a.push("--share-net".into());
     }
     a.extend([
-        "--bind".into(),
-        dir.clone(),
+        // The job directory, by descriptor. The **destination** stays a path,
+        // and that is fine: it is created inside the sandbox namespace, by
+        // bubblewrap, and is never resolved on the host.
+        "--bind-fd".into(),
+        job_fd.as_raw_fd().to_string(),
         dir.clone(),
         "--chdir".into(),
         dir,
@@ -523,7 +715,10 @@ pub fn build_argv(job_dir: &Path, grants: &Grants, command: &str) -> Vec<String>
         "-c".into(),
         command.to_string(),
     ]);
-    a
+    Ok(SandboxArgv {
+        argv: a,
+        _job_fd: job_fd,
+    })
 }
 
 /// Bound on one probe invocation, in seconds.
@@ -592,10 +787,11 @@ pub async fn probe_at(
     grants: &Grants,
     scratch: &Path,
 ) -> Result<(), IsolationUnavailable> {
-    let job_dir = scratch.join("job");
-    std::fs::create_dir_all(&job_dir).map_err(|e| smoke("the scratch job directory", e))?;
-    let job_dir =
-        std::fs::canonicalize(&job_dir).map_err(|e| smoke("the scratch job directory", e))?;
+    // The probe's job directory goes through the **same** resolution a real job
+    // does, descriptor included: the argv binds it by descriptor, so a probe
+    // that built its own path would not be exercising the code production runs.
+    let job_dir = resolve_job_dir(scratch, "probe-task", "probe-job")
+        .map_err(|e| smoke("the scratch job directory", e))?;
     // The probe's own cwd, deliberately OUTSIDE the job directory — and pinned
     // to `/`, which is **present** inside the sandbox.
     //
@@ -640,7 +836,7 @@ pub async fn probe_at(
     .await?;
     verdict_base(
         &out,
-        &job_dir.to_string_lossy(),
+        &job_dir.path().to_string_lossy(),
         Path::new(SMOKE_CA_BUNDLE).exists(),
     )?;
 
@@ -967,15 +1163,18 @@ fn verdict_loopback(
 /// an assertion failure is.
 async fn run_in_sandbox(
     bwrap: &Path,
-    job_dir: &Path,
+    job_dir: &JobDir,
     grants: &Grants,
     command: &str,
     cwd: &Path,
     step: &str,
 ) -> Result<std::process::Output, IsolationUnavailable> {
-    let argv = build_argv(job_dir, grants, command);
+    // `built` owns the descriptor the argv names, and it is alive here past the
+    // `spawn` below — which is the whole reason it is one value rather than a
+    // list of strings.
+    let built = build_argv(job_dir, grants, command).map_err(|e| smoke(step, e))?;
     let mut cmd = tokio::process::Command::new(bwrap);
-    cmd.args(&argv)
+    cmd.args(built.argv())
         // The probe's own cwd: `--chdir` is what puts the sandbox in the job
         // directory, and inheriting this one is exactly the silent pass the
         // cwd check exists to catch.
@@ -1304,7 +1503,9 @@ const HOME_MARKERS: [&str; 2] = ["haos-green.db", "web-auth.toml"];
 ///
 /// The returned path is canonical, is a strict descendant of `root` — never
 /// equal to it — and is exactly `<root>/<task-id>/<job-id>`, so a job can never
-/// write at the root itself and two ids can never share one directory.
+/// write at the root itself and two ids can never share one directory. The
+/// descriptor that travels with it names that same directory, and it is what
+/// the argv binds: see [`JobDir`].
 ///
 /// Order matters as much as the checks do. The ids are validated before any
 /// filesystem call; each level is created relative to the descriptor of the
@@ -1328,17 +1529,19 @@ const HOME_MARKERS: [&str; 2] = ["haos-green.db", "web-auth.toml"];
 ///   below is then created inside it. That directory is one the writer could
 ///   already write to — moving it requires write access to both ends — so no
 ///   privilege is gained, and the containment check still refuses the result;
-/// - the writer swaps a level after this returns but before bubblewrap opens the
-///   path in the argv. That window is not this function's to close: the returned
-///   `PathBuf` is not what gets mounted, bubblewrap resolves it again when it
-///   runs. Closing it belongs to the argv and grant layer, not here.
+/// - the writer swaps a level after this returns. The path it returns then
+///   resolves elsewhere, but the path is not what gets mounted: [`build_argv`]
+///   binds the descriptor this value carries, so the sandbox is still the
+///   directory this function checked. (Measured on bubblewrap 0.12.0: with the
+///   swap in place, `--bind <path>` mounted the symlink's target while
+///   `--bind-fd <fd>` mounted the original inode.)
 ///
 /// Both need a local writer with write access to the sandbox root. That is not
 /// free: `/allow <root>` is grantable, and the default root is the same
 /// directory the chat agent's shell tool uses as its working directory, so the
 /// precondition is recorded in the spec — **no write grant may cover the sandbox
 /// root** — rather than assumed here.
-pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<PathBuf> {
+pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Result<JobDir> {
     let task_id = one_component(task_id, "task id")?;
     let job_id = one_component(job_id, "job id")?;
 
@@ -1367,8 +1570,15 @@ pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Resu
     }
     let root_fd = open_dir(&root)?;
     let (task_dir, task_fd) = create_within(&root_fd, &root, &root.join(task_id), task_id)?;
-    let (job_dir, _job_fd) = create_within(&task_fd, &root, &task_dir.join(job_id), job_id)?;
-    Ok(job_dir)
+    let (job_dir, job_fd) = create_within(&task_fd, &root, &task_dir.join(job_id), job_id)?;
+    // The job level's descriptor is the one that matters and the one this value
+    // carries: it is what `--bind-fd` binds. The root and task descriptors are
+    // dropped here, and they are `O_CLOEXEC` besides, so neither can reach a
+    // child.
+    Ok(JobDir {
+        path: job_dir,
+        fd: job_fd,
+    })
 }
 
 #[cfg(test)]
@@ -1396,6 +1606,60 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         (dir, path)
+    }
+
+    /// Serializes the tests that install a stub `bwrap` on `PATH`.
+    ///
+    /// `PATH` is process-global and libtest runs these tests on many threads, so
+    /// without this one test's stub could answer another test's `bwrap` lookup.
+    /// Only [`PathOnly`] takes it, and the rule it enforces is worth stating:
+    /// **no test may assert a *successful* probe through `PATH`**. Every other
+    /// test in this module either names its binary explicitly
+    /// (`check_bwrap_version_at`, `probe_at`) or asserts only that the mode is
+    /// not `Unconfined`, which holds whichever binary answers.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `PATH` with one directory **prepended**, with [`PATH_LOCK`] held, restored
+    /// on drop — including when the test panics, or one failing test would leave
+    /// every later `bwrap` lookup in this binary pointing at a stub.
+    struct PathOnly {
+        saved: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PathOnly {
+        fn new(dir: &Path) -> Self {
+            // A poisoned lock means another test panicked while holding it; the
+            // guard is still what serializes this, so take it back rather than
+            // cascading the failure.
+            let lock = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = std::env::var_os("PATH");
+            // Prepended, **not** substituted, and the difference is measured:
+            // every other stub in this module is a shell script that calls the
+            // real `sleep`, `head` and `tr`, and a `PATH` of just the stub
+            // directory hides all three from them. A mutation round that
+            // replaced `PATH` wholesale failed eight of eleven mutants on tests
+            // that had nothing to do with the mutation —
+            // `a_hung_probe_is_refused_instead_of_waited_on` with
+            // `exec: sleep: não encontrado`. Prepending still wins the `bwrap`
+            // lookup, because `PATH` is searched left to right.
+            let mut path = std::ffi::OsString::from(dir);
+            if let Some(existing) = &saved {
+                path.push(":");
+                path.push(existing);
+            }
+            std::env::set_var("PATH", path);
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for PathOnly {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
     }
 
     #[test]
@@ -1457,6 +1721,146 @@ mod tests {
         let (_dir, bin) = stub_bwrap_reporting("bubblewrap 0.12.0");
         let r = check_bwrap_version_at(&bin);
         assert!(r.is_ok(), "0.12.0 must pass, got {r:?}");
+    }
+
+    // --- the startup decision (`[supervisor.shell].sandbox`) ----------------
+    //
+    // The precedence table, cell by cell. `Isolation::resolve` is the one
+    // reader of the config key; `from_boundary` is the probe half of it, split
+    // out so that the failing-probe cells are reachable on a host whose
+    // bubblewrap works (and the passing cell on one whose bubblewrap does not).
+
+    /// The probe outcome, both ways, with the reason carried through. A
+    /// flattened "unavailable" would send an operator after the wrong problem:
+    /// "not installed" is a package to install, "older than 0.12.0" is a
+    /// package to upgrade, and a failed smoke step is a host to investigate.
+    #[test]
+    fn the_probe_result_decides_between_sandboxed_and_unavailable() {
+        assert_eq!(Isolation::from_boundary(Ok(())), Isolation::Sandboxed);
+        for reason in [
+            IsolationUnavailable::NotInstalled,
+            IsolationUnavailable::VersionUnreadable("no output".into()),
+            IsolationUnavailable::VersionTooOld((0, 11, 9)),
+            IsolationUnavailable::SmokeTestFailed("HTTPS works: curl did not run".into()),
+        ] {
+            assert_eq!(
+                Isolation::from_boundary(Err(reason.clone())),
+                Isolation::Unavailable(reason.clone()),
+                "the reason must survive into the mode: {reason:?}"
+            );
+        }
+    }
+
+    /// The consenting half of the table, and the fail-closed half for a value
+    /// `Config::load` would already have refused.
+    ///
+    /// `is_unconfined()` is an equality against the literal `"none"`, so a
+    /// value that is neither mode takes the **proving** branch. This asserts
+    /// that from the outside, because the two branches are not interchangeable:
+    /// reading `"chroot"` as consent would run a shell job with no boundary
+    /// because of a typo.
+    #[tokio::test]
+    async fn only_the_literal_none_is_consent_and_an_unknown_value_is_proved() {
+        let grants = Grants::default();
+        for value in ["chroot", "None", "none ", "", "bwrap "] {
+            let cfg = crate::config::ShellSandboxConfig {
+                sandbox: value.into(),
+            };
+            let got = Isolation::resolve(&cfg, &grants).await;
+            assert!(
+                !matches!(got, Isolation::Unconfined),
+                "{value:?} must never resolve to the unconfined mode, got {got:?}"
+            );
+        }
+        assert_eq!(
+            Isolation::resolve(
+                &crate::config::ShellSandboxConfig {
+                    sandbox: "none".into()
+                },
+                &grants
+            )
+            .await,
+            Isolation::Unconfined,
+            "the literal is consent"
+        );
+    }
+
+    /// `resolve` must reach **both** production steps, not route around them.
+    /// These two tests are that, and they are the only ones that can be: the
+    /// floor and the probe both resolve `bwrap` from `PATH`, and a host with a
+    /// working bubblewrap cannot make either fail on its own.
+    ///
+    /// They install a stub `bwrap` on `PATH`, so they are also the only tests in
+    /// this module that mutate process-global state — see [`PATH_LOCK`].
+    ///
+    /// A floor that is not enforced here is the CVE the floor exists for:
+    /// `bwrap` 0.11.9 answers the version question with its own version, so a
+    /// `resolve` that skipped the check would go on to probe it, fail on the
+    /// transcript, and report a **smoke-test** failure — which the assertion
+    /// below separates from the `VersionTooOld` this must be. It is the
+    /// difference between "install bubblewrap" and "upgrade bubblewrap", which
+    /// is the whole reason the variant carries the version.
+    #[tokio::test]
+    async fn the_version_floor_is_enforced_by_resolve_and_not_only_by_its_own_test() {
+        let (_dir, stub) = stub_bwrap_reporting("bubblewrap 0.11.9");
+        let _path = PathOnly::new(stub.parent().unwrap());
+
+        let got = Isolation::resolve(
+            &crate::config::ShellSandboxConfig::default(),
+            &Grants::default(),
+        )
+        .await;
+        assert_eq!(
+            got,
+            Isolation::Unavailable(IsolationUnavailable::VersionTooOld((0, 11, 9))),
+            "a bwrap older than the floor must be refused as VersionTooOld before the \
+             probe runs, not reported as a smoke-test failure"
+        );
+    }
+
+    /// ... and the probe is reached too. The stub answers `--version` with a
+    /// version that satisfies the floor and fails at everything else, so a
+    /// `resolve` that stopped after the version check would return `Sandboxed`
+    /// here — a boundary asserted by nothing but a version string.
+    #[tokio::test]
+    async fn a_failing_probe_refuses_the_mode_rather_than_asserting_the_boundary() {
+        let (_dir, stub) = stub_bwrap_running(
+            "for a in \"$@\"; do\n\
+               if [ \"$a\" = \"--version\" ]; then echo 'bubblewrap 0.12.0'; exit 0; fi\n\
+             done\n\
+             echo 'bwrap: No permissions to creating new namespace' >&2\n\
+             exit 1",
+        );
+        let _path = PathOnly::new(stub.parent().unwrap());
+
+        let got = Isolation::resolve(
+            &crate::config::ShellSandboxConfig::default(),
+            &Grants::default(),
+        )
+        .await;
+        assert!(
+            matches!(
+                got,
+                Isolation::Unavailable(IsolationUnavailable::SmokeTestFailed(_))
+            ),
+            "a bwrap that passes the floor and fails the smoke test must refuse the \
+             mode, got {got:?}"
+        );
+    }
+
+    /// Layer 1's only question, pinned for all three modes. `Unconfined` is the
+    /// operator's consent, so nothing is gated (spec §4) — parking their shell
+    /// tasks anyway would be the same operator loop the refusal message opens,
+    /// one layer up.
+    #[test]
+    fn needs_approval_is_true_only_when_the_boundary_is_absent() {
+        assert!(!Isolation::Sandboxed.needs_approval());
+        assert!(!Isolation::Unconfined.needs_approval());
+        assert!(Isolation::Unavailable(IsolationUnavailable::NotInstalled).needs_approval());
+        assert!(
+            Isolation::default().needs_approval(),
+            "the default fails closed"
+        );
     }
 
     #[test]
@@ -1786,9 +2190,31 @@ mod tests {
         );
     }
 
+    /// A real, resolved job directory in a fresh temporary root.
+    ///
+    /// [`build_argv`] takes a [`JobDir`] rather than a path because the argv
+    /// binds the job directory by **descriptor**, and only [`resolve_job_dir`]
+    /// may build one — so the argv tests go through the same door production
+    /// does. The `TempDir` is returned because it owns the root the descriptor
+    /// names.
+    fn test_job_dir() -> (tempfile::TempDir, JobDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let jd = resolve_job_dir(dir.path(), "task-1", "job-1").unwrap();
+        (dir, jd)
+    }
+
+    /// The production argv for a job in a fresh root. The `TempDir` is returned
+    /// with it so the root outlives the descriptor the argv names.
+    fn argv_of(grants: &Grants, command: &str) -> (tempfile::TempDir, SandboxArgv) {
+        let (dir, jd) = test_job_dir();
+        let built = build_argv(&jd, grants, command).unwrap();
+        (dir, built)
+    }
+
     #[test]
     fn argv_unshares_and_hardens_namespaces() {
-        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let (_dir, built) = argv_of(&Grants::default(), "echo hi");
+        let a = built.argv();
         assert!(a.contains(&"--unshare-all".to_string()));
         // --unshare-all is only --unshare-user-try: it is silently skipped when
         // the user namespace cannot be created, so it must be named explicitly.
@@ -1806,14 +2232,16 @@ mod tests {
 
     #[test]
     fn argv_detaches_the_terminal_and_dies_with_the_parent() {
-        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let (_dir, built) = argv_of(&Grants::default(), "echo hi");
+        let a = built.argv();
         assert!(a.contains(&"--new-session".to_string()), "TIOCSTI");
         assert!(a.contains(&"--die-with-parent".to_string()));
     }
 
     #[test]
     fn clearenv_comes_before_every_setenv() {
-        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let (_dir, built) = argv_of(&Grants::default(), "echo hi");
+        let a = built.argv();
         let clear = a.iter().position(|x| x == "--clearenv").unwrap();
         let setenvs: Vec<usize> = a
             .iter()
@@ -1832,7 +2260,8 @@ mod tests {
 
     #[test]
     fn argv_links_the_dynamic_loader_paths() {
-        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let (_dir, built) = argv_of(&Grants::default(), "echo hi");
+        let a = built.argv();
         // Omitting /lib64 makes execvp fail with "No such file or directory".
         for link in ["/bin", "/lib", "/lib64"] {
             assert!(
@@ -1859,7 +2288,8 @@ mod tests {
 
     #[test]
     fn argv_isolates_the_hostname() {
-        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let (_dir, built) = argv_of(&Grants::default(), "echo hi");
+        let a = built.argv();
         let i = a.iter().position(|x| x == "--hostname").unwrap();
         assert_eq!(a[i + 1], "haos-sandbox");
     }
@@ -1873,11 +2303,131 @@ mod tests {
     /// unnoticed.
     #[test]
     fn argv_pins_the_job_directory_as_the_working_directory() {
-        let a = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "echo hi");
+        let (_dir, jd) = test_job_dir();
+        let built = build_argv(&jd, &Grants::default(), "echo hi").unwrap();
+        let a = built.argv();
+        let dir = jd.path().to_string_lossy().to_string();
         let i = a.iter().position(|x| x == "--chdir").unwrap();
-        assert_eq!(a[i + 1], "/jobs/t/j");
+        assert_eq!(a[i + 1], dir);
         // Immediately before the command, so a later flag cannot re-point it.
         assert_eq!(a[i + 2], "/bin/sh");
+        // And HOME is the same directory, which is what makes bwrap's fallback
+        // for a missing `--chdir` land in the job directory (see the probe's
+        // cwd check).
+        let h = a.iter().position(|x| x == "--setenv").unwrap();
+        assert_eq!(a[h + 1], "HOME");
+        assert_eq!(a[h + 2], dir);
+    }
+
+    /// The job directory is bound by **descriptor**, not by path.
+    ///
+    /// Measured on bubblewrap 0.12.0, with `<root>/<task-id>` renamed away and a
+    /// symlink to a second directory left in its place *after* the descriptor
+    /// was taken:
+    ///
+    /// ```text
+    /// path-based bind (symlink swapped in):  out='WRONG-TARGET'
+    /// fd-based bind  (descriptor held):      out='bound-by-inode'
+    /// ```
+    ///
+    /// `--bind` re-resolves the path when bubblewrap runs, so the writer wins;
+    /// `--bind-fd` mounts the inode the descriptor names. The path is still in
+    /// the argv for `HOME` and `--chdir` — those are names *inside* the
+    /// sandbox, not host resolutions — so this test pins both: the bind is by
+    /// descriptor, and no `--bind` of the job directory survives beside it.
+    #[test]
+    fn the_job_directory_is_bound_by_descriptor_not_by_path() {
+        let (_dir, jd) = test_job_dir();
+        let built = build_argv(&jd, &Grants::default(), "x").unwrap();
+        let a = built.argv();
+        let dir = jd.path().to_string_lossy().to_string();
+
+        let at = a
+            .iter()
+            .position(|x| x == "--bind-fd")
+            .unwrap_or_else(|| panic!("the job directory must be bound by descriptor: {a:?}"));
+        // The number is a *live* descriptor, and it is the duplicate the argv
+        // value is holding open — not a constant, and not the original, which
+        // is close-on-exec and therefore closed by the time bubblewrap runs.
+        let named: i32 = a[at + 1].parse().expect("--bind-fd takes a number");
+        // SAFETY: `named` is only ever a descriptor this process holds; a wrong
+        // number reports `EBADF` rather than doing anything.
+        let flags = unsafe { libc::fcntl(named, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "the descriptor the argv names is not open: F_GETFD = {flags}, errno {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the descriptor the argv names is close-on-exec, so bubblewrap would \
+             not inherit it"
+        );
+        assert_eq!(a[at + 2], dir, "the bind destination is the job directory");
+        assert!(
+            !a.windows(3).any(|w| w[0] == "--bind" && w[1] == dir),
+            "a path-based bind of the job directory re-resolves the path, which is \
+             the race the descriptor closes: {a:?}"
+        );
+    }
+
+    /// The end-to-end version of the test above, on the argv **and** the spawn:
+    /// the descriptor the argv names must be open in the child, naming the job
+    /// directory, or `--bind-fd` binds nothing.
+    ///
+    /// A stub `bwrap` is enough — it reads `--bind-fd N` out of its own argv and
+    /// `readlink`s that descriptor — and it is the same `run_in_sandbox` the
+    /// probe uses, so the argv, the duplicate and the spawn are all the
+    /// production ones. No real sandbox is needed, and none is assumed: this
+    /// runs on a host without bubblewrap.
+    ///
+    /// It is what catches the obvious mistake this design invites — naming
+    /// `JobDir`'s **original** descriptor, which is close-on-exec, instead of
+    /// the duplicate. That mutant passes the string-level test above and fails
+    /// here with an empty `readlink`.
+    #[tokio::test]
+    async fn the_argv_hands_the_child_a_live_descriptor_for_the_job_directory() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (_dir, bin) = stub_bwrap_running(
+            "fd=\"\"\n\
+             prev=\"\"\n\
+             for a in \"$@\"; do\n\
+               if [ \"$prev\" = \"--bind-fd\" ]; then fd=\"$a\"; fi\n\
+               prev=\"$a\"\n\
+             done\n\
+             if [ -z \"$fd\" ]; then echo 'no --bind-fd in the argv' >&2; exit 1; fi\n\
+             if ! readlink /proc/self/fd/\"$fd\"; then\n\
+               echo \"the argv named descriptor $fd, which the child does not have\" >&2\n\
+               exit 1\n\
+             fi",
+        );
+        let job_dir = resolve_job_dir(scratch.path(), "task-1", "job-1").unwrap();
+
+        let out = crate::supervisor::bounded(
+            "the descriptor check",
+            run_in_sandbox(
+                &bin,
+                &job_dir,
+                &Grants::default(),
+                "x",
+                scratch.path(),
+                "the descriptor check",
+            ),
+        )
+        .await
+        .expect("the stub cannot fail the step for any reason but the descriptor");
+
+        assert!(
+            out.status.success(),
+            "the child could not read the descriptor the argv named: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            job_dir.path().to_string_lossy(),
+            "the descriptor the argv names must be the job directory, open in the child"
+        );
     }
 
     #[test]
@@ -1887,8 +2437,12 @@ mod tests {
             write: Default::default(),
             network: true,
         };
-        assert!(!build_argv(Path::new("/j"), &none, "x").contains(&"--share-net".to_string()));
-        let a = build_argv(Path::new("/j"), &net, "x");
+        assert!(!argv_of(&none, "x")
+            .1
+            .argv()
+            .contains(&"--share-net".to_string()));
+        let (_dir, built) = argv_of(&net, "x");
+        let a = built.argv();
         assert!(a.contains(&"--share-net".to_string()));
         // Presence is not enough: order is load-bearing. `--share-net` before
         // `--unshare-all` is re-unshared by it, so the grant becomes a silent
@@ -1935,7 +2489,8 @@ mod tests {
             write: [PathBuf::from("/var/lib"), PathBuf::from("/etc/ssl/certs")].into(),
             network: false,
         };
-        let a = build_argv(Path::new("/jobs/t/j"), &g, "x");
+        let (_dir, built) = argv_of(&g, "x");
+        let a = built.argv();
         for granted in ["/var/lib", "/etc/ssl/certs"] {
             assert!(
                 a.windows(3)
@@ -1966,7 +2521,8 @@ mod tests {
             );
         }
         // And nothing is bound read-write without a grant.
-        let none = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
+        let (_dir, built) = argv_of(&Grants::default(), "x");
+        let none = built.argv();
         assert!(
             !none
                 .windows(3)
@@ -1995,7 +2551,8 @@ mod tests {
             );
         }
         // And the production argv carries them on this host, where both exist.
-        let full = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
+        let (_dir, built) = argv_of(&Grants::default(), "x");
+        let full = built.argv();
         for p in ["/etc/ssl/certs", "/etc/ca-certificates"] {
             if Path::new(p).exists() {
                 assert!(
@@ -2025,17 +2582,15 @@ mod tests {
             "a path that does not exist is skipped, never bound: {a:?}"
         );
         // And the argv it feeds is still complete.
-        let full = build_argv(Path::new("/jobs/t/j"), &Grants::default(), "x");
+        let (_dir, built) = argv_of(&Grants::default(), "x");
+        let full = built.argv();
         assert_eq!(full[full.len() - 3..], ["/bin/sh", "-c", "x"]);
     }
 
     #[test]
     fn the_command_is_last_and_passed_verbatim() {
-        let a = build_argv(
-            Path::new("/jobs/t/j"),
-            &Grants::default(),
-            "run x; cat /etc/hostname",
-        );
+        let (_dir, built) = argv_of(&Grants::default(), "run x; cat /etc/hostname");
+        let a = built.argv();
         assert_eq!(
             a[a.len() - 3..],
             ["/bin/sh", "-c", "run x; cat /etc/hostname"]
@@ -2100,7 +2655,14 @@ mod tests {
         let (_dir, bin) = stub_bwrap_recording_cwd(&record);
         let _ = probe_at(&bin, &Grants::default(), scratch.path()).await;
         let seen = std::fs::read_to_string(&record).unwrap();
-        let job_dir = std::fs::canonicalize(scratch.path().join("job")).unwrap();
+        // The probe's job directory is the one `probe_at` resolves — the same
+        // two-level layout a real job gets, because it goes through
+        // `resolve_job_dir` like a real job does.
+        let job_dir = std::fs::canonicalize(scratch.path().join("probe-task/probe-job")).unwrap();
+        assert!(
+            job_dir.is_dir(),
+            "the probe's job directory was not created"
+        );
         assert_eq!(
             Path::new(seen.trim()),
             Path::new("/"),
@@ -2443,6 +3005,7 @@ exit 0"#,
     #[tokio::test]
     async fn a_chatty_sandbox_is_captured_without_growing() {
         let scratch = tempfile::tempdir().unwrap();
+        let job_dir = resolve_job_dir(scratch.path(), "task-1", "job-1").unwrap();
         // ~1 MB per stream: past `MAX_PROBE_TEXT` by three orders of magnitude,
         // and past a 64 KiB pipe buffer, so both halves of the discipline are
         // exercised by one invocation.
@@ -2457,7 +3020,7 @@ exit 0"#,
         );
         let out = run_in_sandbox(
             &bin,
-            scratch.path(),
+            &job_dir,
             &Grants::default(),
             "x",
             scratch.path(),
@@ -2584,9 +3147,9 @@ exit 0"#,
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("config.toml"), "[package]\nname = \"thing\"\n").unwrap();
         let got = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
-        assert!(got.is_dir());
+        assert!(got.path().is_dir());
         assert_eq!(
-            got,
+            got.path(),
             std::fs::canonicalize(&ws)
                 .unwrap()
                 .join("task-1")
@@ -2633,10 +3196,10 @@ exit 0"#,
         let ws = home.path().join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
         let got = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
-        assert!(got.is_dir());
-        assert!(got.starts_with(std::fs::canonicalize(&ws).unwrap()));
+        assert!(got.path().is_dir());
+        assert!(got.path().starts_with(std::fs::canonicalize(&ws).unwrap()));
         assert_ne!(
-            got,
+            got.path(),
             std::fs::canonicalize(&ws).unwrap(),
             "never the root itself"
         );
@@ -2645,7 +3208,7 @@ exit 0"#,
         // dropped the job id — and then two jobs of one task would share a
         // directory, which is the thing per-job directories exist to prevent.
         assert_eq!(
-            got,
+            got.path(),
             std::fs::canonicalize(&ws)
                 .unwrap()
                 .join("task-1")
@@ -2888,18 +3451,18 @@ exit 0"#,
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(tasks, vec![OsStr::new("task-1")], "the task level");
-        let jobs: Vec<_> = std::fs::read_dir(&got)
+        let jobs: Vec<_> = std::fs::read_dir(got.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert!(jobs.is_empty(), "the job directory starts empty: {jobs:?}");
         assert_eq!(
-            got.file_name().unwrap(),
+            got.path().file_name().unwrap(),
             OsStr::new("job-1"),
             "the job level must be named exactly the id: {got:?}"
         );
         assert_eq!(
-            got.parent().unwrap().file_name().unwrap(),
+            got.path().parent().unwrap().file_name().unwrap(),
             OsStr::new("task-1"),
             "the task level must be named exactly the id: {got:?}"
         );
@@ -2913,7 +3476,7 @@ exit 0"#,
         let ws = home.path().join("nested/workspace");
         let got = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
         assert_eq!(
-            got,
+            got.path(),
             std::fs::canonicalize(&ws)
                 .unwrap()
                 .join("task-1")
@@ -2929,8 +3492,8 @@ exit 0"#,
         let ws = home.path().join("workspace");
         let first = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
         let second = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
-        assert_eq!(first, second);
-        assert!(second.is_dir());
+        assert_eq!(first.path(), second.path());
+        assert!(second.path().is_dir());
     }
 
     /// A root that exists but is not a directory, and one that is a symlink to
@@ -3283,7 +3846,7 @@ exit 0"#,
 
         let got = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
         assert!(
-            got.ends_with("task-1/job-1"),
+            got.path().ends_with("task-1/job-1"),
             "a writable-but-unreadable root is usable: {got:?}"
         );
     }
@@ -3338,6 +3901,91 @@ exit 0"#,
         assert!(
             fd_flags & libc::FD_CLOEXEC != 0,
             "{what} would be inherited by the sandboxed child: F_GETFD = {fd_flags}"
+        );
+    }
+
+    /// The descriptor [`JobDir`] carries names the directory its path names.
+    ///
+    /// Without this the two could drift — a descriptor for the task level, or
+    /// for a level opened before the last `mkdirat` — and `--bind-fd` would
+    /// mount the wrong directory while every string in the argv still looked
+    /// right.
+    #[test]
+    fn the_job_directory_descriptor_names_the_directory_the_path_names() {
+        let (_root, jd) = test_job_dir();
+        assert!(jd.path().is_dir(), "the path is the directory");
+        // `readlink` on the `/proc` entry names the inode the descriptor holds,
+        // which is the property `--bind-fd` acts on.
+        let via_fd = std::fs::read_link(format!("/proc/self/fd/{}", jd.fd.as_raw_fd()))
+            .expect("the descriptor must be readable through /proc/self/fd");
+        assert_eq!(
+            via_fd,
+            jd.path(),
+            "the descriptor and the path must name one directory"
+        );
+    }
+
+    /// `inheritable_fd` clears `FD_CLOEXEC` on the **duplicate only**, and the
+    /// child really does inherit it.
+    ///
+    /// Both halves are load-bearing and they pull in opposite directions:
+    ///
+    /// - cleared on the **original**, the descriptor is inherited by every later
+    ///   `exec` in this process — the probe's `bwrap` invocations, every other
+    ///   job's child — which is a handle into the sandbox root held by processes
+    ///   that have no business holding one;
+    /// - left set on the **duplicate**, the child never sees it and
+    ///   `bwrap --bind-fd` fails with a descriptor that is not open.
+    ///
+    /// The `readlink` is what makes the second half real rather than a flag
+    /// check: it is a child process, spawned the way production spawns one,
+    /// naming the directory through the descriptor it was handed.
+    #[tokio::test]
+    async fn the_inheritable_duplicate_reaches_the_child_and_the_original_stays_cloexec() {
+        let (_root, jd) = test_job_dir();
+        let dup = jd.inheritable_fd().unwrap();
+        // SAFETY: both descriptors are open for the duration of the call.
+        let fd_flags = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+
+        let original = fd_flags(jd.fd.as_raw_fd());
+        assert!(original >= 0, "the original descriptor is not open");
+        assert_ne!(
+            dup.as_raw_fd(),
+            jd.fd.as_raw_fd(),
+            "the duplicate must be a second descriptor, not the original"
+        );
+        assert_eq!(
+            original & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "the original must stay close-on-exec, or every later exec in this \
+             process inherits a handle into the sandbox root"
+        );
+        let duplicated = fd_flags(dup.as_raw_fd());
+        assert!(duplicated >= 0, "the duplicate is not open");
+        assert_eq!(
+            duplicated & libc::FD_CLOEXEC,
+            0,
+            "the duplicate must be inheritable, or the child cannot see it at all"
+        );
+
+        let out = crate::supervisor::bounded(
+            "the descriptor-inheritance check",
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("readlink /proc/self/fd/{}", dup.as_raw_fd()))
+                .output(),
+        )
+        .await
+        .expect("the child must run");
+        assert!(
+            out.status.success(),
+            "readlink failed in the child: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            jd.path().to_string_lossy(),
+            "the child must inherit exactly this descriptor, naming the job directory"
         );
     }
 
