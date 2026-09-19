@@ -1062,24 +1062,61 @@ fn one_component<'a>(id: &'a str, what: &str) -> anyhow::Result<&'a OsStr> {
     }
 }
 
+/// Which containment clause refused a resolved path.
+///
+/// A value, not only prose, because the three clauses are not interchangeable:
+/// a test that matches on the message cannot tell "this is outside the root"
+/// from "this is not what the path names", and a future relaxation of one clause
+/// would then look like containment still working. `containment_is_decided_by_
+/// path_components_not_by_text` asserts the clause.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The path resolved to the root itself, which is not below the root.
+    IsTheRoot,
+    /// The path resolved outside the root.
+    OutsideRoot,
+    /// The path resolved to something other than what it names — a symlink.
+    NotItself,
+}
+
+impl Refusal {
+    /// The operator-facing wording. Every path in it is `{:?}`: `dir` is built
+    /// from caller-supplied ids and `root` from operator config, and
+    /// `Path::display()` does not escape control characters.
+    fn message(&self, root: &Path, dir: &Path, real: &Path) -> anyhow::Error {
+        match self {
+            Self::IsTheRoot => anyhow::anyhow!(
+                "the sandbox path {real:?} is the sandbox root itself, not below it"
+            ),
+            Self::OutsideRoot => anyhow::anyhow!(
+                "the sandbox path {real:?} resolved outside the sandbox root {root:?}"
+            ),
+            Self::NotItself => anyhow::anyhow!(
+                "the sandbox path {dir:?} resolves to {real:?} rather than to itself; \
+                 a symlink here would let two jobs share one sandbox"
+            ),
+        }
+    }
+}
+
 /// The refusal for a level that resolved to `real`, or `None` when `real` is an
 /// acceptable resolution of `dir`: strictly below `root`, and `dir` itself.
 ///
 /// One function rather than a check at each site, so that a mutation removing a
-/// clause is not masked by the same clause surviving in a second copy.
-fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<anyhow::Error> {
-    // Three distinct refusals, because one message for all of them reads wrong:
-    // a path that *is* the root, reported as "outside" it, sends a reader
-    // looking for a traversal that never happened.
+/// clause is not masked by the same clause surviving in a second copy. Three
+/// distinct refusals, because one message for all of them reads wrong: a path
+/// that *is* the root, reported as "outside" it, sends a reader looking for a
+/// traversal that never happened.
+///
+/// Containment is `Path::starts_with`, which compares **components**. Comparing
+/// the two paths as strings passes every test here except the sibling one:
+/// `/…/ws-evil` starts with `/…/ws` as text and is outside it as a path.
+fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<Refusal> {
     if real == root {
-        return Some(anyhow::anyhow!(
-            "the sandbox path {real:?} is the sandbox root itself, not below it"
-        ));
+        return Some(Refusal::IsTheRoot);
     }
     if !real.starts_with(root) {
-        return Some(anyhow::anyhow!(
-            "the sandbox path {real:?} resolved outside the sandbox root {root:?}"
-        ));
+        return Some(Refusal::OutsideRoot);
     }
     // An in-root symlink passes both checks above — it resolves to a directory
     // inside the root — and still breaks the layout the spec makes normative:
@@ -1089,10 +1126,7 @@ fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<anyhow::E
     // `<task-id>/<job-id>` lexically, and a path that does not canonicalise to
     // itself has a symlink at its last level.
     if real != dir {
-        return Some(anyhow::anyhow!(
-            "the sandbox path {dir:?} resolves to {real:?} rather than to itself; \
-             a symlink here would let two jobs share one sandbox"
-        ));
+        return Some(Refusal::NotItself);
     }
     None
 }
@@ -1104,15 +1138,22 @@ fn not_a_directory(root: &Path, dir: &Path, err: std::io::Error) -> anyhow::Erro
     // containment wording when containment is the reason it is refused.
     if let Ok(real) = std::fs::canonicalize(dir) {
         if let Some(refusal) = containment_refusal(root, dir, &real) {
-            return refusal;
+            return refusal.message(root, dir, &real);
         }
-        return anyhow::anyhow!("the sandbox path {dir:?} is not a directory");
+        // Only claim "not a directory" when that is what the kernel said. `EMFILE`
+        // or a umask that leaves the level created but unopenable says nothing
+        // about the entry's type — and the level exists by then, because
+        // `mkdirat` already succeeded, so "is not a directory" would send a
+        // reader looking for the wrong thing entirely.
+        if err.raw_os_error() == Some(libc::ENOTDIR) {
+            return anyhow::anyhow!("the sandbox path {dir:?} is not a directory");
+        }
     }
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.file_type().is_symlink() => {
             anyhow::anyhow!("the sandbox path {dir:?} is a symlink to a target that does not exist")
         }
-        _ => anyhow::anyhow!("cannot create {dir:?}: {err}"),
+        _ => anyhow::anyhow!("cannot open {dir:?} as a directory: {err}"),
     }
 }
 
@@ -1136,6 +1177,14 @@ fn root_not_usable(root: &Path, verb: &str, err: std::io::Error) -> anyhow::Erro
 
 /// Open `path` as a directory, without following a symlink at the last
 /// component.
+///
+/// `O_PATH`, not `O_RDONLY`: nothing here reads the directory's contents, only
+/// `mkdirat` and `openat` relative to it, and `O_PATH` needs no permission on
+/// the directory itself — only traversal of its parents. A root that is writable
+/// and traversable but not readable (mode 0333) is therefore usable, where a
+/// read-only open refused it with `Permission denied`. Verified: an `O_PATH`
+/// descriptor is a valid `dirfd` for both calls, and `O_DIRECTORY` still refuses
+/// a FIFO instead of blocking on it.
 fn open_dir(path: &Path) -> anyhow::Result<OwnedFd> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| anyhow::anyhow!("the path {path:?} contains a NUL byte"))?;
@@ -1144,7 +1193,7 @@ fn open_dir(path: &Path) -> anyhow::Result<OwnedFd> {
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1176,6 +1225,11 @@ fn mkdir_in(parent: &OwnedFd, name: &OsStr, dir: &Path) -> anyhow::Result<()> {
 }
 
 /// `openat(parent, name)` as a directory, refusing a symlink at this level.
+///
+/// `O_PATH` for the same reason as [`open_dir`], and it matters just as much
+/// here: `mkdirat` creates the level with `0o777 & !umask`, so a umask that
+/// strips the read bit produces a level this process may not read and may still
+/// write — and the next `mkdirat` needs write and traversal, not read.
 fn open_dir_in(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
     let c = CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -1184,7 +1238,7 @@ fn open_dir_in(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
         libc::openat(
             parent.as_raw_fd(),
             c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1226,7 +1280,7 @@ fn create_within(
     let real = std::fs::canonicalize(dir)
         .map_err(|e| anyhow::anyhow!("cannot canonicalise {dir:?}: {e}"))?;
     match containment_refusal(root, dir, &real) {
-        Some(refusal) => Err(refusal),
+        Some(refusal) => Err(refusal.message(root, dir, &real)),
         None => Ok((real, child)),
     }
 }
@@ -2814,20 +2868,40 @@ exit 0"#,
     /// `a/.` are the aliases of `a` that they are. What is joined is the
     /// normalised component, never the raw string: that is what makes the layout
     /// `<root>/<task-id>/<job-id>` literally true, and what keeps the
-    /// "resolves to itself" refusal below from rejecting `job-1/.` for a reason
-    /// that has nothing to do with symlinks.
+    /// "resolves to itself" refusal from rejecting `job-1/.` for a reason that
+    /// has nothing to do with symlinks.
+    ///
+    /// The assertion is on the **entries that were created**, not on `Path`
+    /// equality: `Path` equality ignores a trailing separator and `.`, so
+    /// comparing paths here would pass for an implementation that joined the raw
+    /// string and happened to canonicalise afterwards. The names are what the
+    /// layout promises.
     #[test]
     fn an_id_is_joined_as_its_normalised_component() {
         let home = tempfile::tempdir().unwrap();
         let ws = home.path().join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
         let got = resolve_job_dir(&ws, "task-1/", "job-1/.").unwrap();
+
+        let tasks: Vec<_> = std::fs::read_dir(&ws)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(tasks, vec![OsStr::new("task-1")], "the task level");
+        let jobs: Vec<_> = std::fs::read_dir(&got)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(jobs.is_empty(), "the job directory starts empty: {jobs:?}");
         assert_eq!(
-            got,
-            std::fs::canonicalize(&ws)
-                .unwrap()
-                .join("task-1")
-                .join("job-1"),
+            got.file_name().unwrap(),
+            OsStr::new("job-1"),
+            "the job level must be named exactly the id: {got:?}"
+        );
+        assert_eq!(
+            got.parent().unwrap().file_name().unwrap(),
+            OsStr::new("task-1"),
+            "the task level must be named exactly the id: {got:?}"
         );
     }
 
@@ -2993,14 +3067,35 @@ exit 0"#,
     /// swap get a directory created outside the root — measured at 1472 of 8246
     /// refusals over 15 s of swapping before this.
     ///
-    /// The assertion is one-sided: it fails only if a directory appears outside
-    /// the root, so it cannot go red on a machine where the window is never hit.
-    /// The loop is long enough to be measured against the old code, which is
-    /// what keeps it a regression detector rather than a hope.
+    /// This is the end-to-end detector, and it is one-sided: it fails only when
+    /// the swap wins a race, so on a machine where the window is never hit it
+    /// cannot go red. Two things keep it honest. `refused > 0` asserts the loop
+    /// actually met the swapped-in state it claims to be testing — under
+    /// contention refusals are the common case, so a run with none means the
+    /// swapper never interfered and the loop proved nothing. And
+    /// `a_level_swapped_for_a_symlink_cannot_redirect_the_level_below` drives the
+    /// same window with no race at all, so the property does not rest on this
+    /// test's timing.
     #[test]
     fn a_concurrent_swap_cannot_create_a_directory_outside_the_root() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+
+        /// Stops and joins the swapper on **both** paths. The assertion below
+        /// unwinds, and a spinning thread leaked on the failing path is how a red
+        /// test becomes a flaky one.
+        struct Swapper {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Swapper {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
 
         let home = tempfile::tempdir().unwrap();
         let ws = home.path().join("workspace");
@@ -3011,32 +3106,308 @@ exit 0"#,
         let stop = Arc::new(AtomicBool::new(false));
         let link = ws.join("task-1");
         let target = elsewhere.clone();
-        let swapper = {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut real = true;
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(&link);
-                    let _ = std::fs::remove_dir_all(&link);
-                    if real {
-                        let _ = std::fs::create_dir(&link);
-                    } else {
-                        let _ = std::os::unix::fs::symlink(&target, &link);
+        let _swapper = Swapper {
+            stop: Arc::clone(&stop),
+            handle: Some({
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut real = true;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::fs::remove_file(&link);
+                        let _ = std::fs::remove_dir_all(&link);
+                        if real {
+                            let _ = std::fs::create_dir(&link);
+                        } else {
+                            let _ = std::os::unix::fs::symlink(&target, &link);
+                        }
+                        real = !real;
                     }
-                    real = !real;
-                }
-            })
+                })
+            }),
         };
 
+        let mut refused = 0usize;
         for _ in 0..2000 {
-            let _ = resolve_job_dir(&ws, "task-1", "job-1");
+            if resolve_job_dir(&ws, "task-1", "job-1").is_err() {
+                refused += 1;
+            }
             assert!(
                 !elsewhere.join("job-1").exists(),
-                "a directory was created outside the root while the level was swapped"
+                "a directory was created outside the root while the level was swapped \
+                 ({refused} refusals so far)"
             );
         }
+        assert!(
+            refused > 0,
+            "the loop never met the swapped-in state: the swapper did not interfere, so \
+             this run asserted nothing about the property it is named for"
+        );
+    }
 
-        stop.store(true, Ordering::Relaxed);
-        swapper.join().unwrap();
+    /// The window the concurrent test hunts for, with no race in it: the swap is
+    /// done *between* the two levels, by the test, which is the interleaving the
+    /// thread only sometimes wins.
+    ///
+    /// The level above has been created, verified and opened; its path is then
+    /// replaced by a symlink. The creation below is `mkdirat` on the descriptor,
+    /// so it lands inside the directory the descriptor names or fails — it cannot
+    /// be redirected to the swap target, which is exactly what a path-based
+    /// `create_dir_all` did.
+    #[test]
+    fn a_level_swapped_for_a_symlink_cannot_redirect_the_level_below() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let root = std::fs::canonicalize(&ws).unwrap();
+        let root_fd = open_dir(&root).unwrap();
+        let (task_dir, task_fd) =
+            create_within(&root_fd, &root, &root.join("task-1"), OsStr::new("task-1")).unwrap();
+
+        std::fs::remove_dir_all(&task_dir).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("task-1")).unwrap();
+
+        let outcome = create_within(
+            &task_fd,
+            &root,
+            &task_dir.join("job-1"),
+            OsStr::new("job-1"),
+        );
+        assert!(
+            !elsewhere.join("job-1").exists(),
+            "the swap redirected the creation: {:?}",
+            outcome.map(|(path, _fd)| path)
+        );
+    }
+
+    /// The residual this design accepts, pinned so the documentation and the
+    /// behaviour cannot drift apart. A writer that **moves** the verified
+    /// directory out of the root still gets the level below created inside it,
+    /// because a descriptor follows the inode, not the name — and an empty
+    /// directory is therefore created outside the root. The call still fails
+    /// closed: it never *returns* a path outside the root, and the containment
+    /// check refuses the result.
+    ///
+    /// That is the price of closing the symlink variant, and the writer has to
+    /// hold write access to both ends to do it, so it gains no privilege it did
+    /// not already have. If someone closes this too, this test fails — which is
+    /// the point of pinning a residual rather than describing it.
+    #[test]
+    fn the_move_residual_creates_a_directory_outside_the_root_and_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let root = std::fs::canonicalize(&ws).unwrap();
+        let root_fd = open_dir(&root).unwrap();
+        let (task_dir, task_fd) =
+            create_within(&root_fd, &root, &root.join("task-1"), OsStr::new("task-1")).unwrap();
+
+        let moved = home.path().join("moved");
+        std::fs::rename(&task_dir, &moved).unwrap();
+
+        let outcome = create_within(
+            &task_fd,
+            &root,
+            &task_dir.join("job-1"),
+            OsStr::new("job-1"),
+        );
+        assert!(
+            outcome.is_err(),
+            "a moved level must still be refused, never returned: {:?}",
+            outcome.map(|(path, _fd)| path)
+        );
+        assert!(
+            moved.join("job-1").exists(),
+            "the move residual has been closed — update spec §1.3 and this test"
+        );
+    }
+
+    /// Containment asserted as a **property**, not as prose: which clause fired,
+    /// as a value. Matching on the message instead would let a future relaxation
+    /// of one clause pass for containment still working, because another clause
+    /// produces a similar message — and the sibling case below is exactly that
+    /// shape: `/ws-evil` is outside `/ws`, but it starts with `/ws` as a string.
+    #[test]
+    fn containment_is_decided_by_path_components_not_by_text() {
+        let root = Path::new("/home/u/ws");
+        let dir = Path::new("/home/u/ws/task-1/job-1");
+        assert_eq!(
+            containment_refusal(root, dir, Path::new("/home/u/ws/task-1/job-1")),
+            None,
+            "a path below the root that resolves to itself is the only accepted shape"
+        );
+        for outside in [
+            "/home/u/ws-evil/job-1",
+            "/home/u/ws-evil",
+            "/home/u",
+            "/home",
+            "/",
+        ] {
+            assert_eq!(
+                containment_refusal(root, dir, Path::new(outside)),
+                Some(Refusal::OutsideRoot),
+                "{outside} is outside {root:?} and must be refused as such"
+            );
+        }
+        assert_eq!(
+            containment_refusal(root, dir, root),
+            Some(Refusal::IsTheRoot),
+            "the root itself is not below the root"
+        );
+        assert_eq!(
+            containment_refusal(root, dir, Path::new("/home/u/ws/other/job-1")),
+            Some(Refusal::NotItself),
+            "in-root but not what the path names: a symlink"
+        );
+    }
+
+    /// `O_PATH` is what lets the root be a directory this process cannot read:
+    /// nothing here reads the directory's contents, only `mkdirat`/`openat`
+    /// relative to it. Mode 0333 is writable and traversable but not readable,
+    /// and the read-only open this replaced refused it with `Permission denied`.
+    ///
+    /// As root the kernel bypasses the permission bits, so the behavioural half
+    /// is masked there and proven by running the suite as uid 1000; the flag
+    /// assertion in the next test is what holds for every uid.
+    #[test]
+    fn a_root_that_cannot_be_read_is_still_usable() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut perms = std::fs::metadata(&ws).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o333);
+        std::fs::set_permissions(&ws, perms).unwrap();
+
+        let got = resolve_job_dir(&ws, "task-1", "job-1").unwrap();
+        assert!(
+            got.ends_with("task-1/job-1"),
+            "a writable-but-unreadable root is usable: {got:?}"
+        );
+    }
+
+    /// Read the descriptor's own flags back and check all four. None of them is
+    /// visible in a return value, so this is where they can be pinned at all:
+    ///
+    /// - `O_PATH` — the root need not be readable (above);
+    /// - `O_DIRECTORY` — a non-directory at a level must be refused *there*.
+    ///   Measured: without it, a FIFO is opened as a descriptor and the refusal
+    ///   arrives one level down as `cannot create …/job-1: Not a directory`, and
+    ///   a symlink is opened as a descriptor **for the symlink** — `O_PATH` with
+    ///   `O_NOFOLLOW` and no `O_DIRECTORY` is the documented "open the link
+    ///   itself" form, not a refusal. `O_PATH` also means an open can no longer
+    ///   block on a FIFO at all, which is why this is correctness here rather
+    ///   than the liveness guard it was for a read-only open;
+    /// - `O_NOFOLLOW` — a symlink swapped in becomes the parent of the next level;
+    /// - `FD_CLOEXEC` — neither descriptor may leak into the sandboxed child.
+    #[test]
+    fn the_descriptors_carry_the_flags_the_race_and_the_permissions_need() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let root = std::fs::canonicalize(&ws).unwrap();
+        let root_fd = open_dir(&root).unwrap();
+        assert_descriptor_flags(&root_fd, "the root descriptor");
+
+        std::fs::create_dir(root.join("task-1")).unwrap();
+        let level_fd = open_dir_in(&root_fd, OsStr::new("task-1")).unwrap();
+        assert_descriptor_flags(&level_fd, "a level descriptor");
+    }
+
+    /// `F_GETFL` on an `O_PATH` descriptor reports `O_PATH`, `O_DIRECTORY` and
+    /// `O_NOFOLLOW`, and `F_GETFD` reports `FD_CLOEXEC`.
+    fn assert_descriptor_flags(fd: &OwnedFd, what: &str) {
+        // SAFETY: `fd` is open for the duration of the call.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "{what}: F_GETFL failed");
+        for (name, want) in [
+            ("O_PATH", libc::O_PATH),
+            ("O_DIRECTORY", libc::O_DIRECTORY),
+            ("O_NOFOLLOW", libc::O_NOFOLLOW),
+        ] {
+            assert!(
+                flags & want != 0,
+                "{what} is missing {name}: F_GETFL = 0o{flags:o}"
+            );
+        }
+        // SAFETY: as above.
+        let fd_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            fd_flags & libc::FD_CLOEXEC != 0,
+            "{what} would be inherited by the sandboxed child: F_GETFD = {fd_flags}"
+        );
+    }
+
+    /// A FIFO at a level is refused **at that level**, not accepted as a
+    /// directory and then failed one level down. `O_DIRECTORY` is what makes the
+    /// open refuse it; without the flag the open succeeds, the resolve carries on
+    /// with a descriptor for something that is not a directory, and the error
+    /// names `…/task-1/job-1` instead — measured. The assertion that the refusal
+    /// does not mention the job level is what pins that.
+    ///
+    /// The resolve also runs on a helper thread with a deadline, as a safety net:
+    /// this suite has no way to report a hang, so a future change that made the
+    /// open wait — a read-only open on a FIFO does — would fail here instead of
+    /// wedging the binary with no test named.
+    #[test]
+    fn a_fifo_at_a_level_is_refused_instead_of_blocking() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let fifo = ws.join("task-1");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path in a directory that exists.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = ws.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_job_dir(&root, "task-1", "job-1").map_err(|e| e.to_string()));
+        });
+        let outcome = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(outcome) => outcome,
+            Err(_) => panic!(
+                "resolve_job_dir did not return within 10s: the open blocked on a FIFO, \
+                 which is what O_DIRECTORY is there to prevent"
+            ),
+        };
+        let e = outcome.unwrap_err();
+        assert!(e.contains("not a directory"), "{e}");
+        assert!(
+            !e.contains("job-1"),
+            "the FIFO must be refused when it is opened, not one level below: {e}"
+        );
+    }
+
+    /// `O_NOFOLLOW`, deterministically: a level that is a symlink is not
+    /// followed by the `openat` that produces the descriptor for the level
+    /// below. The symlink points *inside* the root, so containment is not what
+    /// refuses it — the flag is, and the refusal has to come from the open
+    /// itself. Without `O_NOFOLLOW` this open succeeds, which is the whole
+    /// difference between a descriptor for the level and a descriptor for
+    /// whatever the level was swapped to point at.
+    ///
+    /// The errno is `ENOTDIR`, not `ELOOP`: with `O_DIRECTORY` as well, Linux
+    /// reports the type mismatch rather than the symlink. Either way the symlink
+    /// is not followed, which is what this asserts.
+    #[test]
+    fn a_symlinked_level_is_not_followed_by_the_open() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("workspace");
+        std::fs::create_dir_all(ws.join("real")).unwrap();
+        std::os::unix::fs::symlink(ws.join("real"), ws.join("task-1")).unwrap();
+
+        let root = std::fs::canonicalize(&ws).unwrap();
+        let root_fd = open_dir(&root).unwrap();
+        let err = open_dir_in(&root_fd, OsStr::new("task-1")).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENOTDIR),
+            "a symlinked level must be refused by the open itself, not followed: {err}"
+        );
     }
 }

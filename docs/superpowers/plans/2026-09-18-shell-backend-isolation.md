@@ -1295,8 +1295,8 @@ git commit -m "feat(supervisor): build the hardened bubblewrap argv and smoke-pr
 
 > **As shipped** (Task 3, `src/supervisor/backend/sandbox.rs`; the source is
 > authoritative). The four tests below are the first version and are kept for
-> the record. The shipped section is **24 tests**, because these four leave the
-> guards unpinned and one assertion with no teeth:
+> the record. The shipped section is **31 tests** (76 in the module), because
+> these four leave the guards unpinned and one assertion with no teeth:
 >
 > - `refuses_the_filesystem_root_as_the_root` — the plan's `contains("/")` is
 >   satisfied by *every* message the function can produce, including the
@@ -1329,7 +1329,21 @@ git commit -m "feat(supervisor): build the hardened bubblewrap argv and smoke-pr
 >   `a_dangling_symlink_at_a_level_is_refused_by_name`;
 > - `the_sandbox_root_is_created_when_it_does_not_exist_yet`,
 >   `resolving_the_same_job_twice_is_idempotent`,
->   `a_newline_in_the_root_path_is_escaped_in_every_message`.
+>   `a_newline_in_the_root_path_is_escaped_in_every_message`;
+> - descriptors: `the_descriptors_carry_the_flags_the_race_and_the_permissions_need`
+>   (all four flags, read back with `F_GETFL`/`F_GETFD`),
+>   `a_symlinked_level_is_not_followed_by_the_open`,
+>   `a_fifo_at_a_level_is_refused_instead_of_blocking` (a missing `O_DIRECTORY`
+>   *hangs* on a FIFO, so the resolve runs on a thread with a deadline — a hang
+>   fails the test instead of wedging the binary),
+>   `a_root_that_cannot_be_read_is_still_usable`;
+> - containment as a clause, not as a message:
+>   `containment_is_decided_by_path_components_not_by_text`;
+> - the race, deterministically, with no thread in it:
+>   `a_level_swapped_for_a_symlink_cannot_redirect_the_level_below`, plus
+>   `the_move_residual_creates_a_directory_outside_the_root_and_is_refused`,
+>   which pins the accepted residual so the spec and the behaviour cannot drift
+>   apart.
 >
 > Each was shown to fail under a mutation that removes the guard it covers, run
 > as uid 1000 — as root the `/`-guard mutant is masked, because root can really
@@ -1426,24 +1440,61 @@ fn one_component<'a>(id: &'a str, what: &str) -> anyhow::Result<&'a OsStr> {
     }
 }
 
+/// Which containment clause refused a resolved path.
+///
+/// A value, not only prose, because the three clauses are not interchangeable:
+/// a test that matches on the message cannot tell "this is outside the root"
+/// from "this is not what the path names", and a future relaxation of one clause
+/// would then look like containment still working. `containment_is_decided_by_
+/// path_components_not_by_text` asserts the clause.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The path resolved to the root itself, which is not below the root.
+    IsTheRoot,
+    /// The path resolved outside the root.
+    OutsideRoot,
+    /// The path resolved to something other than what it names — a symlink.
+    NotItself,
+}
+
+impl Refusal {
+    /// The operator-facing wording. Every path in it is `{:?}`: `dir` is built
+    /// from caller-supplied ids and `root` from operator config, and
+    /// `Path::display()` does not escape control characters.
+    fn message(&self, root: &Path, dir: &Path, real: &Path) -> anyhow::Error {
+        match self {
+            Self::IsTheRoot => anyhow::anyhow!(
+                "the sandbox path {real:?} is the sandbox root itself, not below it"
+            ),
+            Self::OutsideRoot => anyhow::anyhow!(
+                "the sandbox path {real:?} resolved outside the sandbox root {root:?}"
+            ),
+            Self::NotItself => anyhow::anyhow!(
+                "the sandbox path {dir:?} resolves to {real:?} rather than to itself; \
+                 a symlink here would let two jobs share one sandbox"
+            ),
+        }
+    }
+}
+
 /// The refusal for a level that resolved to `real`, or `None` when `real` is an
 /// acceptable resolution of `dir`: strictly below `root`, and `dir` itself.
 ///
 /// One function rather than a check at each site, so that a mutation removing a
-/// clause is not masked by the same clause surviving in a second copy.
-fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<anyhow::Error> {
-    // Three distinct refusals, because one message for all of them reads wrong:
-    // a path that *is* the root, reported as "outside" it, sends a reader
-    // looking for a traversal that never happened.
+/// clause is not masked by the same clause surviving in a second copy. Three
+/// distinct refusals, because one message for all of them reads wrong: a path
+/// that *is* the root, reported as "outside" it, sends a reader looking for a
+/// traversal that never happened.
+///
+/// Containment is `Path::starts_with`, which compares **components**. Comparing
+/// the two paths as strings passes every test here except the sibling one:
+/// `/…/ws-evil` starts with `/…/ws` as text and is outside it as a path.
+fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<Refusal> {
     if real == root {
-        return Some(anyhow::anyhow!(
-            "the sandbox path {real:?} is the sandbox root itself, not below it"
-        ));
+        return Some(Refusal::IsTheRoot);
     }
     if !real.starts_with(root) {
-        return Some(anyhow::anyhow!(
-            "the sandbox path {real:?} resolved outside the sandbox root {root:?}"
-        ));
+        return Some(Refusal::OutsideRoot);
     }
     // An in-root symlink passes both checks above — it resolves to a directory
     // inside the root — and still breaks the layout the spec makes normative:
@@ -1453,10 +1504,7 @@ fn containment_refusal(root: &Path, dir: &Path, real: &Path) -> Option<anyhow::E
     // `<task-id>/<job-id>` lexically, and a path that does not canonicalise to
     // itself has a symlink at its last level.
     if real != dir {
-        return Some(anyhow::anyhow!(
-            "the sandbox path {dir:?} resolves to {real:?} rather than to itself; \
-             a symlink here would let two jobs share one sandbox"
-        ));
+        return Some(Refusal::NotItself);
     }
     None
 }
@@ -1468,15 +1516,22 @@ fn not_a_directory(root: &Path, dir: &Path, err: std::io::Error) -> anyhow::Erro
     // containment wording when containment is the reason it is refused.
     if let Ok(real) = std::fs::canonicalize(dir) {
         if let Some(refusal) = containment_refusal(root, dir, &real) {
-            return refusal;
+            return refusal.message(root, dir, &real);
         }
-        return anyhow::anyhow!("the sandbox path {dir:?} is not a directory");
+        // Only claim "not a directory" when that is what the kernel said. `EMFILE`
+        // or a umask that leaves the level created but unopenable says nothing
+        // about the entry's type — and the level exists by then, because
+        // `mkdirat` already succeeded, so "is not a directory" would send a
+        // reader looking for the wrong thing entirely.
+        if err.raw_os_error() == Some(libc::ENOTDIR) {
+            return anyhow::anyhow!("the sandbox path {dir:?} is not a directory");
+        }
     }
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.file_type().is_symlink() => {
             anyhow::anyhow!("the sandbox path {dir:?} is a symlink to a target that does not exist")
         }
-        _ => anyhow::anyhow!("cannot create {dir:?}: {err}"),
+        _ => anyhow::anyhow!("cannot open {dir:?} as a directory: {err}"),
     }
 }
 
@@ -1484,7 +1539,9 @@ fn not_a_directory(root: &Path, dir: &Path, err: std::io::Error) -> anyhow::Erro
 /// failed. `File exists (os error 17)` is what the raw error says for a root
 /// that is a regular file, a root that is a dangling symlink, and a symlink at
 /// either level — none of which is what "file exists" leads a reader to.
-fn root_not_usable(root: &Path, err: std::io::Error) -> anyhow::Error {
+/// `verb` is "create" or "open", so the fallback names the call that failed
+/// rather than guessing.
+fn root_not_usable(root: &Path, verb: &str, err: std::io::Error) -> anyhow::Error {
     match std::fs::symlink_metadata(root) {
         Ok(m) if m.file_type().is_symlink() => anyhow::anyhow!(
             "the sandbox root {root:?} is a symlink to a target that does not exist"
@@ -1492,12 +1549,20 @@ fn root_not_usable(root: &Path, err: std::io::Error) -> anyhow::Error {
         Ok(m) if !m.is_dir() => {
             anyhow::anyhow!("the sandbox root {root:?} is not a directory")
         }
-        _ => anyhow::anyhow!("cannot create the sandbox root {root:?}: {err}"),
+        _ => anyhow::anyhow!("cannot {verb} the sandbox root {root:?}: {err}"),
     }
 }
 
 /// Open `path` as a directory, without following a symlink at the last
 /// component.
+///
+/// `O_PATH`, not `O_RDONLY`: nothing here reads the directory's contents, only
+/// `mkdirat` and `openat` relative to it, and `O_PATH` needs no permission on
+/// the directory itself — only traversal of its parents. A root that is writable
+/// and traversable but not readable (mode 0333) is therefore usable, where a
+/// read-only open refused it with `Permission denied`. Verified: an `O_PATH`
+/// descriptor is a valid `dirfd` for both calls, and `O_DIRECTORY` still refuses
+/// a FIFO instead of blocking on it.
 fn open_dir(path: &Path) -> anyhow::Result<OwnedFd> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| anyhow::anyhow!("the path {path:?} contains a NUL byte"))?;
@@ -1506,11 +1571,15 @@ fn open_dir(path: &Path) -> anyhow::Result<OwnedFd> {
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
-        return Err(root_not_usable(path, std::io::Error::last_os_error()));
+        return Err(root_not_usable(
+            path,
+            "open",
+            std::io::Error::last_os_error(),
+        ));
     }
     // SAFETY: `fd` is a fresh descriptor from `open`, checked non-negative.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -1534,6 +1603,11 @@ fn mkdir_in(parent: &OwnedFd, name: &OsStr, dir: &Path) -> anyhow::Result<()> {
 }
 
 /// `openat(parent, name)` as a directory, refusing a symlink at this level.
+///
+/// `O_PATH` for the same reason as [`open_dir`], and it matters just as much
+/// here: `mkdirat` creates the level with `0o777 & !umask`, so a umask that
+/// strips the read bit produces a level this process may not read and may still
+/// write — and the next `mkdirat` needs write and traversal, not read.
 fn open_dir_in(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
     let c = CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -1542,7 +1616,7 @@ fn open_dir_in(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
         libc::openat(
             parent.as_raw_fd(),
             c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1562,7 +1636,10 @@ fn open_dir_in(parent: &OwnedFd, name: &OsStr) -> std::io::Result<OwnedFd> {
 /// re-traverses from the root and does follow the swap, which is how a writer
 /// looping on that swap got a directory created outside the root. The descriptor
 /// is opened with `O_NOFOLLOW`, so a symlink already in place is refused with
-/// nothing written through it.
+/// nothing written through it — and that flag is load-bearing for the race as
+/// well, not just for a symlink that is already there: without it, a symlink
+/// swapped in just before the open becomes the parent descriptor for the level
+/// below, and the level below is then created on the other side of it.
 ///
 /// Every message uses `{:?}` rather than `display()`: the path is built from
 /// caller-supplied ids and an operator-supplied root, and `Path::display()` does
@@ -1581,7 +1658,7 @@ fn create_within(
     let real = std::fs::canonicalize(dir)
         .map_err(|e| anyhow::anyhow!("cannot canonicalise {dir:?}: {e}"))?;
     match containment_refusal(root, dir, &real) {
-        Some(refusal) => Err(refusal),
+        Some(refusal) => Err(refusal.message(root, dir, &real)),
         None => Ok((real, child)),
     }
 }
@@ -1646,7 +1723,7 @@ pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Resu
     if !root.is_absolute() {
         anyhow::bail!("sandbox root {root:?} is not absolute");
     }
-    std::fs::create_dir_all(root).map_err(|e| root_not_usable(root, e))?;
+    std::fs::create_dir_all(root).map_err(|e| root_not_usable(root, "create", e))?;
     let root = std::fs::canonicalize(root)
         .map_err(|e| anyhow::anyhow!("cannot canonicalise {root:?}: {e}"))?;
     if root == Path::new("/") {
@@ -1676,7 +1753,7 @@ pub fn resolve_job_dir(root: &Path, task_id: &str, job_id: &str) -> anyhow::Resu
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib supervisor::backend::sandbox`
-Expected: PASS, 69 tests.
+Expected: PASS, 76 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2022,7 +2099,81 @@ let shell = ShellBackend::new(sandbox_path)
 `grants` `Arc` goes into the `Supervisor` in Task 8; until then the backend is
 its only holder.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Hand the job directory to bubblewrap by descriptor**
+
+Between `resolve_job_dir` returning and `bwrap` opening the path in the argv, a
+local writer with write access to the root can replace `<root>/<task-id>` with a
+symlink. The path then resolves somewhere else and bubblewrap mounts **that**
+directory read-write as the job's sandbox. This is not a theoretical window:
+verified on this host by putting the swap in place and running the argv, after
+which the sandboxed command read the swap target's file through the mount. The
+checks inside `resolve_job_dir` cannot close it — they have already returned, and
+the path is re-resolved by a different process.
+
+Close it by handing bubblewrap the **descriptor** instead of the path.
+`bwrap --bind-fd <fd> <dest>` binds the inode the descriptor names; it is present
+in bubblewrap 0.12.0 (Task 1's floor — `bwrap --help` lists it), and verified
+here: with the directory renamed away and a symlink left in its place, the
+fd-based bind still read the original directory's file while the path-based bind
+read the symlink's target. The destination stays a path, which is fine — it is
+created inside the sandbox namespace, not resolved on the host.
+
+This is what the job directory has to be, and it settles the "should the path be
+a newtype?" question that Task 3's review left open: the descriptor has to travel
+with the path, and only `resolve_job_dir` may construct the pair.
+
+```rust
+/// A job's sandbox directory: where it is, and a descriptor for it.
+///
+/// The path is for naming the directory — logs, the workspace record, the
+/// `--chdir` inside the sandbox. The descriptor is what the argv binds, because
+/// bubblewrap re-resolves a path and cannot re-resolve a descriptor. Only
+/// [`resolve_job_dir`] constructs one, so a path that has not been through the
+/// checks cannot reach `build_argv`.
+pub struct JobDir {
+    path: PathBuf,
+    fd: OwnedFd,
+}
+
+impl JobDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A duplicate of the descriptor with `FD_CLOEXEC` **cleared**, so the child
+    /// inherits exactly this one. `try_clone` dups with `F_DUPFD_CLOEXEC`, so the
+    /// duplicate is close-on-exec until this clears it; the original keeps the
+    /// flag and is closed when `JobDir` drops. Bind the result to a name that
+    /// outlives the `spawn` call — a dropped descriptor is a closed one.
+    pub fn inheritable_fd(&self) -> Result<OwnedFd> {
+        let dup = self.fd.try_clone()?;
+        // SAFETY: `dup` is an open descriptor owned by `dup` for the call.
+        if unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+            bail!(
+                "cannot make the job directory inheritable: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(dup)
+    }
+}
+```
+
+Change `resolve_job_dir` to return `Result<JobDir>` (it already opens the job
+level's descriptor and currently discards it as `_job_fd`), and `build_argv` to
+take `&JobDir` — superseding the `&Path` signature Task 2 shipped — emitting
+`--bind-fd <n> <dest>` in place of `--bind <path> <dest>` for the job directory
+only. The **grants** keep their `--bind`: a grant is a host path the operator
+named, it is not what the job's own sandbox is built from, and it is already
+refused when it covers the root (Task 8 Step 3b).
+
+**Test.** The end-to-end version belongs in Task 9's live file, because it needs a
+real `bwrap`: resolve a job directory, replace `<root>/<task-id>` with a symlink
+to a second directory holding a marker file, spawn through the production argv,
+and assert the sandboxed command reads the *original* directory (empty) rather
+than the marker. **Mutation:** emit `--bind <path>` again and the marker is read.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/supervisor/backend/shell.rs src/main.rs
@@ -2554,7 +2705,7 @@ impl Grants {
     /// - a relative path has no meaning once the sandbox has its own root;
     /// - a path that does not exist cannot be bound, and binding it later would
     ///   be a decision nobody made.
-    pub fn resolve_path(raw: &str) -> Result<PathBuf> {
+    pub fn resolve_path(raw: &str, sandbox_root: &Path) -> Result<PathBuf> {
         let raw = strip_dashes(raw);
         if raw.is_empty() {
             bail!("a grant needs a path");
@@ -2579,8 +2730,8 @@ impl Grants {
 
     /// Grant read-write access to one host path, for every future job until it
     /// is revoked. Returns the canonical path the caller audits.
-    pub fn grant_write(&mut self, raw: &str) -> Result<PathBuf> {
-        let path = Self::resolve_path(raw)?;
+    pub fn grant_write(&mut self, raw: &str, sandbox_root: &Path) -> Result<PathBuf> {
+        let path = Self::resolve_path(raw, sandbox_root)?;
         self.write.insert(path.clone());
         Ok(path)
     }
@@ -2658,6 +2809,91 @@ impl Grants {
 
 The fields stay `pub` because the argv builder and the tests read them; every
 **write** goes through `Supervisor`, which is what writes the audit row.
+
+- [ ] **Step 3b: Refuse a grant that covers the sandbox root, or an ancestor of it**
+
+The job directory's own checks (Task 3) assume no *job* can write the levels they
+walk, and spec §1.3 says so next to them. Nothing enforces that assumption today:
+`resolve_path` above accepts any absolute existing path, and the default root is
+the same directory the chat agent's shell tool uses as its working directory, so
+`/allow <home>/workspace` — or `/allow <home>`, which covers it just as surely —
+is exactly the grant that makes the residual reachable by a job. The resolution
+checks cannot enforce it themselves: the writer they would have to exclude *is*
+the job.
+
+Thread the root into the resolution. `Supervisor` already holds the backend, so
+give it the root as a field in Task 5 Step 5's wiring (`sandbox_root: PathBuf`,
+the same value `ShellBackend::new` receives) and change the two signatures:
+
+```rust
+pub fn resolve_path(raw: &str, sandbox_root: &Path) -> Result<PathBuf>
+pub fn grant_write(&mut self, raw: &str, sandbox_root: &Path) -> Result<PathBuf>
+```
+
+and add the rule to `resolve_path`, after the canonicalise and the `/` check:
+
+```rust
+    // A grant that covers the sandbox root hands a job write access to the
+    // levels `resolve_job_dir` walks, which is the one precondition its
+    // containment checks cannot enforce for themselves (spec §1.3). Ancestors
+    // count: `<home>` covers `<home>/workspace`, and the root path is
+    // re-resolved on every call, so write access to the *parent* is enough to
+    // swap the root itself. `starts_with` is a component test — `/ws-evil` is
+    // not below `/ws`, however much it looks like it as a string.
+    let root = std::fs::canonicalize(sandbox_root).unwrap_or_else(|_| sandbox_root.to_path_buf());
+    if root.starts_with(&canon) {
+        bail!(
+            "refusing to grant {}: it covers the sandbox root {} — a job that can \
+             write there can move the directory its own sandbox is built from",
+            canon.display(),
+            root.display()
+        );
+    }
+```
+
+The direction is the whole rule: refuse when the **granted** path is the root or
+an ancestor of it. A grant *inside* the root does not cover the root, and the
+exact-path matching above means it cannot reach the root's own levels either, so
+it stays allowed.
+
+Add this test beside the other `resolve_path` refusals in Step 1:
+
+```rust
+    #[test]
+    fn a_grant_covering_the_sandbox_root_or_an_ancestor_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+
+        // The root, and every ancestor of it: each one hands a job write access
+        // to the levels `resolve_job_dir` walks.
+        for covered in [
+            root.clone(),
+            home.path().to_path_buf(),
+            home.path().parent().unwrap().to_path_buf(),
+        ] {
+            let e = Grants::resolve_path(&covered.to_string_lossy(), &root)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("covers the sandbox root"), "{}: {e}", covered.display());
+        }
+
+        // A sibling of the root, and a path inside it, are legitimate grants.
+        let sibling = home.path().join("other");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(Grants::resolve_path(&sibling.to_string_lossy(), &root).is_ok());
+        let inside = root.join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(Grants::resolve_path(&inside.to_string_lossy(), &root).is_ok());
+    }
+```
+
+**Mutation (required).** Change `root.starts_with(&canon)` to `root == canon` and
+run the test: the ancestor cases must fail with the grant accepted, while the two
+legitimate grants still pass. A rule with no mutant is a rule nobody has seen
+work, and this one is the only thing standing between a job and the sandbox
+root.
 
 - [ ] **Step 4: Make the audit row writable, and write it**
 
@@ -2753,7 +2989,7 @@ Add to `Supervisor` in `src/supervisor/mod.rs`:
     /// without leaving a row. The row is written **before** the grant takes
     /// effect, so a grant that cannot be recorded does not exist.
     pub async fn grant_write(&self, actor: &str, raw: &str) -> Result<PathBuf> {
-        let path = Grants::resolve_path(raw)?;
+        let path = Grants::resolve_path(raw, &self.sandbox_root)?;
         self.store
             .record_grant_audit(actor, &format!("granted write access to {}", path.display()))
             .await?;
@@ -3294,8 +3530,11 @@ with the three name-resolution files, so DNS is not affected — only TLS was.
 8; `build_argv(&Path, &Grants, &str)` (Task 2) is called with exactly that
 signature in Task 5 and inside the probe; `Grants` (Task 2) is read by Task 4's
 default test, by `ShellBackend` in Task 5 and by every grant operation in Task 8;
-`resolve_job_dir(&Path, &str, &str)` (Task 3) is called with those arguments in
-Task 5; `ShellSandboxConfig { sandbox }` (Task 4) is read in Task 5;
+`resolve_job_dir(&Path, &str, &str)` (Task 3) returns a `JobDir` (path +
+descriptor) as of Task 5 Step 6, which is what `build_argv` takes; `Grants::
+resolve_path(raw, sandbox_root)` and `grant_write(raw, sandbox_root)` take the
+root as of Task 8 Step 3b, because a grant that covers it (or an ancestor of it)
+is refused; `ShellSandboxConfig { sandbox }` (Task 4) is read in Task 5;
 `Grants::{resolve_path, grant_write, revoke_write, grant_network, revoke_network,
 missing, covers, held}` and `Supervisor::{grant_write, deny_write, grant_network,
 deny_network, grants_held}` (Task 8) match their uses in Tasks 7, 8 and 9.

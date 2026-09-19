@@ -31,6 +31,17 @@
 > outside the root before the refusal. Fail-closed was not enough: the job never
 > ran, but the filesystem side effect had already happened.
 >
+> **Revision 5, corrected after the second Task 3 review.** Four corrections:
+> (1) §1.3 no longer calls the remaining cases "harmless" — the move residual
+> creates an empty directory outside the root, measured, and the swap-after-return
+> case is not a residual at all: it is closed by `--bind-fd`, verified, and owned
+> by Task 5 Step 6; (2) the grant rule in §4 is extended to **ancestors** of the
+> root, and given an owner (Task 8 Step 3b) instead of living in prose alone;
+> (3) the root path being re-resolved per call is recorded next to it, because
+> write access to the root's *parent* is enough to swap the root; (4) the root and
+> every level are opened `O_PATH`, so a writable-but-unreadable root or level
+> works — the read-only open had regressed that.
+>
 > **Revision 4, corrected after the Task 3 review.** Five more corrections, all
 > of them to claims rather than to the boundary. The id rule said "containing no
 > separator" while `Path::components()` resolves a trailing `/` and `/.` away, so
@@ -354,11 +365,20 @@ with these invariants, each a hard failure rather than a warning:
   the right direction for this one — the boundary does not rest on it, and a
   false refusal here stops every shell job;
 - the directory is created if absent, and **each level is created relative to a
-  descriptor for the level above it, opened without following a symlink**, then
-  canonicalised and checked before the level below it is attempted. The
-  `O_NOFOLLOW` is not decoration: without it a symlink swapped in just before the
-  open becomes the parent descriptor for the level below, and that level is then
-  created on the far side of it — measured as a failing concurrent test. A pre-existing
+  descriptor for the level above it, opened `O_PATH | O_DIRECTORY | O_NOFOLLOW`,
+  then canonicalised and checked before the level below it is attempted. All three
+  flags are load-bearing, and each was shown by mutation to be:
+  `O_NOFOLLOW` — without it a symlink swapped in just before the open becomes the
+  parent descriptor for the level below, and that level is then created on the far
+  side of it (measured as a failing concurrent test); `O_DIRECTORY` — without it a
+  symlink is opened as a descriptor **for the symlink** (`O_PATH` with
+  `O_NOFOLLOW` and no `O_DIRECTORY` is the "open the link itself" form, not a
+  refusal) and a FIFO is accepted as a level, so the refusal arrives one level
+  down and names the wrong path; `O_PATH` — without it a root that is writable and
+  traversable but not readable (mode 0333) is refused with `Permission denied`,
+  which the read-only open did. `O_PATH` also means an open can no longer block on
+  a FIFO at all, so `O_DIRECTORY`'s role there is correctness rather than the
+  liveness guard it was before. A pre-existing
   symlink is refused with nothing written through it, which is also the
   CVE-2026-87766 precondition. Order is part of the invariant, not an
   implementation detail: a check that runs *after* the directory has been created
@@ -375,23 +395,48 @@ with these invariants, each a hard failure rather than a warning:
   directory the descriptor names, or not at all, and the module's concurrent test
   fails against the path-based form.
 
-  Two cases remain, both needing a local writer with write access to the root:
+  Two cases remain, both needing a local writer with write access to the root.
+  Neither is harmless, and saying so is the point of this paragraph:
 
   - a writer that **moves** the verified directory outside the root gets the next
-    level created inside a directory it could already write to — moving it needs
-    write access to both ends — so no privilege is gained, and the containment
-    check still refuses the result;
+    level created *inside it*, because a descriptor follows the inode and not the
+    name. The call still fails closed — it refuses, and never *returns* a path
+    outside the root, so nothing is mounted from there — but an **empty directory
+    is created outside the root**. Pinned deterministically by
+    `the_move_residual_creates_a_directory_outside_the_root_and_is_refused`, which
+    swaps the move in between the two levels instead of racing a thread for it;
+    measured with an adversarial mover over 20000 calls: 16462 destinations gained
+    a `job-1` after the move, 19242 calls were refused, 758 succeeded, and **0**
+    returned a path outside the root. Revision 3's rule — "a refusal that leaves
+    directories behind is not a refusal" — is about what is reachable through the
+    mount, and on that measure this is still a refusal; the directory is created
+    all the same, so it is stated as a cost rather than waved away. The writer
+    needs write access to both ends to move the directory, so it gains no
+    privilege it did not already have;
   - a writer that swaps a level *after* this function returns, but before
-    bubblewrap opens the path in the argv, defeats the mount instead. That window
-    is not this function's to close: the returned path is not what gets mounted,
-    bubblewrap resolves it again when it runs, and the window is far wider than
-    the one inside the function. Closing it belongs to the argv and grant layer.
+    bubblewrap opens the path in the argv, defeats the **mount**: the returned
+    path is not what gets mounted, bubblewrap resolves it again when it runs.
+    Verified rather than assumed — with `<root>/task-1` replaced by a symlink to
+    `<elsewhere>` after the call, `bwrap --bind <root>/task-1/job-1 <dest>` mounts
+    `<elsewhere>/job-1` as the job's read-write directory, and the probe read the
+    other directory's file through the mount. This one is **not** a documented
+    residual: it is closed in the argv by handing bubblewrap the **descriptor**
+    instead of the path. `bwrap --bind-fd <fd> <dest>` binds the inode the
+    descriptor names — verified by renaming the directory away and putting a
+    symlink in its place, after which the fd-based bind still read the original
+    directory's file while the path-based bind read the symlink's target. Task 5
+    Step 6 owns that change, and it is the reason the job directory has to be
+    more than a `PathBuf`.
 
-  Because the second case is reachable by a *job* when a grant covers the root,
-  **no write grant may cover the sandbox root** — see §4, where that is recorded
-  next to the grant rules. The default root is the same directory the chat
-  agent's shell tool uses as its working directory, so the precondition is
-  load-bearing rather than theoretical.
+  Because both are reachable by a *job* when a grant covers the root, **no write
+  grant may cover the sandbox root or any ancestor of it** — see §4 for the rule
+  and Task 8 Step 3b for the step that enforces it. The default root is the same
+  directory the chat agent's shell tool uses as its working directory, so the
+  precondition is load-bearing rather than theoretical. The root **path** is also
+  re-resolved on every call, so write access to the root's *parent* is enough to
+  swap `<root>` for a symlink between the canonicalise and the open — measured at
+  73 of 4000 calls returning a job directory under the swap target. The ancestor
+  rule covers that case too, because an ancestor grant is a grant on the parent.
 
   Bound: a **bind mount** at any level defeats these checks, because a mountpoint
   is in-root *as a path* and `canonicalize` cannot see the difference —
@@ -511,14 +556,27 @@ symlink pointing at `/etc` resolve to the same entry. A grant covers exactly the
 path named and not its children: `/allow /var/lib/docker` does not grant
 `/var/lib`. Widening is an explicit, separate decision.
 
-> **A grant must not cover the sandbox root.** The job directory is resolved
-> before the job starts, and the checks that resolve it assume no *job* can write
-> the levels it walks: with write access to the root, a job can plant a symlink
-> that a later job's setup follows. Creating each level on a descriptor rather
-> than a path removes the directory-creation half of that (§1.3), and the mount
-> half is not closable from there — so the grant set is what keeps it out of
-> reach. `/allow <root>` is grantable today, so this is a rule the grant layer
-> has to enforce, not a property it already has.
+> **A grant must not cover the sandbox root, or any ancestor of it.** The job
+> directory is resolved before the job starts, and the checks that resolve it
+> assume no *job* can write the levels it walks: with write access to the root, a
+> job can plant a symlink that a later job's setup follows. Creating each level on
+> a descriptor rather than a path removes the directory-creation half of that
+> (§1.3); the mount half is closed by passing the descriptor to bubblewrap
+> (`--bind-fd`, §1.3 and Task 5 Step 6); and what remains — the move residual — is
+> kept out of a job's reach by this rule.
+>
+> **Ancestors, not just the root.** A grant of `<home>` covers `<home>/workspace`
+> as surely as a grant of `<home>/workspace` does, and the root path is
+> re-resolved on every call, so a writable *parent* is enough to swap the root
+> itself (§1.3). The test is one line: refuse the grant when
+> `sandbox_root.starts_with(granted)`. A grant *inside* the root is not refused by
+> this rule — it does not cover the root — and the exact-path matching above means
+> it cannot reach the root's own levels either.
+>
+> `/allow <root>` is grantable in the code as it stands, so this is a rule the
+> grant layer has to enforce, not a property it already has: **Task 8 Step 3b** is
+> the step that adds the refusal, with the test and the mutant that show it works.
+> A rule that lives only in a spec paragraph is a rule nobody implements.
 
 The grant set is in-memory and **never persists across a restart**, matching the
 dashboard's session model: a restart is a cheap, complete revocation. Every
@@ -747,6 +805,30 @@ Added, one per correction in this revision:
   and forces the spec to be updated rather than silently drifting.
 - remove `--hostname` → the host's hostname must be visible
 - set the sandbox root to `/` → config load must refuse
+- **grant a path that covers the sandbox root, or any ancestor of it** → the
+  grant must be refused. Mutating the rule's `root.starts_with(granted)` to
+  `root == granted` must let the ancestor cases through (`/allow <home>` accepted
+  while `<home>/workspace` is the root) and leave the two legitimate grants —
+  a sibling of the root and a path inside it — passing. Task 8 Step 3b owns this;
+  it is the only thing keeping a job from writing the levels `resolve_job_dir`
+  walks
+- drop `O_PATH` from the two opens → a root or level that is writable and
+  traversable but not readable (mode 0333) must be refused with
+  `cannot open the sandbox root …: Permission denied`, which is what the read-only
+  open did. **Only observable as a non-root user** — the kernel bypasses the
+  permission bits for root, so this mutation survives a root run and fails a
+  uid-1000 run, which is how it is measured
+- drop `O_DIRECTORY` → a FIFO at a level must no longer be refused *at that
+  level*: the open succeeds and the error names `…/task-1/job-1` instead, and a
+  symlinked level is opened as a descriptor for the symlink rather than refused
+- drop `O_NOFOLLOW` from the level open → a symlinked level is followed, so the
+  open succeeds and returns a descriptor for the symlink's target
+- drop `O_CLOEXEC` → the descriptors must be shown to be inheritable by the
+  sandboxed child
+- compare containment as **text** rather than as path components → the sibling
+  case (`/…/ws-evil` beside `/…/ws`) must be refused as `OutsideRoot` and is
+  instead refused as `NotItself`, which the clause assertion catches even though
+  the refusal still happens
 - revoke the grant between Layer 1 and Layer 2 → Layer 2 must still refuse
 - kill the supervisor → no sandbox process or descendant survives
 - infinite stdout → the byte cap ends the job before the wall clock
