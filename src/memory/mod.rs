@@ -728,6 +728,91 @@ mod tests {
         );
     }
 
+    /// The rebuild's job is to **preserve** the audit log while making `task_id`
+    /// nullable, and nothing exercised the copy.
+    ///
+    /// The rebuild fires on every database — the DDL batch declares
+    /// `task_id TEXT NOT NULL`, so a fresh store creates that form and the
+    /// rebuild immediately replaces it. But on a fresh store the table is
+    /// **empty**, so `INSERT INTO sup_transitions_new SELECT ...` copies zero
+    /// rows, and a rebuild that dropped every row would still pass every other
+    /// test in the suite. This one builds the shipped schema on disk, fills it,
+    /// and then opens it through the real entry point.
+    ///
+    /// It is also the only test that observes the index on a **migrated**
+    /// database rather than a fresh one, which is the case the placement in
+    /// `run_migrations` exists for.
+    #[test]
+    fn the_rebuild_preserves_existing_audit_rows_and_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("haos-green.db");
+
+        // The schema as it shipped: `sup_transitions.task_id` NOT NULL with a
+        // foreign key to `sup_tasks`, and no index on it. `sup_tasks` carries
+        // its full column set because `run_migrations` indexes two of them.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 CREATE TABLE sup_tasks (
+                     id TEXT PRIMARY KEY, title TEXT NOT NULL, user_request TEXT NOT NULL,
+                     task_type TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 5,
+                     risk_level TEXT NOT NULL, execution_mode TEXT NOT NULL,
+                     workflow TEXT NOT NULL, state TEXT NOT NULL,
+                     required_capabilities TEXT NOT NULL DEFAULT '[]', inputs TEXT,
+                     constraints TEXT, expected_outputs TEXT, approval_policy TEXT,
+                     platform TEXT NOT NULL, user_id TEXT NOT NULL, chat_id TEXT,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE TABLE sup_transitions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                     from_state TEXT NOT NULL, to_state TEXT NOT NULL, reason TEXT,
+                     actor TEXT NOT NULL, occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     FOREIGN KEY (task_id) REFERENCES sup_tasks(id)
+                 );
+                 INSERT INTO sup_tasks (id, title, user_request, task_type, risk_level, execution_mode, workflow, state, platform, user_id)
+                     VALUES ('task-old', 't', 'r', 'Ops', 'Low', 'AutoExecute', 'Fast', 'DONE', 'telegram', 'u');
+                 INSERT INTO sup_transitions (task_id, from_state, to_state, reason, actor)
+                     VALUES ('task-old', 'Route', 'Plan', 'the row that must survive', 'operator');",
+            )
+            .unwrap();
+        }
+
+        // The real entry point: this runs the migrations, rebuild included.
+        let store = MemoryStore::open(&path, None, MemoryConfig::default()).unwrap();
+        let conn = store.connection();
+        let conn = conn.blocking_lock();
+
+        let (task_id, reason): (String, String) = conn
+            .query_row(
+                "SELECT task_id, reason FROM sup_transitions WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the pre-existing audit row must survive the rebuild");
+        assert_eq!(task_id, "task-old");
+        assert_eq!(reason, "the row that must survive");
+
+        // And the column really is nullable now, which is the point of the
+        // rebuild: a grant audit row belongs to no task.
+        conn.execute(
+            "INSERT INTO sup_transitions (task_id, from_state, to_state, actor) VALUES (NULL, 'grant', 'write', 'dashboard')",
+            [],
+        )
+        .expect("a NULL task_id must be accepted after the rebuild");
+
+        // A migrated database gets the index too, not only a fresh one.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_sup_transitions_task'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "a migrated database must have the index as well");
+    }
+
     #[test]
     fn a2a_tasks_table_exists_after_migration() {
         let memory = MemoryStore::open_in_memory().unwrap();
