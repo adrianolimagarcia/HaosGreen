@@ -57,11 +57,16 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         constraints: serde_json::Value::Null,
         inputs: serde_json::Value::Null,
         expected_outputs: serde_json::Value::Null,
-        // No `sup_tasks` column carries a declaration, so a job reads back as
-        // declaring nothing. Declarations are consumed by the run that created
-        // the job and are not persisted; a resumed job therefore re-declares
-        // through its task rather than through the row. See `Grants`.
     })
+}
+
+/// One row of `sup_execution_leases`, as stored.
+#[derive(Debug, Clone)]
+pub struct LeaseRow {
+    pub task_id: String,
+    pub owner_id: String,
+    pub expires_at: i64,
+    pub renewed_at: i64,
 }
 
 #[derive(Clone)]
@@ -189,6 +194,61 @@ impl TaskStore {
             rusqlite::params![task_id, owner_id],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Every lease row, live or lapsed, longest-lived first.
+    ///
+    /// `owner_id` comes back raw: it is `pid-<pid>-<uuid>`, so it names a host
+    /// process. A caller that puts this on a wire must mask it — see
+    /// [`Supervisor::leases`], which is the only such caller.
+    pub async fn list_leases(&self) -> Result<Vec<LeaseRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, owner_id, expires_at, renewed_at
+             FROM sup_execution_leases ORDER BY expires_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(LeaseRow {
+                task_id: r.get(0)?,
+                owner_id: r.get(1)?,
+                expires_at: r.get(2)?,
+                renewed_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Delete lease rows that lapsed more than `grace_secs` ago, answering how
+    /// many went.
+    ///
+    /// **This is the query `idx_sup_execution_leases_expiry` was created for,
+    /// and until it existed that index was write-only amplification.** It is
+    /// rewritten on every heartbeat renewal — every 60 s, per running task —
+    /// while no read path could use it: `acquire` is an upsert keyed on the
+    /// primary key, and `renew`/`release` are owner-addressed, so all three
+    /// look the row up by `task_id`. Filtering on `expires_at` alone is what
+    /// turns this into a range scan instead of a full table scan. The schema's
+    /// own comment said the index was "kept for the expiry-driven sweep/reclaim
+    /// query ... that would otherwise scan the whole table"; this is it.
+    ///
+    /// Deleting a lapsed row is safe, and for a specific reason rather than by
+    /// luck: `acquire` takes the `INSERT` path both when the row is missing and
+    /// when it is present-but-expired (its upsert carries
+    /// `WHERE expires_at <= ?now`), and `renew` refuses an expired row by
+    /// design — `expires_at > ?now` — so nothing can resurrect one. The grace
+    /// is therefore **not** needed for correctness; it keeps a row that lapsed
+    /// a moment ago from being deleted and immediately re-inserted by the
+    /// takeover that is about to claim it.
+    pub async fn sweep_expired_leases(&self, grace_secs: i64) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let cutoff = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(grace_secs.max(0));
+        let n = conn.execute(
+            "DELETE FROM sup_execution_leases WHERE expires_at <= ?1",
+            rusqlite::params![cutoff],
+        )?;
+        Ok(n)
     }
 
     pub async fn create(

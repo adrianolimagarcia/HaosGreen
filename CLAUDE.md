@@ -485,6 +485,7 @@ that is neither an IP nor a CIDR range.
 | `GET /api/settings`, `POST /api/settings/password`, `POST /api/settings/bearer`, `PUT /api/settings/allow-ips` | Credentials and the live allowlist. |
 | `POST`, `GET /api/chat/sessions`; `GET`, `POST /api/chat/sessions/{id}/messages`; `POST /api/chat/sessions/{id}/cancel` | The chat surface. The `POST` on messages is `text/event-stream`. |
 | `GET`, `POST /api/supervisor/tasks`; `GET /api/supervisor/tasks/{id}`; `POST /api/supervisor/tasks/{id}/{pause,resume,cancel,approve}` | Supervisor surface. |
+| `GET /api/supervisor/leases` | Execution leases, live and lapsed. Read-only, and the owner id is masked to a 6-character fingerprint. |
 | `GET /api/supervisor/grants`; `POST /api/supervisor/grants/{allow,deny}` | Grant surface. The body is `{"path": "..."}` or `{"network": true}` — exactly one — and a refusal is **400** carrying the reason, because it is about the path, not about task state. |
 | `GET /api/logs`, `GET /api/logs/stream` | Log history, and a live tail that is not a replay. |
 | `GET /api/a2a/status`, `/peers`, `/outbound`; `PUT /api/a2a/outbound`; `POST /api/a2a/test` | A2A manager. |
@@ -719,7 +720,6 @@ Skill packs are auto-loaded by the existing `SkillRegistry` at startup; the
 
 ```toml
 [supervisor]
-default_autonomy_mode = "standard"   # "fast" | "standard" | "rigorous"
 artifacts_dir         = "supervisor/artifacts"
 
 [supervisor.shell]
@@ -733,6 +733,15 @@ auto_execute_only_low       = false   # when true, Medium escalates to RequireAp
 
 Defaults preserve M1–M6 behavior (Medium-risk auto-executes). Flip individual
 fields to tighten the gate.
+
+`default_autonomy_mode` was documented here and **deleted** — nothing read it.
+Wiring it into `HeuristicClassifier`'s `_` fallback arm was rejected because that
+arm catches only Research/Writing/Ops/Unknown: a code change is hardcoded
+`Rigorous` and `GeneralAssistant` hardcoded `Fast`, so `"fast"` would not make a
+refactor fast, and `Fast` drops `Route`/`Clarify`/`Plan`. A coherent wiring is a
+**floor** ("never below this mode"), which is a new semantic needing a product
+decision; deleting removes the hazard without inventing one. The `config.example.toml`
+note records the floor design for whoever builds it.
 
 ### Bot commands
 
@@ -904,7 +913,7 @@ and `result` (Reporter Markdown summary).
 | `sup_jobs`        | One row per job dispatched within a task — backend, goal, prompt, status, result_summary, error, optional `parent_job_id` for spawned subjobs |
 | `sup_transitions` | Append-only audit log of every state change (`from_state`, `to_state`, `actor`, `reason`, `occurred_at`) |
 | `sup_artifacts`   | Index of files written under `artifacts_dir` (`task_id`, `job_id`, `kind`, `path`, `sha256`, `bytes`) |
-| `sup_execution_leases` | One row per running task — `owner_id`, `expires_at`, `renewed_at`. The cross-process execution fence; see below |
+| `sup_execution_leases` | One row per running task — `owner_id`, `expires_at`, `renewed_at`. The cross-process execution fence; see below. Read by `GET /api/supervisor/leases` and swept at startup |
 
 All five tables are created idempotently in `MemoryStore` at startup.
 
@@ -959,8 +968,26 @@ Known bounds — documented, not hidden:
   a live lease early;
 - the heartbeat is an ordinary task, so all-worker starvation stops renewals and
   the row lapses with no signal;
-- the lease table is write-only from the app's point of view — no UI or route
-  shows who holds a lease or when it expires.
+- ~~the lease table is write-only from the app's point of view~~ — **closed**.
+  `GET /api/supervisor/leases` and `Supervisor::leases()` list every row, live or
+  lapsed, with `live` and `seconds_remaining` so an operator can tell "wait for
+  the TTL" from "go look for a stuck process". The **owner id is masked** to a
+  6-character SHA-256 fingerprint before it leaves the process: it is
+  `pid-<pid>-<uuid>`, so it names a host process, and this codebase already
+  refuses to log it. Do not add a route that takes an owner id — that would turn
+  a per-run identifier into a capability.
+- **Lapsed rows are swept at startup.** `Supervisor::sweep_lapsed_leases()`
+  deletes rows expired for more than an hour, called once from `main.rs`. This is
+  the query `idx_sup_execution_leases_expiry` was created for and, until it
+  existed, the index was **write-only amplification** — rewritten on every 60 s
+  heartbeat renewal, per running task, read by nothing. The schema's own comment
+  said so and warned not to cite a benefit the current paths did not have. It is
+  safe to delete a lapsed row because `acquire` takes the `INSERT` path both when
+  the row is missing and when it is present-but-expired, and `renew` refuses an
+  expired row by design, so nothing can resurrect one; the grace exists only so a
+  row that lapsed a moment ago is not churned against the takeover about to claim
+  it. `the_lease_sweep_is_the_query_the_expiry_index_exists_for` asserts the plan
+  still names that index.
 
 ## Agent skills
 

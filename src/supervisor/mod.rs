@@ -233,6 +233,45 @@ const LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// notices unless a worker frees up and the heartbeat ticks again.
 const LEASE_TTL_SECS: i64 = 300;
 
+/// How long a lapsed lease row is kept before the startup sweep removes it.
+///
+/// Not a correctness bound: an expired row is already takeable and can never be
+/// renewed, so deleting one changes no outcome. It exists so that a row which
+/// lapsed a moment ago is not deleted and immediately re-inserted by the
+/// takeover about to claim it, and so the table keeps roughly "live plus
+/// recently-lapsed" rather than every task this home has ever run.
+const LEASE_GC_GRACE_SECS: i64 = 3600;
+
+/// One lease, as an operator sees it.
+///
+/// Deliberately **not** the stored row: the owner id never leaves the process.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseInfo {
+    pub task_id: String,
+    /// Six hex characters of the SHA-256 of the owner id — never the id, which
+    /// is `pid-<pid>-<uuid>` and so names a host process. Same shape as
+    /// `WebCredentials::bearer_fingerprint`, and for the same reason: an
+    /// operator needs to tell two holders apart, not to hold one.
+    pub owner_fingerprint: String,
+    pub expires_at: i64,
+    pub renewed_at: i64,
+    /// `expires_at > now`. A lapsed row is still listed — it is what explains a
+    /// task that cannot be started yet.
+    pub live: bool,
+    /// Seconds until expiry; negative once lapsed.
+    pub seconds_remaining: i64,
+}
+
+/// Six hex characters of the SHA-256 of `owner_id`.
+fn owner_fingerprint(owner_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(owner_id.as_bytes())
+        .iter()
+        .take(3)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Backoff between renew attempts after a transient store error: one initial
 /// attempt plus three retries, so a brief SQLite write-lock is not read as a
 /// lost lease.
@@ -758,6 +797,44 @@ impl Supervisor {
     /// [`TaskStore::record_grant_audit`].
     pub async fn audit_grant(&self, actor: &str, reason: &str) -> anyhow::Result<()> {
         self.store.record_grant_audit(actor, reason).await
+    }
+
+    /// Every execution lease, live or lapsed, with the owner id masked.
+    ///
+    /// This is the read half of a table that was previously write-only from the
+    /// application's point of view. It matters operationally because the two
+    /// ways a run is refused are indistinguishable from the outside: a live
+    /// lease held by another process and a lapsed row left by a crashed one both
+    /// produce the same `already_running` refusal, and the refusal's own log
+    /// line deliberately cannot tell them apart. Without this, an operator whose
+    /// task will not start has nothing to look at and no way to learn whether to
+    /// wait for the TTL or go looking for a stuck process.
+    pub async fn leases(&self) -> anyhow::Result<Vec<LeaseInfo>> {
+        let now = chrono::Utc::now().timestamp();
+        Ok(self
+            .store
+            .list_leases()
+            .await?
+            .into_iter()
+            .map(|r| LeaseInfo {
+                owner_fingerprint: owner_fingerprint(&r.owner_id),
+                live: r.expires_at > now,
+                seconds_remaining: r.expires_at.saturating_sub(now),
+                task_id: r.task_id,
+                expires_at: r.expires_at,
+                renewed_at: r.renewed_at,
+            })
+            .collect())
+    }
+
+    /// Delete lease rows that lapsed more than [`LEASE_GC_GRACE_SECS`] ago.
+    ///
+    /// Called once at startup, which is the case that matters: the rows worth
+    /// reclaiming are the ones a crashed process left behind, and a running
+    /// process reaps its own on release. Answers how many rows went, so the
+    /// caller can log it without a second query.
+    pub async fn sweep_lapsed_leases(&self) -> anyhow::Result<usize> {
+        self.store.sweep_expired_leases(LEASE_GC_GRACE_SECS).await
     }
 
     /// Would this task select the shell backend?
@@ -1634,6 +1711,178 @@ mod tests {
             |r| r.get::<_, String>(0),
         )
         .ok()
+    }
+
+    /// **The sweep is the query the expiry index was built for, and this pins
+    /// that it really uses it.**
+    ///
+    /// The schema kept `idx_sup_execution_leases_expiry` with a comment saying it
+    /// was "kept for the expiry-driven sweep/reclaim query ... that would
+    /// otherwise scan the whole table", and warned: "Do not cite a performance
+    /// benefit the current paths do not have." Until this sweep existed there was
+    /// no such query, so the index was **write-only amplification** — rewritten on
+    /// every 60 s heartbeat renewal, per running task, read by nothing. An index
+    /// that no plan names is the same defect as a function no code calls, so the
+    /// plan is asserted rather than assumed.
+    #[tokio::test]
+    async fn the_lease_sweep_is_the_query_the_expiry_index_exists_for() {
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conn = memory.connection();
+        let conn = conn.lock().await;
+        let mut stmt = conn
+            .prepare("EXPLAIN QUERY PLAN DELETE FROM sup_execution_leases WHERE expires_at <= ?1")
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([0i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("idx_sup_execution_leases_expiry"),
+            "the sweep must use the expiry index, or it is a full table scan and the \
+             index buys nothing: {plan}"
+        );
+    }
+
+    /// The sweep removes what lapsed past the grace and keeps everything else.
+    #[tokio::test]
+    async fn the_lease_sweep_removes_lapsed_rows_and_keeps_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+
+        for id in ["live", "lapsed", "recent"] {
+            assert!(sup.store().acquire_lease(id, "owner", 300).await.unwrap());
+        }
+        {
+            let conn = memory.connection();
+            let conn = conn.lock().await;
+            let now = chrono::Utc::now().timestamp();
+            // Past the grace.
+            conn.execute(
+                "UPDATE sup_execution_leases SET expires_at=?1 WHERE task_id='lapsed'",
+                rusqlite::params![now - 10_000],
+            )
+            .unwrap();
+            // Lapsed, but inside it: kept, so a takeover about to claim it is
+            // not racing a delete.
+            conn.execute(
+                "UPDATE sup_execution_leases SET expires_at=?1 WHERE task_id='recent'",
+                rusqlite::params![now - 10],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            sup.sweep_lapsed_leases().await.unwrap(),
+            1,
+            "exactly the row past the grace may go"
+        );
+
+        let left: Vec<String> = sup
+            .leases()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.task_id)
+            .collect();
+        assert!(
+            left.contains(&"live".to_string()),
+            "a live lease survives: {left:?}"
+        );
+        assert!(
+            left.contains(&"recent".to_string()),
+            "a row inside the grace survives: {left:?}"
+        );
+        assert!(
+            !left.contains(&"lapsed".to_string()),
+            "the lapsed row is gone: {left:?}"
+        );
+    }
+
+    /// **The owner id never reaches a caller.** It is `pid-<pid>-<uuid>`, so it
+    /// names a host process, and this codebase already refuses to log it. The
+    /// listing masks it the same way the dashboard masks a bearer token, and a
+    /// lapsed row stays visible — it is what explains a task that will not start.
+    #[tokio::test]
+    async fn the_lease_listing_masks_the_owner_and_reports_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let sup = Supervisor::new_for_test(dir.path().into(), memory.connection());
+
+        assert!(sup
+            .store()
+            .acquire_lease("t1", "pid-4242-secret-uuid", 300)
+            .await
+            .unwrap());
+        assert!(sup
+            .store()
+            .acquire_lease("t2", "pid-9999-other", 300)
+            .await
+            .unwrap());
+
+        let raw = lease_owner(&memory, "t1").await.unwrap();
+        assert!(
+            raw.contains("4242"),
+            "the fixture must carry the pid to be a test"
+        );
+
+        let leases = sup.leases().await.unwrap();
+        let l = leases.iter().find(|l| l.task_id == "t1").expect("listed");
+        assert!(l.live, "a 300 s lease is live");
+        assert!(l.seconds_remaining > 0, "and has time left");
+        assert_eq!(
+            l.owner_fingerprint.len(),
+            6,
+            "same shape as a bearer fingerprint"
+        );
+        assert!(
+            !l.owner_fingerprint.contains("4242"),
+            "the pid must not survive masking: {}",
+            l.owner_fingerprint
+        );
+        assert_ne!(l.owner_fingerprint, raw);
+        // Stable for one owner, and distinct between two — otherwise an operator
+        // could not tell two holders apart, which is the only thing it is for.
+        let again = sup.leases().await.unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .find(|l| l.task_id == "t1")
+                .unwrap()
+                .owner_fingerprint,
+            l.owner_fingerprint
+        );
+        assert_ne!(
+            again
+                .iter()
+                .find(|l| l.task_id == "t2")
+                .unwrap()
+                .owner_fingerprint,
+            l.owner_fingerprint
+        );
+
+        // A lapsed row is still listed, and says so.
+        {
+            let conn = memory.connection();
+            let conn = conn.lock().await;
+            conn.execute(
+                "UPDATE sup_execution_leases SET expires_at=?1 WHERE task_id='t1'",
+                rusqlite::params![chrono::Utc::now().timestamp() - 5],
+            )
+            .unwrap();
+        }
+        let leases = sup.leases().await.unwrap();
+        let l = leases
+            .iter()
+            .find(|l| l.task_id == "t1")
+            .expect("still listed");
+        assert!(!l.live, "an expired row is not live");
+        assert!(
+            l.seconds_remaining < 0,
+            "and its remaining time is negative"
+        );
     }
 
     #[tokio::test]

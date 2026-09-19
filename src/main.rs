@@ -584,6 +584,17 @@ async fn main() -> Result<()> {
         .with_grants(Arc::clone(&grants))
         .with_sandbox_root(config.sandbox.allowed_directory.clone()),
     );
+    // Reclaim lease rows a crashed process left behind. Startup is the case that
+    // matters: a running process reaps its own on release, and an expired row is
+    // already takeable, so this bounds the table rather than unblocking
+    // anything. It is also the only caller of the query
+    // `idx_sup_execution_leases_expiry` was created for.
+    match _supervisor.sweep_lapsed_leases().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(rows = n, "reclaimed lapsed execution leases"),
+        // Never fatal: a failed sweep costs disk, not correctness.
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "could not sweep lapsed leases"),
+    }
     match _supervisor.resumable_task_ids().await {
         Ok(ids) if !ids.is_empty() => info!(
             "  Supervisor: {} resumable task(s) found at startup",

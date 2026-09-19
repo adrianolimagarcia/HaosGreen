@@ -337,22 +337,24 @@ impl MemoryStore {
                 expires_at INTEGER NOT NULL,
                 renewed_at INTEGER NOT NULL
             );
-            -- Forward-looking, and deliberately kept: nothing queries
-            -- `expires_at` on its own today. `renew_lease` and `release_lease`
+            -- Read by exactly one query: the expiry-driven sweep in
+            -- `TaskStore::sweep_expired_leases` (`DELETE ... WHERE expires_at <=
+            -- ?1`), called once at startup. `renew_lease` and `release_lease`
             -- both report `SEARCH sup_execution_leases USING INDEX
             -- sqlite_autoindex_sup_execution_leases_1 (task_id=?)` under
             -- `EXPLAIN QUERY PLAN` — they are key- and owner-addressed, so they
-            -- cannot use this index. The takeover is an upsert whose conflict
-            -- target is the PRIMARY KEY, so its `expires_at <= ?now` predicate is
-            -- applied to the one row that key lookup found; `EXPLAIN QUERY PLAN`
-            -- reports nothing at all for it, because an `INSERT ... VALUES` has
-            -- no query plan to show. Only a query filtered by `expires_at` alone
-            -- uses this index, and no such query exists. It is therefore
-            -- write-only amplification for now — its entry is rewritten on every
-            -- renewal — and is kept for the expiry-driven sweep/reclaim query
-            -- (find and free leases that lapsed) that would otherwise scan the
-            -- whole table. Do not cite a performance benefit the current paths do
-            -- not have.
+            -- cannot use this index — and the takeover is an upsert whose
+            -- conflict target is the PRIMARY KEY, so its `expires_at <= ?now`
+            -- predicate is applied to the one row that key lookup found. The
+            -- sweep is therefore the **only** reader, and this comment used to
+            -- say the opposite: it described the index as write-only
+            -- amplification for now, kept for a sweep that did not exist, and
+            -- warned not to cite a benefit the current paths did not have. That
+            -- was accurate and was the defect — an index rewritten on every 60 s
+            -- heartbeat renewal, per running task, read by nothing. The sweep
+            -- exists now, and `the_lease_sweep_is_the_query_the_expiry_index_
+            -- exists_for` asserts the plan still names this index, so it cannot
+            -- quietly become dead weight again.
             CREATE INDEX IF NOT EXISTS idx_sup_execution_leases_expiry
                 ON sup_execution_leases(expires_at);
 

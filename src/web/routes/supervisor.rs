@@ -8,6 +8,7 @@
 //! POST /api/supervisor/tasks/{id}/resume
 //! POST /api/supervisor/tasks/{id}/cancel
 //! POST /api/supervisor/tasks/{id}/approve
+//! GET  /api/supervisor/leases           -> { leases: [LeaseInfo] }
 //! ```
 //!
 //! Every route is on the guarded router, so a caller has already passed the
@@ -64,6 +65,7 @@ pub fn router() -> Router<WebState> {
         .route("/api/supervisor/tasks/{id}/resume", post(resume_task))
         .route("/api/supervisor/tasks/{id}/cancel", post(cancel_task))
         .route("/api/supervisor/tasks/{id}/approve", post(approve_task))
+        .route("/api/supervisor/leases", get(list_leases))
         .route("/api/supervisor/grants", get(list_grants))
         .route("/api/supervisor/grants/allow", post(allow_grant))
         .route("/api/supervisor/grants/deny", post(deny_grant))
@@ -75,6 +77,13 @@ pub fn router() -> Router<WebState> {
 struct GrantRequest {
     path: Option<String>,
     network: Option<bool>,
+}
+
+/// The lease listing. Owner ids are already masked by `Supervisor::leases`;
+/// this struct cannot reintroduce one.
+#[derive(serde::Serialize)]
+struct LeaseList {
+    leases: Vec<crate::supervisor::LeaseInfo>,
 }
 
 #[derive(serde::Serialize)]
@@ -103,6 +112,25 @@ const DASHBOARD_ACTOR: &str = "dashboard";
 
 /// The body of every malformed grant request.
 const GRANT_SHAPE: &str = "send exactly one of `path` or `network`";
+
+/// Every execution lease, live or lapsed.
+///
+/// The read half of a table that was write-only from the application's point of
+/// view. Both ways a run is refused — a live lease held elsewhere, and a lapsed
+/// row from a crashed process — produce the same `already_running` answer, so
+/// without this an operator has nothing to look at. The owner id is masked to a
+/// six-character fingerprint before it reaches this body; the raw value is
+/// `pid-<pid>-<uuid>` and names a host process.
+async fn list_leases(State(state): State<WebState>) -> Response {
+    let supervisor = match state.supervisor_or_unavailable() {
+        Ok(supervisor) => supervisor,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    match supervisor.leases().await {
+        Ok(leases) => Json(LeaseList { leases }).into_response(),
+        Err(e) => internal_error("list sup_execution_leases", &e),
+    }
+}
 
 async fn list_grants(State(state): State<WebState>) -> Response {
     let supervisor = match state.supervisor_or_unavailable() {

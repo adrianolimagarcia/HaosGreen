@@ -190,6 +190,72 @@ async fn enable_bearer_and_get_token(base: &str, cookie: &str) -> String {
 
 // ── The guard ───────────────────────────────────────────────────────────────
 
+/// `GET /api/supervisor/leases` answers "who holds this task, and until when".
+///
+/// This is the read half of `sup_execution_leases`, which was write-only from
+/// the application's point of view. It matters because the two ways a run is
+/// refused are indistinguishable from outside — a live lease held by another
+/// process and a lapsed row left by a crashed one both answer the same
+/// `already_running`, and that refusal's log line deliberately cannot tell them
+/// apart — so without this an operator whose task will not start has nothing to
+/// look at.
+///
+/// The assertion that carries the weight is the last one: the **raw owner id is
+/// nowhere in the serialised body**. It is `pid-<pid>-<uuid>`, so it names a
+/// host process, and this codebase already refuses to log it.
+#[tokio::test]
+async fn the_dashboard_lists_execution_leases_with_the_owner_masked() {
+    let (base, _dir, supervisor) = spawn_test_server_with_supervisor().await;
+    let cookie = login_and_get_cookie(&base, "admin").await;
+    let client = reqwest::Client::new();
+
+    // Empty to begin with — and an array, not a missing field.
+    let r = client
+        .get(format!("{base}/api/supervisor/leases"))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .expect("list leases");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("lease json");
+    assert_eq!(body["leases"], serde_json::json!([]));
+
+    // One live lease, taken straight through the store the route reads.
+    assert!(supervisor
+        .store()
+        .acquire_lease("task-under-test", "pid-31337-hidden", 300)
+        .await
+        .expect("acquire"));
+
+    let r = client
+        .get(format!("{base}/api/supervisor/leases"))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .expect("list leases");
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.expect("lease json");
+    let l = &body["leases"][0];
+    assert_eq!(l["task_id"], "task-under-test");
+    assert_eq!(l["live"], true, "a 300 s lease is live");
+    assert!(
+        l["seconds_remaining"].as_i64().unwrap() > 0,
+        "and has time left: {l}"
+    );
+    let fp = l["owner_fingerprint"]
+        .as_str()
+        .expect("a fingerprint string");
+    assert_eq!(fp.len(), 6, "same shape as a bearer fingerprint");
+    assert!(
+        !fp.contains("31337"),
+        "the pid must not survive masking: {fp}"
+    );
+    assert!(
+        !body.to_string().contains("pid-31337-hidden"),
+        "the raw owner id leaked into the body: {body}"
+    );
+}
+
 /// The dashboard grant routes: list, grant, revoke, and refuse a bad body.
 ///
 /// Each refusal is asserted to be a **400**, not merely non-200: a route that
@@ -349,7 +415,7 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
     // header is sent on all of them so the request reaches the authentication
     // check rather than being stopped by the CSRF gate first: this test is
     // about authentication.
-    let cases: [(&str, &str, Option<serde_json::Value>); 27] = [
+    let cases: [(&str, &str, Option<serde_json::Value>); 28] = [
         ("GET", "/api/settings", None),
         (
             "POST",
@@ -393,6 +459,10 @@ async fn every_protected_route_refuses_an_unauthenticated_caller() {
         ("POST", "/api/supervisor/tasks/nope/resume", None),
         ("POST", "/api/supervisor/tasks/nope/cancel", None),
         ("POST", "/api/supervisor/tasks/nope/approve", None),
+        // The lease surface. Read-only, and the owner id is masked before it
+        // reaches the body, but it still belongs here: it is new, and the sweep
+        // is the list of routes a missing guard would expose.
+        ("GET", "/api/supervisor/leases", None),
         // The grant surface. `/allow` widens the shell boundary — it is the
         // route on which a missing guard would hand a caller the filesystem —
         // so it belongs in the sweep more than any of the lifecycle routes.
