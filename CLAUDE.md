@@ -796,8 +796,11 @@ cannot disagree:
 - **Layer 2 (run time)** — `ShellBackend::run` refuses to spawn at all and
   returns a `Failed` job naming the cause.
 
-The base set is bound **read-only** (`/usr /bin /lib /lib64 /proc /dev`, the
-three resolver files, and both certificate paths), and `/etc/ssl/certs` **plus**
+The base set is bound **read-only**, but it is not six host binds: **only `/usr`
+is a `--ro-bind` of the host**. `/bin`, `/lib` and `/lib64` are `--symlink`s into
+it, and `/proc` and `/dev` are bubblewrap's own fresh mounts (`--proc`, `--dev`),
+not the host's. With them come three resolver files and both certificate paths,
+all read-only — and `/etc/ssl/certs` **plus**
 `/etc/ca-certificates` are both required for TLS: on Arch/CachyOS the bundle is a
 symlink into the latter, so binding the first alone leaves it dangling and `curl`
 fails with `(77) error adding trust anchors`. A network namespace is shared only

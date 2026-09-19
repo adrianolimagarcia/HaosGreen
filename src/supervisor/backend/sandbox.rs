@@ -707,6 +707,11 @@ impl Grants {
     }
 
     /// Does the held set cover everything this declaration asks for?
+    /// Test-only: production asks [`Self::missing`] so it can *name* what is
+    /// absent, and a bare `bool` throws that away. It was `pub` with no
+    /// production caller, which `#![deny(dead_code)]` does not catch inside a
+    /// `pub mod` chain — the same shape as `SandboxArgv::argv`.
+    #[cfg(test)]
     pub fn covers(&self, declared: &Grants) -> bool {
         self.missing(declared).is_empty()
     }
@@ -931,6 +936,14 @@ pub fn build_argv(job_dir: &JobDir, grants: &Grants, command: &str) -> anyhow::R
         "--setenv".into(),
         "PATH".into(),
         "/usr/bin:/bin".into(),
+        // Measured: `TMPDIR` is absent under `--clearenv`, and while `mktemp`
+        // falls back to `/tmp` by convention and works, tools that read the
+        // variable rather than the convention would not. `/tmp` is bwrap's own
+        // fresh tmpfs — a probe showed it holding only the files that same job
+        // created — so pointing at it adds no reachability.
+        "--setenv".into(),
+        "TMPDIR".into(),
+        "/tmp".into(),
         "--ro-bind".into(),
         "/usr".into(),
         "/usr".into(),

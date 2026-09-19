@@ -223,15 +223,43 @@ struct Capture {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     /// At least one pipe reached [`MAX_OUTPUT_BYTES`], so the child was killed.
+    /// Incomplete by a **known and bounded** amount.
     truncated: bool,
+    /// A read failed, or a reader task did not finish cleanly, so **how much is
+    /// missing is unknown**. Strictly worse than `truncated`, and it used to be
+    /// reported as the *better* of the two — see [`ReadEnd::Failed`].
+    incomplete: bool,
     /// A pipe was still open when the capture stopped. Only
     /// [`POST_CAP_DRAIN_GRACE`] or the job's deadline can cause it, and
     /// `truncated` says which.
     gave_up: bool,
 }
 
-/// Read a pipe to EOF, or to `cap` bytes — whichever comes first. The `bool` is
-/// `true` when the cap is what stopped it.
+/// Why a bounded read stopped.
+///
+/// Three outcomes, not two. The old signature was `(Vec<u8>, bool)` where `bool`
+/// meant "the cap stopped it", and a **read error returned `false`** — the same
+/// value a clean EOF produces. So a read that failed partway was
+/// indistinguishable from one that finished, and a job that exited 0 reported
+/// `Succeeded` over output it had only partly captured.
+///
+/// That inverted the design's own principle. Truncation by the cap is `Failed`
+/// precisely because the summary is known-incomplete and
+/// `Backend::verify_result` reads `Succeeded` as "this output can be trusted". A
+/// summary that is incomplete by an *unknown* amount is less trustworthy than
+/// one truncated at a known byte count, so it cannot be the single case that
+/// passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadEnd {
+    /// The pipe reached EOF: the capture is complete.
+    Eof,
+    /// The cap stopped it, and the child was killed for it.
+    Capped,
+    /// The read failed. Incomplete by an unknown amount.
+    Failed,
+}
+
+/// Read a pipe to EOF, or to `cap` bytes — whichever comes first.
 ///
 /// The reader is **owned**, not borrowed, and that is load-bearing: when this
 /// future completes, the `ChildStdout`/`ChildStderr` it holds is dropped, which
@@ -241,21 +269,20 @@ struct Capture {
 async fn read_capped<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut r: R,
     cap: usize,
-) -> (Vec<u8>, bool) {
+) -> (Vec<u8>, ReadEnd) {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk).await {
-            // A read error is an end, not a failure: the child's exit status is
-            // what reports failure, and a job whose pipe died has no more output
-            // to give either way.
-            Ok(0) | Err(_) => return (buf, false),
+            Ok(0) => return (buf, ReadEnd::Eof),
+            // **Not** an end, and not a clean one. See [`ReadEnd`].
+            Err(_) => return (buf, ReadEnd::Failed),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() >= cap {
                     buf.truncate(cap);
-                    return (buf, true);
+                    return (buf, ReadEnd::Capped);
                 }
             }
         }
@@ -286,15 +313,17 @@ async fn capture_capped(
             stdout: Vec::new(),
             stderr: Vec::new(),
             truncated: false,
+            incomplete: false,
             gave_up: false,
         };
     };
     let mut out = tokio::spawn(read_capped(stdout_pipe, MAX_OUTPUT_BYTES));
     let mut err = tokio::spawn(read_capped(stderr_pipe, MAX_OUTPUT_BYTES));
 
-    let mut out_res: Option<(Vec<u8>, bool)> = None;
-    let mut err_res: Option<(Vec<u8>, bool)> = None;
+    let mut out_res: Option<(Vec<u8>, ReadEnd)> = None;
+    let mut err_res: Option<(Vec<u8>, ReadEnd)> = None;
     let mut truncated = false;
+    let mut incomplete = false;
     let mut killed = false;
     let mut drain_until: Option<tokio::time::Instant> = None;
 
@@ -303,21 +332,29 @@ async fn capture_capped(
         // restart it. The grace only exists once the cap has fired.
         let until = drain_until.unwrap_or(deadline_at);
         tokio::select! {
+            // `unwrap_or` covers a `JoinError`: the reader task panicked or was
+            // aborted, so there is no buffer at all. That is the same
+            // unknown-incomplete case as a read error, and it used to yield
+            // `(Vec::new(), false)` — an **empty** capture reported as a
+            // successful one.
             r = &mut out, if out_res.is_none() => {
-                let (buf, hit) = r.unwrap_or_else(|_| (Vec::new(), false));
-                truncated |= hit;
-                out_res = Some((buf, hit));
+                let (buf, end) = r.unwrap_or((Vec::new(), ReadEnd::Failed));
+                truncated |= end == ReadEnd::Capped;
+                incomplete |= end == ReadEnd::Failed;
+                out_res = Some((buf, end));
             }
             r = &mut err, if err_res.is_none() => {
-                let (buf, hit) = r.unwrap_or_else(|_| (Vec::new(), false));
-                truncated |= hit;
-                err_res = Some((buf, hit));
+                let (buf, end) = r.unwrap_or((Vec::new(), ReadEnd::Failed));
+                truncated |= end == ReadEnd::Capped;
+                incomplete |= end == ReadEnd::Failed;
+                err_res = Some((buf, end));
             }
             _ = tokio::time::sleep_until(until) => {
                 return Capture {
                     stdout: out_res.take().map(|(b, _)| b).unwrap_or_default(),
                     stderr: err_res.take().map(|(b, _)| b).unwrap_or_default(),
                     truncated,
+                    incomplete,
                     gave_up: true,
                 };
             }
@@ -325,13 +362,31 @@ async fn capture_capped(
         if truncated && !killed {
             killed = true;
             let _ = child.start_kill();
-            drain_until = Some(tokio::time::Instant::now() + POST_CAP_DRAIN_GRACE);
+            // Clamped to the deadline. The grace exists so a killed child's
+            // pipe can drain, and it must not become a way for a job to outlive
+            // its own `timeout_secs`: without the `min`, a job with a 1 s
+            // timeout whose output hit the cap could run ~2 s past it.
+            //
+            // **REVIEWED, not TESTED.** Two attempts at a test both finished in
+            // 0.02 s, and the second one passed with this `min` deleted — so
+            // neither exercised the drain at all. The loop exits as soon as
+            // *both* readers complete, the stdout reader returns at the cap, and
+            // the stderr reader EOFs because nothing held that pipe; a
+            // grandchild that keeps a pipe open past the kill is what would make
+            // the grace load-bearing, and `sleep 30 &` (with and without `wait`,
+            // with `>&1`) did not do it. A test that passes for the wrong reason
+            // is worse than no test, so this is fixed by inspection only.
+            drain_until = Some(std::cmp::min(
+                tokio::time::Instant::now() + POST_CAP_DRAIN_GRACE,
+                deadline_at,
+            ));
         }
     }
     Capture {
         stdout: out_res.take().map(|(b, _)| b).unwrap_or_default(),
         stderr: err_res.take().map(|(b, _)| b).unwrap_or_default(),
         truncated,
+        incomplete,
         gave_up: false,
     }
 }
@@ -572,17 +627,27 @@ impl Backend for ShellBackend {
         if captured.truncated {
             errors.push(format!("output exceeded the {MAX_OUTPUT_BYTES}-byte cap"));
         }
+        if captured.incomplete {
+            errors.push(
+                "the command's output could not be read to the end, so the summary below is \
+                 incomplete by an unknown amount"
+                    .to_string(),
+            );
+        }
         if !stderr.is_empty() {
             errors.push(stderr);
         }
-        // A truncated capture is incomplete by construction, so the job is not a
-        // success even when the child exited 0: `Backend::verify_result` reads
-        // `Succeeded` as "this output can be trusted".
-        let status = if captured.truncated || !exit.is_some_and(|s| s.success()) {
-            JobStatus::Failed
-        } else {
-            JobStatus::Succeeded
-        };
+        // An incomplete capture is not a success even when the child exited 0:
+        // `Backend::verify_result` reads `Succeeded` as "this output can be
+        // trusted", and output that is known-incomplete — or worse, incomplete
+        // by an unknown amount — is not. Both cases are here, not just the one
+        // with a bounded byte count.
+        let status =
+            if captured.truncated || captured.incomplete || !exit.is_some_and(|s| s.success()) {
+                JobStatus::Failed
+            } else {
+                JobStatus::Succeeded
+            };
         job.status = status.clone();
         Ok(JobOutput {
             status,
@@ -693,6 +758,49 @@ mod tests {
             "Unconfined is the operator's consent, so the declaration must not gate it; \
              got {out:?}"
         );
+    }
+
+    /// A reader that fails on its first read, standing in for a pipe that dies
+    /// partway through a capture.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("the pipe died")))
+        }
+    }
+
+    /// **The three ends of a bounded read must stay distinguishable.**
+    ///
+    /// This is the whole of the L5 fix. A read error used to return the *same*
+    /// `bool` a clean EOF returns, so a capture that failed partway was
+    /// indistinguishable from one that finished — and the verdict, which reads
+    /// only `truncated`, then reported `Succeeded` over output it had partly
+    /// captured. The cap case was already `Failed` because the summary is
+    /// known-incomplete; an unknown-incomplete summary is less trustworthy
+    /// still, so it cannot be the one case that passes.
+    #[tokio::test]
+    async fn a_failed_read_is_not_reported_as_a_clean_end() {
+        let (buf, end) = read_capped(FailingReader, MAX_OUTPUT_BYTES).await;
+        assert!(buf.is_empty());
+        assert_eq!(
+            end,
+            ReadEnd::Failed,
+            "a failed read must not be indistinguishable from EOF"
+        );
+
+        // The two clean ends stay distinct from each other as well, so the new
+        // variant did not collapse them.
+        let (_, eof) = read_capped(std::io::Cursor::new(Vec::<u8>::new()), MAX_OUTPUT_BYTES).await;
+        assert_eq!(eof, ReadEnd::Eof);
+
+        let (buf, capped) = read_capped(std::io::Cursor::new(vec![b'x'; 16]), 4).await;
+        assert_eq!(capped, ReadEnd::Capped);
+        assert_eq!(buf.len(), 4, "the cap is what stopped it, at the cap");
     }
 
     #[tokio::test]

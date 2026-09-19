@@ -390,7 +390,14 @@ with these invariants, each a hard failure rather than a warning:
   is not containment.
 
   Against a filesystem that is not being modified underneath the call, a path
-  that is going to be refused is refused before anything is created. A
+  that is going to be refused **by this containment check** is refused before
+  anything is created. That scope is the whole claim, and it is narrower than it
+  reads: the check lives in `resolve_job_dir`, and a job refused *later* — by
+  Layer 2's grant refusal in `ShellBackend::run`, which runs after
+  `resolve_job_dir` has returned — has already had its
+  `<root>/<task-id>/<job-id>` directory created. A refused job gains nothing from
+  an empty directory, so this is a documentation correction and not a defect, but
+  "refused before anything is created" does not hold for that path. A
   **concurrent** writer is a different claim, and revisions 3 and 4 stated a
   stronger one than the code could deliver: with creation by path, a writer
   looping on the swap of `<root>/<task-id>` got a directory created outside the
