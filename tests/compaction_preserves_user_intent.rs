@@ -23,7 +23,7 @@ fn failing_llm() -> LlmClient {
         max_tokens: 100,
         discover_models: false,
         context_window: 4096,
-        context_window_cache: Arc::new(tokio::sync::RwLock::new(None)),
+        context_window_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         parse_retry_limit: 0,
     };
     let provider: Arc<dyn haos_green::provider::Provider> =

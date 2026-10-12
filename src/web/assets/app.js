@@ -1460,23 +1460,78 @@
 
   const ROLE_LABELS = { user: "You", assistant: "Agent", error: "Error", note: "Note" };
 
+  function estimatedTokens(text) {
+    const value = typeof text === "string" ? text : "";
+    return Math.max(1, Math.ceil(value.length / 4));
+  }
+
   function chatBubble(message) {
     const root = make("div", "msg msg-" + message.role);
     if (message.role === "error") {
       root.setAttribute("role", "status");
     }
-    root.appendChild(make("span", "msg-role", ROLE_LABELS[message.role] || message.role));
 
-    const body = make("div", "msg-body");
-    body.textContent = message.text;
-    root.appendChild(body);
+    let body;
+    let tokens = null;
 
-    if (message.streaming && message.text === "") {
-      // Nothing to show yet; the working indicator below the log covers the
-      // pause before the first token.
-      root.hidden = true;
+    if (message.role === "user") {
+      body = make("div", "msg-bubble user-bubble");
+      body.textContent = message.text;
+      root.appendChild(make("span", "sr-only", "You"));
+      root.appendChild(body);
+      const avatar = make("div", "avatar user-avatar");
+      avatar.appendChild(icon("i-user"));
+      root.appendChild(avatar);
+    } else if (message.role === "assistant") {
+      const avatar = make("div", "avatar bot-avatar robot-mark");
+      avatar.appendChild(make("span", "antenna"));
+      const face = make("span", "face");
+      face.appendChild(make("b"));
+      face.appendChild(make("b"));
+      face.appendChild(make("em"));
+      avatar.appendChild(face);
+      root.appendChild(avatar);
+
+      const stack = make("div", "msg-stack");
+      const meta = make("div", "message-meta");
+      meta.appendChild(make("strong", null, "HaosGreen"));
+      tokens = make("span", "msg-tokens", "~" + estimatedTokens(message.text) + " tok");
+      tokens.title = "Estimated from message length";
+      meta.appendChild(tokens);
+      meta.appendChild(make("time", "msg-time", "Agora"));
+      stack.appendChild(meta);
+
+      body = make("div", "msg-bubble ai-bubble");
+      body.textContent = message.text;
+      stack.appendChild(body);
+      root.appendChild(stack);
+
+      if (message.text !== "") {
+        const tools = make("div", "message-tools");
+        const copy = button("Copy", "btn", "button");
+        copy.setAttribute("aria-label", "Copy response");
+        copy.textContent = "";
+        copy.appendChild(icon("i-copy"));
+        copy.addEventListener("click", function () {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+            navigator.clipboard.writeText(message.text).then(function () {
+              copy.title = "Copied";
+            }).catch(function () {
+              copy.title = "Copy unavailable";
+            });
+          }
+        });
+        tools.appendChild(copy);
+        root.appendChild(tools);
+      }
+    } else {
+      body = make("div", "msg-bubble " + (message.role === "note" ? "note-bubble" : "err-bubble"));
+      body.textContent = message.text;
+      root.appendChild(make("span", "sr-only", ROLE_LABELS[message.role] || message.role));
+      root.appendChild(body);
     }
-    return { root: root, body: body };
+
+    return { root: root, body: body, tokens: tokens };
   }
 
   function renderChatLog() {
@@ -1487,6 +1542,15 @@
 
     clear(dom.log);
     chat.live = null;
+
+    const ghost = make("div", "hero-ghost");
+    ghost.setAttribute("aria-hidden", "true");
+    const ghostRobot = make("div", "ghost-robot");
+    ghostRobot.appendChild(make("span"));
+    ghostRobot.appendChild(make("i"));
+    ghostRobot.appendChild(make("i"));
+    ghost.appendChild(ghostRobot);
+    dom.log.appendChild(ghost);
 
     if (chat.messages.length === 0) {
       dom.log.appendChild(chatEmptyState());
@@ -1705,6 +1769,9 @@
       if (chat.live) {
         chat.live.root.hidden = false;
         chat.live.body.textContent = message.text;
+        if (chat.live.tokens) {
+          chat.live.tokens.textContent = "~" + estimatedTokens(message.text) + " tok";
+        }
       }
     }
     renderChatWorking();
@@ -2225,11 +2292,14 @@
     input.id = "chat-input";
     input.name = "chat-input";
     input.rows = 1;
-    input.placeholder = "Message the agent…";
+    input.placeholder = "Mensagem para o HaosGreen… (Enter envia, Shift+Enter pula linha)";
     input.setAttribute("aria-label", "Message");
     input.spellcheck = false;
 
-    const send = button("Send", "btn btn-accent", "submit");
+    const send = button("Send", "send-btn", "submit");
+    send.setAttribute("aria-label", "Send message");
+    send.textContent = "";
+    send.appendChild(icon("i-send"));
 
     input.addEventListener("input", function () {
       autosizeComposer(input);

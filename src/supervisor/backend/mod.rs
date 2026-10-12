@@ -146,28 +146,47 @@ pub async fn run_cli_process(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // Ignore write errors: the process may exit before reading all stdin.
-        let _ = stdin.write_all(prompt.as_bytes()).await;
-        let _ = stdin.shutdown().await;
-    }
-    let output =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-            .await
-        {
-            Ok(res) => res?,
-            Err(_) => {
-                job.status = JobStatus::Failed;
-                return Ok(JobOutput {
-                    status: JobStatus::Failed,
-                    summary: String::new(),
-                    evidence: vec![],
-                    errors: vec![format!("CLI timed out after {timeout_secs}s")],
-                    changed_files: vec![],
-                    next_step: None,
-                });
+    let stdin_opt = child.stdin.take();
+
+    let execute_fut = async {
+        let stdin_fut = async {
+            if let Some(mut stdin) = stdin_opt {
+                // Ignore write errors: the process may exit before reading all stdin.
+                let _ = stdin.write_all(prompt.as_bytes()).await;
+                let _ = stdin.shutdown().await;
             }
         };
+        let wait_fut = child.wait_with_output();
+        tokio::pin!(stdin_fut);
+        tokio::pin!(wait_fut);
+        let mut stdin_done = false;
+
+        loop {
+            tokio::select! {
+                _ = &mut stdin_fut, if !stdin_done => {
+                    stdin_done = true;
+                }
+                res = &mut wait_fut => {
+                    return res;
+                }
+            }
+        }
+    };
+
+    let output = match tokio::time::timeout(Duration::from_secs(timeout_secs), execute_fut).await {
+        Ok(res) => res?,
+        Err(_) => {
+            job.status = JobStatus::Failed;
+            return Ok(JobOutput {
+                status: JobStatus::Failed,
+                summary: String::new(),
+                evidence: vec![],
+                errors: vec![format!("CLI timed out after {timeout_secs}s")],
+                changed_files: vec![],
+                next_step: None,
+            });
+        }
+    };
     let exit = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -232,5 +251,75 @@ mod tests {
         reg.register(Arc::new(DummyReasoning));
         let chosen = reg.select_for(&["reasoning".into()]).unwrap();
         assert_eq!(chosen.name(), "dummy-reasoning");
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_process_echoes_stdin_and_drains_output() {
+        let mut job = Job::new(
+            "job-1",
+            crate::supervisor::job::JobType::ExecutorJob,
+            "test",
+            "test echo",
+        );
+        job.prompt = Some("hello world from stdin".to_string());
+        job.timeout_secs = 10;
+        let workdir = std::env::temp_dir();
+        let args = vec!["-c".to_string(), "cat".to_string()];
+
+        let output = run_cli_process(&mut job, "sh", &args, &workdir)
+            .await
+            .expect("run_cli_process should succeed");
+
+        assert_eq!(output.status, crate::supervisor::job::JobStatus::Succeeded);
+        assert_eq!(output.summary, "hello world from stdin");
+        assert_eq!(job.status, crate::supervisor::job::JobStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_process_handles_large_stdin_concurrently() {
+        let mut job = Job::new(
+            "job-2",
+            crate::supervisor::job::JobType::ExecutorJob,
+            "test",
+            "test large stdin",
+        );
+        // 128KB prompt exceeds typical OS pipe buffer (64KB)
+        let large_prompt = "A".repeat(128 * 1024);
+        job.prompt = Some(large_prompt.clone());
+        job.timeout_secs = 10;
+        let workdir = std::env::temp_dir();
+        let args = vec!["-c".to_string(), "wc -c".to_string()];
+
+        let output = run_cli_process(&mut job, "sh", &args, &workdir)
+            .await
+            .expect("run_cli_process should succeed without pipe buffer deadlock");
+
+        assert_eq!(output.status, crate::supervisor::job::JobStatus::Succeeded);
+        assert_eq!(output.summary.trim(), (128 * 1024).to_string());
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_process_times_out() {
+        let mut job = Job::new(
+            "job-3",
+            crate::supervisor::job::JobType::ExecutorJob,
+            "test",
+            "test timeout",
+        );
+        job.prompt = Some("test".to_string());
+        job.timeout_secs = 1;
+        let workdir = std::env::temp_dir();
+        let args = vec!["-c".to_string(), "sleep 5".to_string()];
+
+        let output = run_cli_process(&mut job, "sh", &args, &workdir)
+            .await
+            .expect("run_cli_process should return timeout output");
+
+        assert_eq!(output.status, crate::supervisor::job::JobStatus::Failed);
+        assert_eq!(job.status, crate::supervisor::job::JobStatus::Failed);
+        assert!(output
+            .errors
+            .iter()
+            .any(|e| e.contains("CLI timed out after 1s")));
     }
 }

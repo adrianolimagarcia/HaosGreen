@@ -96,6 +96,7 @@ impl MemoryStore {
     /// Falls back to FTS5-only if embeddings are not available.
     pub async fn search_knowledge(&self, query: &str, limit: usize) -> Result<Vec<KnowledgeEntry>> {
         let query_embedding = self.embeddings.try_embed_one(query).await;
+        let fts_query = crate::memory::conversations::sanitize_fts_query(query);
 
         let conn = self.conn.lock().await;
 
@@ -132,9 +133,10 @@ impl MemoryStore {
             let search_limit = (limit * 3) as i64;
             let mut stmt = conn.prepare(sql)?;
             let entries = stmt
-                .query_map(rusqlite::params![query_bytes, search_limit, query], |row| {
-                    parse_knowledge_row(row)
-                })?
+                .query_map(
+                    rusqlite::params![query_bytes, search_limit, fts_query],
+                    parse_knowledge_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()
                 .context("Failed to hybrid-search knowledge")?;
 
@@ -151,7 +153,7 @@ impl MemoryStore {
             ";
             let mut stmt = conn.prepare(sql)?;
             let entries = stmt
-                .query_map(rusqlite::params![query, limit as i64], |row| {
+                .query_map(rusqlite::params![fts_query, limit as i64], |row| {
                     parse_knowledge_row(row)
                 })?
                 .collect::<Result<Vec<_>, _>>()
@@ -216,4 +218,27 @@ fn parse_knowledge_row(row: &rusqlite::Row) -> rusqlite::Result<KnowledgeEntry> 
         value: row.get(3)?,
         source: row.get(4)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_search_knowledge_special_characters_no_fts_error() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        store
+            .remember(
+                "facts",
+                "cplusplus",
+                "how to use C++ and qwen3.8",
+                Some("user"),
+            )
+            .await
+            .unwrap();
+
+        // Searches with punctuation and special chars that previously broke FTS5:
+        for query in &["C++", "qwen3.8", "foo-bar", "como usar C++?"] {
+            let res = store.search_knowledge(query, 5).await;
+            assert!(res.is_ok(), "Query {:?} failed: {:?}", query, res.err());
+        }
+    }
 }

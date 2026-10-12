@@ -61,13 +61,111 @@ pub enum LoopCallbackChoice {
     AddInstruction,
 }
 
+/// The reason a scheduled job was dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunReason {
+    Scheduled,
+    ManualRerun,
+}
+
 /// A request dispatched from a fire closure to the background job runner.
 pub struct ScheduledJobRequest {
     pub incoming: IncomingMessage,
     pub bot: Arc<Bot>,
     pub task_id: String,
     pub is_recurring: bool,
+    pub generation: i64,
+    pub run_reason: RunReason,
     pub task_store: ScheduledTaskStore,
+}
+
+/// Await this registration's decision after its scheduler UUID CAS. Dropping the
+/// sole sender rejects early-return paths; the deadline bounds recurring waits.
+pub async fn dispatch_registered(
+    tx: &tokio::sync::mpsc::Sender<ScheduledJobRequest>,
+    req: ScheduledJobRequest,
+    mut ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let decision = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if *ready.borrow_and_update() {
+                return true;
+            }
+            if ready.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await;
+    if !matches!(decision, Ok(true)) {
+        // A recurring manual callback does not own its active parent's registration.
+        if req.is_recurring && req.run_reason == RunReason::ManualRerun {
+            return;
+        }
+        // Reject only registering: a durable commit may beat timeout/publication.
+        // If it won, the authoritative eligibility check below permits its callback.
+        match req
+            .task_store
+            .reject_registration(&req.task_id, req.generation)
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, "Failed to reject registration callback");
+                return;
+            }
+        }
+    }
+    dispatch_scheduled(tx, req).await;
+}
+
+/// Dispatch without accumulating blocked scheduler callbacks behind a full queue.
+pub async fn dispatch_scheduled(
+    tx: &tokio::sync::mpsc::Sender<ScheduledJobRequest>,
+    req: ScheduledJobRequest,
+) {
+    match req
+        .task_store
+        .is_eligible(&req.task_id, req.generation)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::error!(%error, "Scheduled eligibility lookup failed; refusing dispatch");
+            return;
+        }
+    }
+    if let Err(error) = tx.try_send(req) {
+        let reason = error.to_string();
+        let req = error.into_inner();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_at = chrono::Utc::now().to_rfc3339();
+        if let Err(error) = req
+            .task_store
+            .insert_run(
+                &run_id,
+                &req.task_id,
+                &run_at,
+                None,
+                Some(&reason),
+                "rejected",
+            )
+            .await
+        {
+            tracing::error!(%error, "Failed to record rejected scheduled run");
+        }
+        if !req.is_recurring {
+            if let Err(error) = req
+                .task_store
+                .finish_generation(&req.task_id, req.generation, "rejected")
+                .await
+            {
+                tracing::error!(%error, "Failed to terminalize rejected scheduled task");
+            }
+        }
+    }
 }
 
 /// The core agent that processes messages through LLM + tools.
@@ -85,7 +183,7 @@ pub struct Agent {
     pub scheduler: Arc<Scheduler>,
     pub self_weak: Weak<Agent>,
     /// Sender for dispatching scheduled job work to the background runner.
-    pub job_tx: tokio::sync::mpsc::UnboundedSender<ScheduledJobRequest>,
+    pub job_tx: tokio::sync::mpsc::Sender<ScheduledJobRequest>,
     pub langsmith: Arc<LangSmithClient>,
     pub restart_pending: Arc<AtomicBool>,
     pub soul_updated: Arc<AtomicBool>,
@@ -104,11 +202,7 @@ pub struct Agent {
     /// The agent loop creates a oneshot channel, stores the sender here,
     /// then awaits the receiver. The Telegram callback handler resolves
     /// the sender with the user's choice.
-    pub pending_loop_callbacks: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::oneshot::Sender<LoopCallbackChoice>>,
-        >,
-    >,
+    pub pending_loop_callbacks: Arc<LoopCallbacks>,
 }
 
 /// A task parsed from the spawn_agents tool arguments, after validation.
@@ -161,7 +255,7 @@ impl Agent {
         task_store: ScheduledTaskStore,
         scheduler: Arc<Scheduler>,
         self_weak: Weak<Agent>,
-        job_tx: tokio::sync::mpsc::UnboundedSender<ScheduledJobRequest>,
+        job_tx: tokio::sync::mpsc::Sender<ScheduledJobRequest>,
         langsmith: Arc<LangSmithClient>,
         config_path: PathBuf,
         cancel_registry: Arc<CancelRegistry>,
@@ -428,6 +522,10 @@ impl Agent {
 
         let mut current = self.current_model.write().await;
         *current = model_id.to_string();
+        drop(current);
+
+        // Best-effort context window refresh for the newly selected model
+        self.refresh_context_window_cache().await;
 
         tracing::info!(model = %model_id, provider = %provider_name, "Model changed and persisted");
         Ok(())
@@ -520,25 +618,32 @@ impl Agent {
         }
     }
 
-    /// Register a oneshot sender for a user's loop detection callback.
-    /// Returns the old sender if one was already registered (should not happen
-    /// in practice since one user has one active process_message).
-    pub async fn register_loop_callback(
-        &self,
-        user_id: &str,
-        sender: tokio::sync::oneshot::Sender<LoopCallbackChoice>,
-    ) -> Option<tokio::sync::oneshot::Sender<LoopCallbackChoice>> {
-        let mut map = self.pending_loop_callbacks.lock().await;
-        map.insert(user_id.to_string(), sender)
-    }
-
-    /// Take the loop callback sender for a user, if any.
+    /// Consume only the callback belonging to this exact prompt.
     pub async fn take_loop_callback(
         &self,
         user_id: &str,
+        nonce: &str,
     ) -> Option<tokio::sync::oneshot::Sender<LoopCallbackChoice>> {
-        let mut map = self.pending_loop_callbacks.lock().await;
-        map.remove(user_id)
+        take_loop_callback(&self.pending_loop_callbacks, user_id, nonce).await
+    }
+
+    async fn wait_for_loop_choice(
+        &self,
+        user_id: &str,
+        chat_id: &str,
+        text: &str,
+        cancel: &CancellationToken,
+    ) -> bool {
+        wait_for_loop_choice(
+            &self.pending_loop_callbacks,
+            self.sender.as_ref(),
+            user_id,
+            chat_id,
+            text,
+            cancel,
+            std::time::Duration::from_secs(self.config.loop_detection_config().timeout_seconds),
+        )
+        .await
     }
 
     /// Get the current MidRunMode for a user. Defaults to Steer.
@@ -591,10 +696,13 @@ impl Agent {
     pub async fn refresh_context_window_cache(&self) {
         let model = self.current_model.read().await.clone();
         let (provider, actual_model) = self.registry.resolve_model(&model);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
         if let Some(ctx) = provider.fetch_context_window(&client, actual_model).await {
             let mut cache = provider.config().context_window_cache.write().await;
-            *cache = Some(ctx);
+            cache.insert(actual_model.to_string(), ctx);
             tracing::info!("Context window for {}: {} tokens", actual_model, ctx);
         }
     }
@@ -645,6 +753,8 @@ impl Agent {
         stream_token_tx: Option<tokio::sync::mpsc::Sender<String>>,
         tool_ui_mode: crate::tool_registry::ToolUiMode,
     ) -> Result<String> {
+        // One routing snapshot governs attachment vision, context and every main-loop call.
+        let current_model = self.current_model.read().await.clone();
         let platform = &incoming.platform;
         let user_id = &incoming.user_id;
         let _parsed_chat_id: ChatId = incoming
@@ -720,24 +830,32 @@ impl Agent {
         }
 
         // Process attachments
-        let supports_vision = {
-            let current = self.current_model.read().await;
-            let (provider, _) = self.registry.resolve_model(&current);
-            provider.supports_vision()
-        };
+        let supports_vision = self
+            .registry
+            .resolve_model(&current_model)
+            .0
+            .supports_vision();
 
-        let image_parts = cmgr
+        let (extracted_text, image_parts) = cmgr
             .add_incoming(incoming, &self.config, supports_vision)
             .await?;
 
+        // Combine incoming.text and extracted attachment text (HG-01 & HG-02)
+        let effective_user_text = match (incoming.text.is_empty(), extracted_text.is_empty()) {
+            (false, false) => format!("{}\n\n{extracted_text}", incoming.text),
+            (false, true) => incoming.text.clone(),
+            (true, false) => extracted_text,
+            (true, true) => String::new(),
+        };
+
         // Build user message content
         let user_msg_content = if image_parts.is_empty() {
-            MessageContent::from_text(incoming.text.clone())
+            MessageContent::from_text(effective_user_text)
         } else {
             let mut parts: Vec<ContentPart> = Vec::new();
-            if !incoming.text.is_empty() {
+            if !effective_user_text.is_empty() {
                 parts.push(ContentPart::Text {
-                    text: incoming.text.clone(),
+                    text: effective_user_text,
                 });
             }
             parts.extend(image_parts);
@@ -755,7 +873,6 @@ impl Agent {
 
         // Per-turn compaction (ADR 0003 Q1): routine compaction runs once per
         // user turn, before the agentic loop, at 85% of the real provider window.
-        let current_model = self.current_model.read().await.clone();
         let context_window = self.registry.effective_context_window(&current_model);
         let compaction_model = self.config.learning.compaction_model.clone();
         let user_model_path = self
@@ -830,11 +947,12 @@ impl Agent {
             max_iterations: self.config.max_iterations(),
             empty_response_retry_limit: self.config.empty_response_retry_limit(),
             context_window,
-            loop_detection_enabled: true,
+            loop_detection_enabled: self.config.loop_detection_config().enabled,
+            loop_detection_threshold: self.config.loop_detection_config().threshold,
             interactive_loop_callback: true,
             allowed_tools: None,
             langsmith_project: Some(ls_project.clone()),
-            model: None,
+            model: Some(current_model.clone()),
             tool_event_tx,
             stream_token_tx,
             recovery_nudge: None,
@@ -850,8 +968,21 @@ impl Agent {
             Some(&self.langsmith),
             self.sender.as_ref() as &dyn PlatformSender,
             Box::new(make_ctx),
-            None,
+            Some(self.build_special_tool_handler()),
         )
+        .with_loop_handler(Box::new(|user_id, chat_id, info| {
+            let user_id = user_id.to_string();
+            let chat_id = chat_id.to_string();
+            let text = format!(
+                "Repeated tool '{}' detected ({} calls). Continue or stop?",
+                info.tool_name, info.call_count
+            );
+            let cancel = cancel_token.clone();
+            Box::pin(async move {
+                self.wait_for_loop_choice(&user_id, &chat_id, &text, &cancel)
+                    .await
+            })
+        }))
         .run(
             &mut crate::loop_runner::MessageContainer::Conversation(Box::new(cmgr)),
             user_id,
@@ -927,6 +1058,26 @@ impl Agent {
                 self.clear_cancel_token(user_id).await;
                 Ok("I've reached the maximum number of tool call iterations. Please try rephrasing your request.".to_string())
             }
+            Ok(crate::loop_runner::LoopOutcome::LoopDetected { tool_name, count }) => {
+                warn!(
+                    user_id = %user_id,
+                    tool = %tool_name,
+                    count = count,
+                    "Repetitive loop detected in agent execution"
+                );
+                self.langsmith.end_run(crate::langsmith::EndRunParams {
+                    id: chain_run_id,
+                    outputs: None,
+                    error: Some(format!(
+                        "Loop detected with tool `{tool_name}` repeated {count} times"
+                    )),
+                    end_time: Self::now_iso8601_static(),
+                });
+                self.clear_cancel_token(user_id).await;
+                Ok(format!(
+                    "I stopped executing because a repetitive loop was detected with tool `{tool_name}` repeated {count} times."
+                ))
+            }
             Err(e) => {
                 self.langsmith.end_run(crate::langsmith::EndRunParams {
                     id: chain_run_id,
@@ -953,6 +1104,23 @@ impl Agent {
 
         let count = tasks.len();
         for task in tasks {
+            let generation = match self.task_store.generation(&task.id).await {
+                Ok(previous) => match self
+                    .task_store
+                    .reactivate(&task.id, previous, &task.status)
+                    .await
+                {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        tracing::error!(%error, "Cannot fence restored task");
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(%error, "Cannot restore task eligibility");
+                    continue;
+                }
+            };
             // Build the same fire closure as in schedule_task handler
             let job_tx = self.job_tx.clone();
             let bot_clone = Arc::clone(&bot);
@@ -963,7 +1131,9 @@ impl Agent {
             let is_recurring = task.trigger_type == "recurring";
             let store_clone = self.task_store.clone();
 
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
             let fire = move || {
+                let ready = ready_rx.clone();
                 let tx = job_tx.clone();
                 let bot = bot_clone.clone();
                 let store = store_clone.clone();
@@ -986,11 +1156,11 @@ impl Agent {
                         bot,
                         task_id: tid,
                         is_recurring: recurring,
+                        generation,
+                        run_reason: RunReason::Scheduled,
                         task_store: store,
                     };
-                    if let Err(e) = tx.send(req) {
-                        tracing::error!("Failed to dispatch restored scheduled job: {}", e);
-                    }
+                    dispatch_registered(&tx, req, ready).await;
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             };
@@ -1009,8 +1179,38 @@ impl Agent {
                             task.id,
                             e
                         );
-                        // Mark as completed since its time has passed
-                        let _ = self.task_store.set_status(&task.id, "completed").await;
+                        // Record misfire in runs and mark status as misfired (HG-06)
+                        let run_id = uuid::Uuid::new_v4().to_string();
+                        let run_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                        let err_msg = format!(
+                            "Task misfired: trigger time passed before execution ({})",
+                            e
+                        );
+                        if let Err(err) = self
+                            .task_store
+                            .insert_run(
+                                &run_id,
+                                &task.id,
+                                &run_at,
+                                None,
+                                Some(&err_msg),
+                                "misfired",
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to persist misfire run record for task {}: {}",
+                                task.id,
+                                err
+                            );
+                        }
+                        if let Err(error) = self
+                            .task_store
+                            .finish_generation(&task.id, generation, "misfired")
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to persist restored misfire status");
+                        }
                         continue;
                     }
                 }
@@ -1024,7 +1224,7 @@ impl Agent {
                 Ok(sched_id) => {
                     if let Err(e) = self
                         .task_store
-                        .update_scheduler_job_id(&task.id, &sched_id.to_string())
+                        .register_generation(&task.id, generation, &sched_id.to_string())
                         .await
                     {
                         tracing::warn!(
@@ -1032,7 +1232,19 @@ impl Agent {
                             task.id,
                             e
                         );
+                        if let Err(error) = self
+                            .task_store
+                            .finish_generation(&task.id, generation, "failed_registration")
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to invalidate unpersisted restored task");
+                        }
+                        if let Err(error) = self.scheduler.remove_job(sched_id).await {
+                            tracing::error!(%error, "Failed to remove unpersisted restored scheduler job");
+                        }
+                        continue;
                     }
+                    ready_tx.send_replace(true);
                     tracing::info!(
                         "Restored scheduled task: {} ({})",
                         task.id,
@@ -1040,6 +1252,13 @@ impl Agent {
                     );
                 }
                 Err(e) => {
+                    if let Err(error) = self
+                        .task_store
+                        .finish_generation(&task.id, generation, "failed_registration")
+                        .await
+                    {
+                        tracing::error!(%error, "Failed to persist restore registration failure");
+                    }
                     tracing::error!(
                         "Failed to restore scheduled task {} ({}): {}",
                         task.id,
@@ -1069,7 +1288,76 @@ impl Agent {
         all.extend(self.mcp.tool_definitions());
         all
     }
+}
 
+/// Tool definitions for special agent tools (`invoke_agent` and `spawn_agents`).
+pub fn special_agent_tool_definitions() -> Vec<crate::llm::ToolDefinition> {
+    vec![
+        crate::llm::ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::llm::FunctionDefinition {
+                name: "invoke_agent".to_string(),
+                description: "Invoke a specialized agent or skill to perform a task.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "description": "The name of the agent or skill to invoke (e.g. 'verifier')"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task and instructions for the agent"
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional model override"
+                        },
+                        "tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional list of tools to allow"
+                        }
+                    },
+                    "required": ["agent", "prompt"]
+                }),
+            },
+        },
+        crate::llm::ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::llm::FunctionDefinition {
+                name: "spawn_agents".to_string(),
+                description: "Spawn multiple subagents in parallel to execute tasks concurrently."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "system_prompt": { "type": "string" },
+                                    "prompt": { "type": "string" },
+                                    "model": { "type": "string" },
+                                    "tools": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    }
+                                },
+                                "required": ["system_prompt", "prompt"]
+                            }
+                        }
+                    },
+                    "required": ["tasks"]
+                }),
+            },
+        },
+    ]
+}
+
+impl Agent {
     /// Run a named skill/agent as an isolated subagent mini-loop.
     /// `kind` controls which registry to look up and which read tool to use in the bootstrap.
     /// Returns the subagent's final text response (or an error string).
@@ -1089,9 +1377,8 @@ impl Agent {
     ) -> String {
         // --- Ad-hoc mode (no predefined skill/agent) ---
         if skill_name.is_none() {
-            let model = model_override
-                .map(str::to_string)
-                .unwrap_or_else(|| self.config.openrouter.model.clone());
+            let current = self.current_model.read().await.clone();
+            let model = model_override.map(str::to_string).unwrap_or(current);
 
             let declared_tools = tools_override
                 .or_else(|| self.config.subagents.default_tools.clone())
@@ -1158,7 +1445,7 @@ impl Agent {
         // Resolve model and tool list from registry metadata (or overrides).
         // For invoke_agent: check agents registry first, fall back to skills registry.
         let (resolved_model, declared_tools, max_iter) = {
-            let default_model = self.config.openrouter.model.clone();
+            let default_model = self.current_model.read().await.clone();
 
             let skill_opt = {
                 let agents = self.agents.read().await;
@@ -1299,6 +1586,151 @@ impl Agent {
         .await
     }
 
+    /// Build special_tool_handler for invoke_agent/spawn_agents.
+    pub fn build_special_tool_handler(&self) -> crate::loop_runner::ToolHandlerFn {
+        let self_weak = self.self_weak.clone();
+        Box::new(
+            move |name: &str, args: &Value, _user_id: &str, _chat_id: &str| {
+                let name_owned = name.to_string();
+                let args_owned = args.clone();
+                let self_weak = self_weak.clone();
+                Box::pin(async move {
+                    match name_owned.as_str() {
+                        "invoke_agent" => {
+                            let agent_name = match args_owned["agent"]
+                                .as_str()
+                                .or_else(|| args_owned["skill"].as_str())
+                            {
+                                Some(a) => a.to_string(),
+                                None => return Some("Missing agent".to_string()),
+                            };
+                            let prompt = match args_owned["prompt"].as_str() {
+                                Some(p) => p.to_string(),
+                                None => return Some("Missing prompt".to_string()),
+                            };
+                            let model_override = args_owned["model"].as_str().map(str::to_string);
+                            let tools_override = args_owned["tools"].as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect::<Vec<_>>()
+                            });
+                            tracing::info!(
+                                "Invoking agent '{}' (model_override: {:?})",
+                                agent_name,
+                                model_override
+                            );
+                            let agent = match self_weak.upgrade() {
+                                Some(a) => a,
+                                None => return Some("Agent is shutting down".to_string()),
+                            };
+                            Some(
+                                agent
+                                    .run_subagent(
+                                        Some(&agent_name),
+                                        "",
+                                        &prompt,
+                                        model_override.as_deref(),
+                                        tools_override,
+                                    )
+                                    .await,
+                            )
+                        }
+                        "spawn_agents" => {
+                            let parsed_tasks: Vec<AdHocTask> = if let Some(tasks) =
+                                args_owned["tasks"].as_array()
+                            {
+                                if tasks.is_empty() {
+                                    return Some("tasks array is empty".to_string());
+                                }
+                                let mut parsed = Vec::with_capacity(tasks.len());
+                                for (i, task) in tasks.iter().enumerate() {
+                                    let system_prompt = match task["system_prompt"].as_str() {
+                                        Some(s) => s.to_string(),
+                                        None => {
+                                            return Some(format!(
+                                                "Task at index {}: missing system_prompt",
+                                                i
+                                            ))
+                                        }
+                                    };
+                                    let prompt = match task["prompt"].as_str() {
+                                        Some(p) => p.to_string(),
+                                        None => {
+                                            return Some(format!(
+                                                "Task at index {}: missing prompt",
+                                                i
+                                            ))
+                                        }
+                                    };
+                                    parsed.push(AdHocTask {
+                                        system_prompt,
+                                        prompt,
+                                        model: task["model"].as_str().map(str::to_string),
+                                        tools: task["tools"].as_array().map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|v| v.as_str().map(str::to_string))
+                                                .collect()
+                                        }),
+                                    });
+                                }
+                                parsed
+                            } else {
+                                let system_prompt = match args_owned["system_prompt"].as_str() {
+                                    Some(s) => s.to_string(),
+                                    None => {
+                                        return Some("Missing system_prompt or tasks".to_string())
+                                    }
+                                };
+                                let prompt = match args_owned["prompt"].as_str() {
+                                    Some(p) => p.to_string(),
+                                    None => return Some("Missing prompt".to_string()),
+                                };
+                                vec![AdHocTask {
+                                    system_prompt,
+                                    prompt,
+                                    model: args_owned["model"].as_str().map(str::to_string),
+                                    tools: args_owned["tools"].as_array().map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(str::to_string))
+                                            .collect()
+                                    }),
+                                }]
+                            };
+                            let agent = match self_weak.upgrade() {
+                                Some(a) => a,
+                                None => return Some("Agent is shutting down".to_string()),
+                            };
+                            let futures: Vec<_> = parsed_tasks
+                                .into_iter()
+                                .map(|task| {
+                                    let sp = task.system_prompt.clone();
+                                    let p = task.prompt.clone();
+                                    let m = task.model.clone();
+                                    let t = task.tools.clone();
+                                    let a = agent.clone();
+                                    Box::pin(async move {
+                                        a.run_subagent(None, &sp, &p, m.as_deref(), t).await
+                                    })
+                                })
+                                .collect();
+                            let results = futures::future::join_all(futures).await;
+                            let mut output = String::from("Spawned agents results:\n\n");
+                            for (i, result) in results.iter().enumerate() {
+                                output.push_str(&format!(
+                                    "--- Agent {} ---\n{}\n\n",
+                                    i + 1,
+                                    result
+                                ));
+                            }
+                            Some(output)
+                        }
+                        _ => None,
+                    }
+                }) as Pin<Box<dyn Future<Output = Option<String>> + Send + 'static>>
+            },
+        )
+    }
+
     /// Shared mini-agentic loop used by both ad-hoc and predefined subagents.
     /// Runs LLM calls, executes whitelisted tools, and returns the final text response.
     /// Returns a boxed future to break type-level cycles with the special_tool_handler.
@@ -1317,151 +1749,7 @@ impl Agent {
         Box::pin(async move {
             // Build special_tool_handler for invoke_agent/spawn_agents (circular dependency
             // prevents them from being registered in ToolRegistry).
-            let special_handler = {
-                let self_weak = self.self_weak.clone();
-                move |name: &str, args: &Value, _user_id: &str, _chat_id: &str| {
-                    let name_owned = name.to_string();
-                    let args_owned = args.clone();
-                    let self_weak = self_weak.clone();
-                    Box::pin(async move {
-                        match name_owned.as_str() {
-                            "invoke_agent" => {
-                                let agent_name = match args_owned["agent"]
-                                    .as_str()
-                                    .or_else(|| args_owned["skill"].as_str())
-                                {
-                                    Some(a) => a.to_string(),
-                                    None => return Some("Missing agent".to_string()),
-                                };
-                                let prompt = match args_owned["prompt"].as_str() {
-                                    Some(p) => p.to_string(),
-                                    None => return Some("Missing prompt".to_string()),
-                                };
-                                let model_override =
-                                    args_owned["model"].as_str().map(str::to_string);
-                                let tools_override = args_owned["tools"].as_array().map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(str::to_string))
-                                        .collect::<Vec<_>>()
-                                });
-                                tracing::info!(
-                                    "Invoking agent '{}' (model_override: {:?})",
-                                    agent_name,
-                                    model_override
-                                );
-                                let agent = match self_weak.upgrade() {
-                                    Some(a) => a,
-                                    None => return Some("Agent is shutting down".to_string()),
-                                };
-                                Some(
-                                    agent
-                                        .run_subagent(
-                                            Some(&agent_name),
-                                            "",
-                                            &prompt,
-                                            model_override.as_deref(),
-                                            tools_override,
-                                        )
-                                        .await,
-                                )
-                            }
-                            "spawn_agents" => {
-                                let parsed_tasks: Vec<AdHocTask> = if let Some(tasks) =
-                                    args_owned["tasks"].as_array()
-                                {
-                                    if tasks.is_empty() {
-                                        return Some("tasks array is empty".to_string());
-                                    }
-                                    let mut parsed = Vec::with_capacity(tasks.len());
-                                    for (i, task) in tasks.iter().enumerate() {
-                                        let system_prompt = match task["system_prompt"].as_str() {
-                                            Some(s) => s.to_string(),
-                                            None => {
-                                                return Some(format!(
-                                                    "Task at index {}: missing system_prompt",
-                                                    i
-                                                ))
-                                            }
-                                        };
-                                        let prompt = match task["prompt"].as_str() {
-                                            Some(p) => p.to_string(),
-                                            None => {
-                                                return Some(format!(
-                                                    "Task at index {}: missing prompt",
-                                                    i
-                                                ))
-                                            }
-                                        };
-                                        parsed.push(AdHocTask {
-                                            system_prompt,
-                                            prompt,
-                                            model: task["model"].as_str().map(str::to_string),
-                                            tools: task["tools"].as_array().map(|arr| {
-                                                arr.iter()
-                                                    .filter_map(|v| v.as_str().map(str::to_string))
-                                                    .collect()
-                                            }),
-                                        });
-                                    }
-                                    parsed
-                                } else {
-                                    let system_prompt = match args_owned["system_prompt"].as_str() {
-                                        Some(s) => s.to_string(),
-                                        None => {
-                                            return Some(
-                                                "Missing system_prompt or tasks".to_string(),
-                                            )
-                                        }
-                                    };
-                                    let prompt = match args_owned["prompt"].as_str() {
-                                        Some(p) => p.to_string(),
-                                        None => return Some("Missing prompt".to_string()),
-                                    };
-                                    vec![AdHocTask {
-                                        system_prompt,
-                                        prompt,
-                                        model: args_owned["model"].as_str().map(str::to_string),
-                                        tools: args_owned["tools"].as_array().map(|arr| {
-                                            arr.iter()
-                                                .filter_map(|v| v.as_str().map(str::to_string))
-                                                .collect()
-                                        }),
-                                    }]
-                                };
-                                let agent = match self_weak.upgrade() {
-                                    Some(a) => a,
-                                    None => return Some("Agent is shutting down".to_string()),
-                                };
-                                let futures: Vec<_> = parsed_tasks
-                                    .into_iter()
-                                    .map(|task| {
-                                        let sp = task.system_prompt.clone();
-                                        let p = task.prompt.clone();
-                                        let m = task.model.clone();
-                                        let t = task.tools.clone();
-                                        let a = agent.clone();
-                                        Box::pin(async move {
-                                            a.run_subagent(None, &sp, &p, m.as_deref(), t).await
-                                        })
-                                    })
-                                    .collect();
-                                let results = futures::future::join_all(futures).await;
-                                let mut output = String::from("Spawned agents results:\n\n");
-                                for (i, result) in results.iter().enumerate() {
-                                    output.push_str(&format!(
-                                        "--- Agent {} ---\n{}\n\n",
-                                        i + 1,
-                                        result
-                                    ));
-                                }
-                                Some(output)
-                            }
-                            _ => None,
-                        }
-                    })
-                        as Pin<Box<dyn Future<Output = Option<String>> + Send + 'static>>
-                }
-            };
+            let special_handler = self.build_special_tool_handler();
 
             let make_ctx = {
                 let sandbox_dir = self.config.sandbox.allowed_directory.clone();
@@ -1485,7 +1773,8 @@ impl Agent {
                 max_iterations: max_iter,
                 empty_response_retry_limit: self.config.empty_response_retry_limit(),
                 context_window: subagent_window,
-                loop_detection_enabled: true,
+                loop_detection_enabled: self.config.loop_detection_config().enabled,
+                loop_detection_threshold: self.config.loop_detection_config().threshold,
                 interactive_loop_callback: false,
                 allowed_tools: Some(allowed_tools_vec),
                 langsmith_project: None,
@@ -1505,7 +1794,7 @@ impl Agent {
                 None,
                 self.sender.as_ref() as &dyn PlatformSender,
                 Box::new(make_ctx),
-                Some(Box::new(special_handler)),
+                Some(special_handler),
             )
             .run(
                 &mut crate::loop_runner::MessageContainer::Plain(std::mem::take(messages)),
@@ -1524,6 +1813,9 @@ impl Agent {
                         "Subagent '{}' reached the maximum number of iterations ({}).",
                         label, max_iter
                     )
+                }
+                Ok(crate::loop_runner::LoopOutcome::LoopDetected { tool_name, .. }) => {
+                    format!("Subagent stopped: repetitive loop detected with tool `{tool_name}`.")
                 }
                 Err(e) => format!("Subagent '{}' error: {}", label, e),
             }
@@ -1586,9 +1878,9 @@ impl Agent {
     where
         I: IntoIterator<Item = ChatMessage>,
     {
-        let model = self.config.openrouter.model.clone();
+        let model = self.current_model.read().await.clone();
         let max_iter = self.config.max_iterations();
-        let loop_config = policy_loop_config(
+        let mut loop_config = policy_loop_config(
             allowed_tools,
             &model,
             max_iter,
@@ -1596,6 +1888,8 @@ impl Agent {
             self.registry.effective_context_window(&model),
             stream_token_tx,
         );
+        loop_config.loop_detection_enabled = self.config.loop_detection_config().enabled;
+        loop_config.loop_detection_threshold = self.config.loop_detection_config().threshold;
 
         let system_content = self.build_subagent_system_prompt("").await;
         let mut messages = vec![ChatMessage {
@@ -1859,13 +2153,66 @@ fn is_compacted_regurgitation(raw: &str, parsed: &serde_json::Value) -> bool {
     false
 }
 
-/// Build the `LoopConfig` for a caller that supplies an explicit policy.
-///
-/// Free function rather than a method so the security property is testable
-/// without constructing an `Agent` or reaching an LLM: `allowed_tools` must
-/// come out as `Some(..)`, never `None`. In `LoopConfig` a `None` here means
-/// *no restriction at all* (`src/config.rs:313-320`), which is exactly how a
-/// remote peer would gain `execute_command`.
+// Shared callback registry type; only interactive main turns populate it.
+pub type LoopCallbacks = tokio::sync::Mutex<
+    std::collections::HashMap<String, (String, tokio::sync::oneshot::Sender<LoopCallbackChoice>)>,
+>;
+
+async fn take_loop_callback(
+    callbacks: &LoopCallbacks,
+    user_id: &str,
+    nonce: &str,
+) -> Option<tokio::sync::oneshot::Sender<LoopCallbackChoice>> {
+    let mut map = callbacks.lock().await;
+    if map.get(user_id).is_some_and(|(id, _)| id == nonce) {
+        map.remove(user_id).map(|(_, sender)| sender)
+    } else {
+        None
+    }
+}
+
+async fn wait_for_loop_choice(
+    callbacks: &LoopCallbacks,
+    sender: &dyn PlatformSender,
+    user_id: &str,
+    chat_id: &str,
+    text: &str,
+    cancel: &CancellationToken,
+    timeout: std::time::Duration,
+) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let nonce = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    callbacks
+        .lock()
+        .await
+        .insert(user_id.to_string(), (nonce.clone(), tx));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let message = tokio::select! {
+        result = sender.show_loop_buttons(chat_id, text, &nonce) => result,
+        _ = cancel.cancelled() => Ok(None),
+        _ = tokio::time::sleep_until(deadline) => Ok(None),
+    };
+    let choice = if matches!(message, Ok(Some(_))) {
+        tokio::select! {
+            result = rx => result.ok(),
+            _ = cancel.cancelled() => None,
+            _ = tokio::time::sleep_until(deadline) => None,
+        }
+    } else {
+        None
+    };
+    take_loop_callback(callbacks, user_id, &nonce).await;
+    if let Ok(Some(id)) = message {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sender.delete_message(chat_id, &id),
+        )
+        .await;
+    }
+    matches!(choice, Some(LoopCallbackChoice::Continue)) && !cancel.is_cancelled()
+}
+
+/// Preserve an explicit policy: `None` would mean unrestricted tools.
 fn policy_loop_config(
     allowed_tools: Vec<String>,
     model: &str,
@@ -1879,6 +2226,7 @@ fn policy_loop_config(
         empty_response_retry_limit,
         context_window,
         loop_detection_enabled: true,
+        loop_detection_threshold: 3,
         interactive_loop_callback: false,
         allowed_tools: Some(allowed_tools),
         langsmith_project: None,
@@ -1892,6 +2240,114 @@ fn policy_loop_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LoopTestSender {
+        callbacks: Arc<LoopCallbacks>,
+        choice: Option<LoopCallbackChoice>,
+        cancel: Option<CancellationToken>,
+        deleted: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl PlatformSender for LoopTestSender {
+        async fn show_loop_buttons(&self, _: &str, _: &str, nonce: &str) -> Result<Option<String>> {
+            if let Some(choice) = self.choice {
+                take_loop_callback(&self.callbacks, "u", nonce)
+                    .await
+                    .unwrap()
+                    .send(choice)
+                    .unwrap();
+            }
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            Ok(Some("buttons".into()))
+        }
+        async fn send_message(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::platform::sender::MessageFormat,
+        ) -> Result<String> {
+            Ok("id".into())
+        }
+        async fn send_file(&self, _: &str, _: &std::path::Path, _: Option<&str>) -> Result<String> {
+            Ok("id".into())
+        }
+        async fn show_cancel_button(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            Ok("id".into())
+        }
+        async fn edit_message(&self, _: &str, _: &String, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str, _: &String) -> Result<()> {
+            self.deleted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn notify_shutdown(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_loop_callback_cannot_consume_newer_prompt() {
+        let callbacks = LoopCallbacks::new(std::collections::HashMap::new());
+        let (old, _) = tokio::sync::oneshot::channel();
+        callbacks
+            .lock()
+            .await
+            .insert("u".into(), ("old".into(), old));
+        let (new, rx) = tokio::sync::oneshot::channel();
+        callbacks
+            .lock()
+            .await
+            .insert("u".into(), ("new".into(), new));
+        assert!(take_loop_callback(&callbacks, "u", "old").await.is_none());
+        assert_eq!(callbacks.lock().await.len(), 1);
+        take_loop_callback(&callbacks, "u", "new")
+            .await
+            .unwrap()
+            .send(LoopCallbackChoice::Stop)
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), LoopCallbackChoice::Stop);
+    }
+
+    #[tokio::test]
+    async fn loop_choices_cleanup_registration_and_buttons() {
+        for (choice, cancel_now, expected) in [
+            (Some(LoopCallbackChoice::Continue), false, true),
+            (Some(LoopCallbackChoice::Stop), false, false),
+            (Some(LoopCallbackChoice::AddInstruction), false, false),
+            (None, false, false), // timeout
+            (None, true, false),
+        ] {
+            let callbacks = Arc::new(LoopCallbacks::new(std::collections::HashMap::new()));
+            let cancel = CancellationToken::new();
+            let sender = LoopTestSender {
+                callbacks: callbacks.clone(),
+                choice,
+                cancel: cancel_now.then(|| cancel.clone()),
+                deleted: AtomicBool::new(false),
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_loop_choice(
+                    &callbacks,
+                    &sender,
+                    "u",
+                    "c",
+                    "loop",
+                    &cancel,
+                    std::time::Duration::from_millis(1),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, expected);
+            assert!(callbacks.lock().await.is_empty());
+            assert!(sender.deleted.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
 
     #[test]
     fn policy_loop_config_is_never_unrestricted() {
@@ -2325,5 +2781,187 @@ mod tests {
             .map(|c| c.as_text())
             .unwrap_or_default()
             .contains("question"));
+    }
+
+    #[test]
+    fn test_effective_user_text_combination_logic() {
+        // HG-01 & HG-02: verify combination of user text and extracted attachment text
+        let combine = |text: &str, extracted: &str| match (text.is_empty(), extracted.is_empty()) {
+            (false, false) => format!("{}\n\n{}", text, extracted),
+            (false, true) => text.to_string(),
+            (true, false) => extracted.to_string(),
+            (true, true) => String::new(),
+        };
+
+        assert_eq!(combine("Hello", ""), "Hello");
+        assert_eq!(combine("", "Extracted PDF"), "Extracted PDF");
+        assert_eq!(combine("Hello", "Extracted PDF"), "Hello\n\nExtracted PDF");
+        assert_eq!(combine("", ""), "");
+    }
+
+    #[test]
+    fn test_policy_loop_config_binds_model() {
+        let cfg = policy_loop_config(
+            vec!["read_file".to_string()],
+            "custom-provider/custom-model",
+            5,
+            3,
+            128_000,
+            None,
+        );
+        assert_eq!(
+            cfg.model.as_deref(),
+            Some("custom-provider/custom-model"),
+            "policy_loop_config must pass the specified model"
+        );
+        assert_eq!(cfg.context_window, 128_000);
+    }
+
+    #[tokio::test]
+    async fn test_set_model_updates_current_model_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let initial_toml = r#"
+[general]
+home = "/tmp"
+
+[telegram]
+bot_token = "123:abc"
+allowed_user_ids = [12345]
+
+[sandbox]
+allowed_directory = "/tmp"
+
+[openrouter]
+api_key = "test-key"
+model = "initial-model"
+
+[[provider]]
+name = "default_prov"
+type = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "test-key"
+model = "initial-model"
+"#;
+        tokio::fs::write(&config_path, initial_toml).await.unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let sections = vec![crate::config::ProviderSection {
+            name: "default_prov".to_string(),
+            provider_type: crate::config::ProviderType::OpenRouter,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: None,
+            model: "initial-model".to_string(),
+            supports_vision: false,
+            max_tokens: 1000,
+            discover_models: false,
+            context_window: 100_000,
+        }];
+        let registry =
+            Arc::new(crate::provider::build_registry(&sections, "default_prov", 0).unwrap());
+        let mcp = McpManager::new();
+        let skills = SkillRegistry::new();
+        let agents = SkillRegistry::new();
+        let task_store = ScheduledTaskStore::new(memory.connection());
+        let scheduler = Arc::new(Scheduler::new().await.unwrap());
+        let (job_tx, _job_rx) = tokio::sync::mpsc::channel(64);
+        let langsmith = Arc::new(LangSmithClient::new(None));
+        let cancel_registry = Arc::new(CancelRegistry::new());
+        let tool_registry = ToolRegistry::new();
+
+        struct DummySender;
+        #[async_trait::async_trait]
+        impl PlatformSender for DummySender {
+            async fn send_message(
+                &self,
+                _: &str,
+                _: &str,
+                _: crate::platform::sender::MessageFormat,
+            ) -> anyhow::Result<crate::platform::sender::PlatformMessageId> {
+                Ok("dummy".to_string())
+            }
+            async fn send_file(
+                &self,
+                _: &str,
+                _: &std::path::Path,
+                _: Option<&str>,
+            ) -> anyhow::Result<crate::platform::sender::PlatformMessageId> {
+                Ok("dummy".to_string())
+            }
+            async fn show_cancel_button(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> anyhow::Result<crate::platform::sender::PlatformMessageId> {
+                Ok("dummy".to_string())
+            }
+            async fn edit_message(
+                &self,
+                _: &str,
+                _: &crate::platform::sender::PlatformMessageId,
+                _: &str,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn delete_message(
+                &self,
+                _: &str,
+                _: &crate::platform::sender::PlatformMessageId,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn notify_shutdown(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let sender: Arc<dyn PlatformSender> = Arc::new(DummySender);
+        let restart_pending = Arc::new(AtomicBool::new(false));
+        let soul_updated = Arc::new(AtomicBool::new(false));
+
+        let agent = Agent::new(
+            config,
+            registry,
+            mcp,
+            memory,
+            skills,
+            agents,
+            task_store,
+            scheduler,
+            Weak::new(),
+            job_tx,
+            langsmith,
+            config_path.clone(),
+            cancel_registry,
+            tool_registry,
+            sender,
+            restart_pending,
+            soul_updated,
+        );
+
+        assert_eq!(
+            *agent.current_model.read().await,
+            "default_prov/initial-model"
+        );
+
+        // Change model via set_model
+        agent
+            .set_model("default_prov/new-updated-model")
+            .await
+            .unwrap();
+
+        // 1. Verify current_model is immediately updated
+        assert_eq!(
+            *agent.current_model.read().await,
+            "default_prov/new-updated-model"
+        );
+
+        // 2. Verify persisted in config.toml
+        let saved_content = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            saved_content.contains("new-updated-model"),
+            "config file must contain new model"
+        );
     }
 }

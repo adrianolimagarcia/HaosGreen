@@ -14,6 +14,33 @@ pub(crate) fn f32_vec_to_bytes(floats: &[f32]) -> Vec<u8> {
     f32_slice_to_bytes(floats).to_vec()
 }
 
+/// Sanitizes a natural language query for SQLite FTS5 matching.
+///
+/// Prevents FTS5 syntax errors caused by special characters and tokens such as
+/// `C++`, `qwen3.8`, `foo-bar`, unbalanced quotes, wildcards, and booleans.
+/// Each whitespace-delimited word containing alphanumeric characters is quoted
+/// as a literal phrase token.
+#[allow(dead_code)]
+pub(crate) fn sanitize_fts_query(query: &str) -> String {
+    let tokens: Vec<String> = query
+        .replace('"', " ")
+        .split_whitespace()
+        .filter_map(|word| {
+            if word.chars().any(|c| c.is_alphanumeric()) {
+                Some(format!("\"{}\"", word))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if tokens.is_empty() {
+        "\"\"".to_string()
+    } else {
+        tokens.join(" ")
+    }
+}
+
 impl MemoryStore {
     /// Get or create an active (non-archived) conversation for a platform user.
     /// If all existing conversations for the user are archived, a new one is created.
@@ -138,7 +165,7 @@ impl MemoryStore {
     ) -> Result<Vec<ChatMessage>> {
         let conn = self.conn.lock().await;
 
-        // Load all [SUMMARY] system messages ordered by created_at ASC
+        // Load all [SUMMARY] system messages ordered by created_at ASC, rowid ASC
         let mut summary_stmt = conn.prepare(
             "SELECT m.role, m.content, m.tool_calls, m.tool_call_id
              FROM messages m
@@ -147,7 +174,7 @@ impl MemoryStore {
                AND m.role = 'system'
                AND m.content LIKE '[SUMMARY]%'
                AND (c.is_archived IS NULL OR c.is_archived = 0)
-             ORDER BY m.created_at ASC",
+             ORDER BY m.created_at ASC, m.rowid ASC",
         )?;
         let summaries = summary_stmt
             .query_map(rusqlite::params![conversation_id], |row| {
@@ -159,15 +186,15 @@ impl MemoryStore {
         // Load the most recent raw_limit non-summary messages, re-ordered ASC
         let mut raw_stmt = conn.prepare(
             "SELECT role, content, tool_calls, tool_call_id FROM (
-                SELECT m.role, m.content, m.tool_calls, m.tool_call_id, m.created_at
+                SELECT m.role, m.content, m.tool_calls, m.tool_call_id, m.created_at, m.rowid
                 FROM messages m
                 JOIN conversations c ON m.conversation_id = c.id
                 WHERE m.conversation_id = ?1
                   AND NOT (m.role = 'system' AND m.content LIKE '[SUMMARY]%')
                   AND (c.is_archived IS NULL OR c.is_archived = 0)
-                ORDER BY m.created_at DESC
+                ORDER BY m.created_at DESC, m.rowid DESC
                 LIMIT ?2
-            ) ORDER BY created_at ASC",
+            ) ORDER BY created_at ASC, rowid ASC",
         )?;
         let raw_messages = raw_stmt
             .query_map(
@@ -211,10 +238,14 @@ impl MemoryStore {
                     LIMIT ?2
                 ),
                 fts_matches AS (
-                    SELECT rowid,
-                           row_number() OVER (ORDER BY rank) as rank_number
-                    FROM messages_fts
+                    SELECT fts.rowid,
+                           row_number() OVER (ORDER BY fts.rank) as rank_number
+                    FROM messages_fts fts
+                    JOIN messages m ON m.rowid = fts.rowid
                     WHERE messages_fts MATCH ?3
+                      AND m.conversation_id = ?4
+                      AND m.role IN ('user', 'assistant')
+                      AND (m.is_summarized IS NULL OR m.is_summarized = 0)
                     LIMIT ?2
                 )
                 SELECT m.role, m.content, m.tool_calls, m.tool_call_id,
@@ -231,6 +262,7 @@ impl MemoryStore {
                 LIMIT ?2
             ";
 
+            let fts_query = sanitize_fts_query(query);
             let search_limit = (limit * 3) as i64;
             let rrf_k = self.config.rrf_k;
             let rrf_weight_fts = self.config.rrf_weight_fts;
@@ -241,7 +273,7 @@ impl MemoryStore {
                     rusqlite::params![
                         query_bytes,
                         search_limit,
-                        query,
+                        fts_query,
                         conversation_id,
                         rrf_k,
                         rrf_weight_vec,
@@ -266,10 +298,11 @@ impl MemoryStore {
                 ORDER BY fts.rank
                 LIMIT ?3
             ";
+            let fts_query = sanitize_fts_query(query);
             let mut stmt = conn.prepare(sql)?;
             let messages = stmt
                 .query_map(
-                    rusqlite::params![query, conversation_id, limit as i64],
+                    rusqlite::params![fts_query, conversation_id, limit as i64],
                     parse_message_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()
@@ -320,6 +353,7 @@ impl MemoryStore {
                 ORDER BY combined_rank DESC
                 LIMIT ?2
             ";
+            let fts_query = sanitize_fts_query(query);
             let search_limit = (limit * 3) as i64;
             let rrf_k = self.config.rrf_k;
             let rrf_weight_fts = self.config.rrf_weight_fts;
@@ -330,7 +364,7 @@ impl MemoryStore {
                     rusqlite::params![
                         query_bytes,
                         search_limit,
-                        query,
+                        fts_query,
                         rrf_k,
                         rrf_weight_vec,
                         rrf_weight_fts
@@ -403,6 +437,13 @@ impl MemoryStore {
                 rusqlite::params![id],
             )
             .context("Failed to mark message as summarized")?;
+
+            // Also synchronize metadata in message_embeddings if it exists
+            let _ = conn.execute(
+                "UPDATE message_embeddings SET is_summarized = 1
+                 WHERE rowid IN (SELECT rowid FROM messages WHERE id = ?1)",
+                rusqlite::params![id],
+            );
         }
         Ok(())
     }
@@ -439,6 +480,7 @@ fn parse_message_row(row: &rusqlite::Row) -> rusqlite::Result<ChatMessage> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::llm::{ChatMessage, MessageContent};
 
     fn make_msg(role: &str, content: &str) -> ChatMessage {
@@ -448,6 +490,49 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_check_vec_join() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conv_a = store
+            .get_or_create_conversation("test", "user_a")
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let floats = vec![0.0f32; 384];
+        let bytes = f32_vec_to_bytes(&floats);
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, role, content) VALUES ('m1', ?1, 'user', 'hello')",
+            rusqlite::params![&conv_a],
+        ).unwrap();
+        let rowid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO message_embeddings (rowid, embedding, is_summarized, role) VALUES (?1, ?2, 0, 'user')",
+            rusqlite::params![rowid, bytes],
+        ).unwrap();
+
+        let sql = "
+            WITH vec_matches AS (
+                SELECT v.rowid, v.distance,
+                       row_number() OVER (ORDER BY v.distance) as rank_number
+                FROM message_embeddings v
+                JOIN messages m ON m.rowid = v.rowid
+                WHERE v.embedding MATCH ?1
+                  AND k = ?2
+                  AND v.is_summarized = 0
+                  AND v.role IN ('user', 'assistant')
+                  AND m.conversation_id = ?3
+                ORDER BY v.distance
+                LIMIT ?2
+            )
+            SELECT count(*) FROM vec_matches
+        ";
+        let mut stmt = conn.prepare(sql).unwrap();
+        let count: i64 = stmt
+            .query_row(rusqlite::params![bytes, 10, &conv_a], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -664,5 +749,94 @@ mod tests {
             messages.is_empty(),
             "Archived conversation should return no messages via load_messages"
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_messages_with_limit_deterministic_rowid_ordering_on_timestamp_ties() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conv_id = store
+            .get_or_create_conversation("test", "tie_user")
+            .await
+            .unwrap();
+
+        // Insert multiple messages sharing the exact same created_at timestamp
+        let fixed_time = "2026-03-30 12:00:00";
+        {
+            let conn = store.conn.lock().await;
+            for i in 1..=5 {
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, created_at)
+                     VALUES (?1, 'user', ?2, ?3)",
+                    rusqlite::params![conv_id, format!("message {i}"), fixed_time],
+                )
+                .unwrap();
+            }
+        }
+
+        // Limit to 3 messages
+        let loaded = store.load_messages_with_limit(&conv_id, 3).await.unwrap();
+        assert_eq!(loaded.len(), 3);
+        // The most recent 3 messages by insertion order (rowid DESC) should be 3, 4, 5.
+        // Re-ordered ASC by (created_at, rowid), they must appear as 3, 4, 5.
+        assert_eq!(loaded[0].content.as_ref().unwrap().as_text(), "message 3");
+        assert_eq!(loaded[1].content.as_ref().unwrap().as_text(), "message 4");
+        assert_eq!(loaded[2].content.as_ref().unwrap().as_text(), "message 5");
+
+        // Also test [SUMMARY] messages with identical timestamps
+        {
+            let conn = store.conn.lock().await;
+            for i in 1..=3 {
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, created_at)
+                     VALUES (?1, 'system', ?2, ?3)",
+                    rusqlite::params![conv_id, format!("[SUMMARY] summary {i}"), fixed_time],
+                )
+                .unwrap();
+            }
+        }
+
+        let loaded_with_summaries = store.load_messages_with_limit(&conv_id, 3).await.unwrap();
+        // 3 summaries + 3 raw messages = 6 total
+        assert_eq!(loaded_with_summaries.len(), 6);
+        assert_eq!(
+            loaded_with_summaries[0].content.as_ref().unwrap().as_text(),
+            "[SUMMARY] summary 1"
+        );
+        assert_eq!(
+            loaded_with_summaries[1].content.as_ref().unwrap().as_text(),
+            "[SUMMARY] summary 2"
+        );
+        assert_eq!(
+            loaded_with_summaries[2].content.as_ref().unwrap().as_text(),
+            "[SUMMARY] summary 3"
+        );
+        assert_eq!(
+            loaded_with_summaries[3].content.as_ref().unwrap().as_text(),
+            "message 3"
+        );
+        assert_eq!(
+            loaded_with_summaries[4].content.as_ref().unwrap().as_text(),
+            "message 4"
+        );
+        assert_eq!(
+            loaded_with_summaries[5].content.as_ref().unwrap().as_text(),
+            "message 5"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fts_query() {
+        assert_eq!(sanitize_fts_query("C++"), "\"C++\"");
+        assert_eq!(sanitize_fts_query("qwen3.8"), "\"qwen3.8\"");
+        assert_eq!(sanitize_fts_query("foo-bar"), "\"foo-bar\"");
+        assert_eq!(
+            sanitize_fts_query("como usar C++?"),
+            "\"como\" \"usar\" \"C++?\""
+        );
+        assert_eq!(
+            sanitize_fts_query("\"already quoted\""),
+            "\"already\" \"quoted\""
+        );
+        assert_eq!(sanitize_fts_query("???"), "\"\"");
     }
 }

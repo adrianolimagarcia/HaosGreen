@@ -940,10 +940,11 @@ pub async fn run(
     info!("Starting Telegram platform...");
 
     // Send startup notifications (best-effort) — before agent is moved into dptree
+    let startup_model = agent.current_model.read().await.clone();
     notify_startup(
         &bot,
         &allowed_user_ids,
-        &agent.config.openrouter.model,
+        &startup_model,
         agent.mcp.server_count(),
         agent.skills.read().await.len(),
         agent.memory.embeddings.is_available(),
@@ -2430,8 +2431,14 @@ async fn handle_loop_callback(bot: Bot, q: CallbackQuery, agent: Arc<Agent>) -> 
         return Ok(());
     };
 
-    // Send the choice to the waiting agent loop (if any)
-    if let Some(sender) = agent.take_loop_callback(&user_id).await {
+    // A stale keyboard must never consume a newer prompt for the same user.
+    let parsed = serde_json::from_str::<serde_json::Value>(&data).ok();
+    let nonce = parsed
+        .as_ref()
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Some(sender) = agent.take_loop_callback(&user_id, nonce).await {
         let _ = sender.send(choice);
     }
 
@@ -2636,6 +2643,31 @@ impl TelegramAdapter {
 
 #[async_trait]
 impl PlatformSender for TelegramAdapter {
+    async fn show_loop_buttons(
+        &self,
+        chat_id_str: &str,
+        text: &str,
+        nonce: &str,
+    ) -> Result<Option<PlatformMessageId>> {
+        let chat_id = parse_chat_id(chat_id_str)?;
+        let keyboard = InlineKeyboardMarkup::new([[
+            InlineKeyboardButton::callback(
+                "Continue",
+                format!(r#"{{"type":"loop","action":"continue","id":"{nonce}"}}"#),
+            ),
+            InlineKeyboardButton::callback(
+                "Stop",
+                format!(r#"{{"type":"loop","action":"stop","id":"{nonce}"}}"#),
+            ),
+        ]]);
+        let msg = self
+            .bot
+            .send_message(chat_id, text)
+            .reply_markup(keyboard)
+            .await?;
+        Ok(Some(format!("{}:{}", chat_id.0, msg.id.0)))
+    }
+
     async fn send_message(
         &self,
         chat_id_str: &str,

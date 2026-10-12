@@ -129,10 +129,11 @@ async fn main() -> Result<()> {
     // Build provider registry from config
     let (provider_sections, default_provider, fallback_chain) = config.build_providers();
     let registry = Arc::new(
-        provider::build_registry(
+        provider::build_registry_with_fallback(
             &provider_sections,
             &default_provider,
             config.parse_retry_limit(),
+            fallback_chain,
         )
         .context("Failed to build LLM provider registry")?,
     );
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
         "  Providers: {} (default: {}, fallback: {} model(s))",
         registry.provider_count(),
         registry.default_provider_name(),
-        fallback_chain.len()
+        registry.fallback_chain().len()
     );
 
     // Spawn background task to warm context_window_cache for all providers
@@ -153,7 +154,7 @@ async fn main() -> Result<()> {
                     let model = provider.default_model();
                     if let Some(ctx) = provider.fetch_context_window(&client, model).await {
                         let mut cache = provider.config().context_window_cache.write().await;
-                        *cache = Some(ctx);
+                        cache.insert(model.to_string(), ctx);
                         tracing::info!(
                             "Context window cache: {} / {} = {} tokens",
                             name,
@@ -223,8 +224,11 @@ async fn main() -> Result<()> {
         &http_client,
     )
     .await;
-    if refreshed > 0 {
-        info!("  Refreshed {refreshed} expiring MCP OAuth token(s) at startup");
+    if !refreshed.is_empty() {
+        info!(
+            "  Refreshed {} expiring MCP OAuth token(s) at startup",
+            refreshed.len()
+        );
     }
 
     // Initialize MCP connections (using possibly-refreshed configs)
@@ -273,9 +277,9 @@ async fn main() -> Result<()> {
 
     haos_green::platform::telegram::init_bot_token(config.telegram.bot_token.clone());
 
-    // Channel for dispatching scheduled job work from fire closures to background runner
+    // Bounded channel for dispatching scheduled job work from fire closures to background runner (P1-07)
     let (job_tx, mut job_rx) =
-        tokio::sync::mpsc::unbounded_channel::<haos_green::agent::ScheduledJobRequest>();
+        tokio::sync::mpsc::channel::<haos_green::agent::ScheduledJobRequest>(64);
 
     let cancel_registry = std::sync::Arc::new(haos_green::cancel_registry::CancelRegistry::new());
     let sender: Arc<dyn haos_green::platform::sender::PlatformSender> = Arc::new(
@@ -360,17 +364,44 @@ async fn main() -> Result<()> {
     let agent_for_runner = Arc::clone(&agent);
     tokio::spawn(async move {
         while let Some(req) = job_rx.recv().await {
+            // Recheck persisted eligibility at dequeue, not merely at callback time.
+            match req
+                .task_store
+                .is_eligible(&req.task_id, req.generation)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!(%error, "Cannot authorize scheduled run");
+                    continue;
+                }
+            }
             let agent = Arc::clone(&agent_for_runner);
 
             // Persist run record BEFORE processing (capture fire time)
             let run_id = uuid::Uuid::new_v4().to_string();
             let run_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-            if let Err(e) = req
+            match req
                 .task_store
-                .insert_run(&run_id, &req.task_id, &run_at, None, None, "running")
+                .begin_run(&req.task_id, req.generation, &run_id, &run_at)
                 .await
             {
-                tracing::warn!("Failed to persist scheduled task run record: {}", e);
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::error!(%error, "Failed to claim scheduled run; refusing execution");
+                    if !req.is_recurring {
+                        if let Err(error) = req
+                            .task_store
+                            .finish_generation(&req.task_id, req.generation, "failed")
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to record scheduled claim failure; recovery required");
+                        }
+                    }
+                    continue;
+                }
             }
 
             let response = match agent
@@ -385,6 +416,15 @@ async fn main() -> Result<()> {
                     {
                         tracing::warn!("Failed to update scheduled task run record: {}", e);
                     }
+                    if !req.is_recurring {
+                        if let Err(error) = req
+                            .task_store
+                            .finish_generation(&req.task_id, req.generation, "completed")
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to terminalize scheduled task");
+                        }
+                    }
                     r
                 }
                 Err(e) => {
@@ -398,7 +438,13 @@ async fn main() -> Result<()> {
                         tracing::warn!("Failed to update failed scheduled task run record: {}", e);
                     }
                     if !req.is_recurring {
-                        let _ = req.task_store.set_status(&req.task_id, "failed").await;
+                        if let Err(error) = req
+                            .task_store
+                            .finish_generation(&req.task_id, req.generation, "failed")
+                            .await
+                        {
+                            tracing::error!(%error, "Failed to terminalize scheduled task");
+                        }
                     }
                     // Send error to user via rich message
                     let chat_id_val: i64 = match req.incoming.chat_id.parse() {
@@ -450,17 +496,21 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn background OAuth token refresh task: checks every 30 minutes.
-    // `cfgs` is kept across ticks so that updated token_expires_at values
-    // are remembered and a freshly-rotated refresh token isn't re-used.
+    // Poll often enough to catch the five-minute refresh window.
     {
         let mut cfgs = mcp_server_configs.clone();
         let refresh_config_path = config_path.clone();
         let refresh_http_client = http_client.clone();
+        let refresh_agent = agent.clone();
         tokio::spawn(async move {
-            // 30-minute interval — tokens expiring within 5 min are always caught
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30 * 60));
-            interval.tick().await; // skip first immediate tick
+            let mut pending: std::collections::HashMap<_, _> = cfgs
+                .iter()
+                .filter(|cfg| cfg.url.is_some() && !refresh_agent.mcp.has_server(&cfg.name))
+                .map(|cfg| (cfg.name.clone(), cfg.clone()))
+                .collect();
+            let mut interval = tokio::time::interval(haos_green::mcp::OAUTH_POLL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
             loop {
                 interval.tick().await;
                 let refreshed = haos_green::mcp::refresh_expiring_tokens(
@@ -469,11 +519,12 @@ async fn main() -> Result<()> {
                     &refresh_http_client,
                 )
                 .await;
-                if refreshed > 0 {
-                    tracing::info!(
-                        "Background token refresh: updated {refreshed} MCP OAuth token(s)"
-                    );
-                }
+                haos_green::mcp::reconnect_refreshed_servers(
+                    &refresh_agent.mcp,
+                    &mut pending,
+                    refreshed,
+                )
+                .await;
             }
         });
     }

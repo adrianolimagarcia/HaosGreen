@@ -114,8 +114,7 @@ async fn process_image(
 /// Extract text content from a PDF file.
 fn extract_pdf_text(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).context("Failed to read PDF")?;
-    // unwrap_or_default: malformed PDFs return empty string rather than propagating
-    let text = pdf_extract::extract_text_from_mem(&bytes).unwrap_or_default();
+    let text = pdf_extract::extract_text_from_mem(&bytes).context("Failed to extract PDF text")?;
     Ok(text)
 }
 
@@ -242,5 +241,25 @@ mod tests {
         let text = "b".repeat(1001);
         let chunks = chunk_text(&text, 1000, 100);
         assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_pdf_text_malformed_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("corrupt.pdf");
+        std::fs::write(&pdf_path, b"not a valid pdf content").unwrap();
+
+        let res = extract_pdf_text(&pdf_path);
+        assert!(
+            res.is_err(),
+            "Malformed PDF should return Err, but got: {:?}",
+            res
+        );
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Failed to extract PDF text"),
+            "Error should provide clear context"
+        );
     }
 }

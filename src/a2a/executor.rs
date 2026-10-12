@@ -275,6 +275,7 @@ impl AgentExecutor for A2aExecutor {
                 Ok(crate::loop_runner::LoopOutcome::FinalResponse(t)) => (TaskState::Completed, t),
                 Ok(crate::loop_runner::LoopOutcome::MaxIterations) => (TaskState::Failed, "The agent reached its maximum number of iterations.".to_string()),
                 Ok(crate::loop_runner::LoopOutcome::Cancelled) => (TaskState::Canceled, "Cancelled.".to_string()),
+                Ok(crate::loop_runner::LoopOutcome::LoopDetected { tool_name, count }) => (TaskState::Failed, format!("Repetitive loop detected with tool {tool_name} ({count} repetitions).")),
                 Err(e) => (TaskState::Failed, format!("Agent error: {e}")),
             };
             let mut history = prior_history.unwrap_or_default();

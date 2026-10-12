@@ -381,12 +381,31 @@ impl MemoryStore {
             ",
         )?;
 
-        // Migration: add is_summarized column (safe no-op if column already exists)
-        conn.execute_batch("ALTER TABLE messages ADD COLUMN is_summarized BOOLEAN DEFAULT 0;")
-            .ok(); // ok() because ALTER TABLE fails if column already exists — that's intentional
-
-        conn.execute_batch("ALTER TABLE conversations ADD COLUMN is_archived INTEGER DEFAULT 0;")
-            .ok(); // safe no-op: ALTER TABLE fails with "duplicate column" on re-run
+        // Only an existing column is a no-op; permission/corruption/DDL errors
+        // must stop startup instead of leaving a partially usable schema.
+        for (table, column, definition) in [
+            ("messages", "is_summarized", "BOOLEAN DEFAULT 0"),
+            ("conversations", "is_archived", "INTEGER DEFAULT 0"),
+            (
+                "scheduled_tasks",
+                "generation",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    [table, column],
+                    |row| row.get(0),
+                )
+                .with_context(|| format!("inspect {table}.{column}"))?;
+            if !exists {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+                ))
+                .with_context(|| format!("add {table}.{column}"))?;
+            }
+        }
 
         // Stored embedding dimension (None if legacy DB without schema_meta row)
         let raw: Option<String> = conn
@@ -401,24 +420,21 @@ impl MemoryStore {
 
         let need_migrate = !matches!(stored_dims, Some(s) if s == dims);
 
-        let table_exists = |conn: &Connection, name: &str| -> bool {
+        let table_exists = |conn: &Connection, name: &str| -> Result<bool> {
             conn.query_row(
-                &format!(
-                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='{}'",
-                    name
-                ),
-                [],
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
                 |row| row.get(0),
             )
-            .unwrap_or(false)
+            .with_context(|| format!("inspect table {name}"))
         };
 
         if need_migrate {
             // Drop vec tables so we can recreate with new dimension
-            if table_exists(conn, "message_embeddings") {
+            if table_exists(conn, "message_embeddings")? {
                 conn.execute_batch("DROP TABLE message_embeddings;")?;
             }
-            if table_exists(conn, "knowledge_embeddings") {
+            if table_exists(conn, "knowledge_embeddings")? {
                 conn.execute_batch("DROP TABLE knowledge_embeddings;")?;
             }
             conn.execute_batch(&format!(
@@ -441,7 +457,7 @@ impl MemoryStore {
             }
         } else {
             // Create vec tables only if they don't exist (same dimension)
-            if !table_exists(conn, "message_embeddings") {
+            if !table_exists(conn, "message_embeddings")? {
                 conn.execute_batch(&format!(
                     "CREATE VIRTUAL TABLE message_embeddings USING vec0(embedding float[{}]);",
                     dims
@@ -451,7 +467,7 @@ impl MemoryStore {
                     [dims.to_string()],
                 )?;
             }
-            if !table_exists(conn, "knowledge_embeddings") {
+            if !table_exists(conn, "knowledge_embeddings")? {
                 conn.execute_batch(&format!(
                     "CREATE VIRTUAL TABLE knowledge_embeddings USING vec0(embedding float[{}]);",
                     dims
@@ -468,14 +484,14 @@ impl MemoryStore {
         // Migration: ensure message_embeddings has metadata columns (is_summarized, role)
         // for pre-filtering, and no existing rows with NULL metadata.
         // ALTER TABLE is not supported for vec0, so we must DROP and recreate.
-        if table_exists(conn, "message_embeddings") {
+        if table_exists(conn, "message_embeddings")? {
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(message_embeddings)")
                 .and_then(|mut stmt| {
                     stmt.query_map([], |row| row.get(1))?
                         .collect::<Result<Vec<_>, _>>()
                 })
-                .unwrap_or_default();
+                .context("inspect message_embeddings columns")?;
 
             let has_meta = cols.contains(&"is_summarized".to_string());
 
@@ -488,7 +504,7 @@ impl MemoryStore {
                     |row| row.get::<_, i64>(0),
                 )
                 .map(|count| count > 0)
-                .unwrap_or(false)
+                .context("inspect message_embeddings NULL metadata")?
             } else {
                 true
             };
@@ -607,6 +623,90 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_migrations_legacy_and_idempotent() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let conn = store.conn.blocking_lock();
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN is_summarized; ALTER TABLE conversations DROP COLUMN is_archived;").unwrap();
+        // Simulate a pre-generation scheduler database while preserving legacy rows.
+        let generation_exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('scheduled_tasks') WHERE name='generation')", [], |r| r.get(0)).unwrap();
+        if generation_exists {
+            conn.execute_batch("ALTER TABLE scheduled_tasks DROP COLUMN generation;")
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO conversations(id,platform,user_id) VALUES('legacy','test','user');
+             INSERT INTO messages(id,conversation_id,role,content) VALUES('legacy','legacy','user','legacy content');
+             INSERT INTO scheduled_tasks(id,user_id,chat_id,platform,trigger_type,trigger_value,prompt,description)
+             VALUES('legacy','user','chat','test','once','now','prompt','description');",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            MemoryStore::run_migrations(&conn, store.embeddings.dimensions()).unwrap();
+        }
+        let archived: i64 = conn
+            .query_row(
+                "SELECT is_archived FROM conversations WHERE id='legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, 0);
+        let generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM scheduled_tasks WHERE id='legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 0);
+        let metadata: (String, i64, String) = conn.query_row(
+            "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('scheduled_tasks') WHERE name='generation'", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(metadata, ("INTEGER".to_string(), 1, "0".to_string()));
+        let message: (String, i64) = conn
+            .query_row(
+                "SELECT content,is_summarized FROM messages WHERE id='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(message, ("legacy content".to_string(), 0));
+        let prompt: String = conn
+            .query_row(
+                "SELECT prompt FROM scheduled_tasks WHERE id='legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt, "prompt");
+        for (table, column) in [
+            ("messages", "is_summarized"),
+            ("conversations", "is_archived"),
+            ("scheduled_tasks", "generation"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info(?1) WHERE name=?2",
+                    [table, column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}.{column}");
+        }
+    }
+
+    #[test]
+    fn audit_migrations_propagate_alter_errors() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let conn = store.conn.blocking_lock();
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN is_summarized; PRAGMA query_only=ON;")
+            .unwrap();
+        let err = MemoryStore::run_migrations(&conn, store.embeddings.dimensions()).unwrap_err();
+        assert!(format!("{err:#}").contains("is_summarized"), "{err:#}");
+    }
 
     #[test]
     fn test_scheduled_tasks_table_exists() {

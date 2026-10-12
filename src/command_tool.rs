@@ -13,6 +13,50 @@ use crate::llm::{FunctionDefinition, ToolDefinition};
 use crate::platform::sender::PlatformSender;
 use crate::tool_registry::{ToolContext, ToolHandler, ToolResult, ToolUiMode};
 
+/// Guard that ensures the child process and its entire process group are killed
+/// if dropped (e.g. on error, cancellation, panic, or transport drop).
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+    disarmed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(child: &tokio::process::Child) -> Self {
+        #[cfg(unix)]
+        let pgid = child.id().map(|id| id as i32);
+        Self {
+            #[cfg(unix)]
+            pgid,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    fn kill(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.disarmed = true;
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 /// Controls how command execution messages are sent to Telegram.
 enum SendMode {
     /// Full live output with cancel button.
@@ -87,28 +131,52 @@ impl CommandTool {
         cmd.process_group(0);
         let mut child = cmd.spawn()?;
 
+        // Process group guard ensures that if any setup fails (like show_cancel_button),
+        // or if a panic or unexpected error occurs, the child process and its tree are killed.
+        let mut pg_guard = ProcessGroupGuard::new(&child);
+
         let escaped_cmd = crate::utils::telegram_markdown::escape_text(command);
 
         // Verbose: cancel button + live output + final result
         // Minimal: cancel button (simple text) + no live output, delete on finish
         // Silent: no message at all (tool_notifier handles nothing)
-        let (msg_id, send_mode) = match ctx.tool_ui_mode {
+        // If chat_id is empty or invalid, fallback to Silent mode rather than failing after spawn.
+        let is_valid_chat = !ctx.chat_id.trim().is_empty();
+        let effective_mode = if is_valid_chat {
+            ctx.tool_ui_mode
+        } else {
+            ToolUiMode::Silent
+        };
+
+        let (msg_id, send_mode) = match effective_mode {
             ToolUiMode::Verbose => {
                 let status_text =
                     format!("💻 Running: `{}`\n\n```\n⏳ Starting...\n```", escaped_cmd);
-                let id = self
+                match self
                     .sender
                     .show_cancel_button(&ctx.chat_id, &status_text, &cmd_id)
-                    .await?;
-                (Some(id), SendMode::Verbose)
+                    .await
+                {
+                    Ok(id) => (Some(id), SendMode::Verbose),
+                    Err(e) => {
+                        warn!("Failed to show cancel button: {e}; falling back to silent");
+                        (None, SendMode::Silent)
+                    }
+                }
             }
             ToolUiMode::Minimal => {
                 let status_text = format!("⏳ Running: `{}`", escaped_cmd);
-                let id = self
+                match self
                     .sender
                     .show_cancel_button(&ctx.chat_id, &status_text, &cmd_id)
-                    .await?;
-                (Some(id), SendMode::Minimal)
+                    .await
+                {
+                    Ok(id) => (Some(id), SendMode::Minimal),
+                    Err(e) => {
+                        warn!("Failed to show cancel button: {e}; falling back to silent");
+                        (None, SendMode::Silent)
+                    }
+                }
             }
             ToolUiMode::Silent => (None, SendMode::Silent),
         };
@@ -196,13 +264,30 @@ impl CommandTool {
             }
         }
 
-        let _ = tokio::join!(stdout_handle, stderr_handle);
-        while let Ok(chunk) = output_rx.try_recv() {
-            output_buffer.push_str(&chunk);
-        }
+        // HG-09: Drain remaining output while awaiting reader tasks under a timeout.
+        // If readers are stuck trying to send to a full channel, draining ensures they make progress.
+        let drain_future = async {
+            let mut readers = futures::future::join(stdout_handle, stderr_handle);
+            tokio::select! {
+                _ = &mut readers => {
+                    while let Ok(chunk) = output_rx.try_recv() {
+                        output_buffer.push_str(&chunk);
+                    }
+                }
+                _ = async {
+                    while let Some(chunk) = output_rx.recv().await {
+                        output_buffer.push_str(&chunk);
+                    }
+                } => {}
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), drain_future).await;
+
         if output_buffer.chars().count() > MAX_BUFFER_CHARS {
             output_buffer = crate::utils::strings::truncate_tail(&output_buffer, MAX_BUFFER_CHARS);
         }
+
+        pg_guard.disarm();
 
         fn format_body(buf: &str, no_output_msg: &str) -> Option<String> {
             if buf.is_empty() {

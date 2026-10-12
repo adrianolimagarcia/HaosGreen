@@ -335,7 +335,7 @@ async fn build_agent(config_path: &Path, memory: &MemoryStore, a2a: A2aConfig) -
     let task_store = ScheduledTaskStore::new(memory.connection());
     let scheduler = Arc::new(Scheduler::new().await.expect("create the scheduler"));
     let (job_tx, _job_rx) =
-        tokio::sync::mpsc::unbounded_channel::<haos_green::agent::ScheduledJobRequest>();
+        tokio::sync::mpsc::channel::<haos_green::agent::ScheduledJobRequest>(64);
     let langsmith = Arc::new(LangSmithClient::new(None));
     let cancel_registry = Arc::new(CancelRegistry::new());
     let sender: Arc<dyn PlatformSender> = Arc::new(NoopSender);

@@ -3537,7 +3537,7 @@ async fn build_live_agent(
             .expect("create the scheduler"),
     );
     let (job_tx, _job_rx) =
-        tokio::sync::mpsc::unbounded_channel::<haos_green::agent::ScheduledJobRequest>();
+        tokio::sync::mpsc::channel::<haos_green::agent::ScheduledJobRequest>(64);
     let langsmith = Arc::new(haos_green::langsmith::LangSmithClient::new(None));
     let cancel_registry = Arc::new(haos_green::cancel_registry::CancelRegistry::new());
     let sender: Arc<dyn haos_green::platform::sender::PlatformSender> = Arc::new(LiveNoopSender);

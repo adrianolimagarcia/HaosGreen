@@ -17,6 +17,16 @@ pub enum MessageFormat {
 
 #[async_trait]
 pub trait PlatformSender: Send + Sync {
+    /// Unsupported platforms stop safely instead of waiting for an unreachable UI.
+    async fn show_loop_buttons(
+        &self,
+        _chat_id: &str,
+        _text: &str,
+        _nonce: &str,
+    ) -> Result<Option<PlatformMessageId>> {
+        Ok(None)
+    }
+
     async fn send_message(
         &self,
         chat_id: &str,

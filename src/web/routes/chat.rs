@@ -391,6 +391,11 @@ async fn send_message(
             Ok(Ok(LoopOutcome::MaxIterations)) => {
                 yield error_event(MAX_ITERATIONS_MESSAGE);
             }
+            Ok(Ok(LoopOutcome::LoopDetected { tool_name, count })) => {
+                yield error_event(&format!(
+                    "repetitive loop detected with tool `{tool_name}` repeated {count} times"
+                ));
+            }
             Ok(Err(e)) => {
                 yield error_event(&format!("the agent run failed: {e}"));
             }

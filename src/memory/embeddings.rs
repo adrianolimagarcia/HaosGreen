@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Embedding engine that calls an OpenAI-compatible /v1/embeddings API.
@@ -36,6 +37,9 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
+/// Default HTTP request timeout for embedding API calls (30 seconds).
+pub const DEFAULT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl EmbeddingEngine {
     /// Create an embedding engine with API configuration.
     /// If config is None, embedding features are disabled (FTS5-only fallback).
@@ -48,10 +52,11 @@ impl EmbeddingEngine {
         } else {
             info!("Embedding engine disabled (no embedding config). Using FTS5-only search.");
         }
-        Self {
-            client: reqwest::Client::new(),
-            config,
-        }
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_EMBEDDING_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self { client, config }
     }
 
     /// Whether vector embeddings are available
@@ -130,5 +135,22 @@ impl EmbeddingEngine {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedding_timeout_constant() {
+        assert_eq!(DEFAULT_EMBEDDING_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_engine_new_without_config() {
+        let engine = EmbeddingEngine::new(None);
+        assert!(!engine.is_available());
+        assert_eq!(engine.dimensions(), 384);
     }
 }

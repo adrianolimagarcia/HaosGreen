@@ -12,5 +12,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build
-        run: cargo check
+        run: cargo check --all-targets --locked

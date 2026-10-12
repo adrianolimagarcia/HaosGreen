@@ -178,7 +178,6 @@ long plan never blocks the bot; `/approve` and `/clarify` are what start it.
 
 ```toml
 [supervisor]
-default_autonomy_mode = "standard"   # "fast" | "standard" | "rigorous"
 artifacts_dir         = "supervisor/artifacts"
 
 [supervisor.risk]

@@ -176,7 +176,49 @@
         <circle cx="12" cy="12" r="8.25" />
         <path d="M12 7.5V12l3 1.75" />
       </symbol>
+
+      <!--
+        Conversation marks. `i-user` is the operator's avatar in the transcript
+        and `i-send` is the composer's submit button; both are drawn on the same
+        24-unit grid and stroke weight as the navigation set.
+      -->
+      <symbol
+        id="i-user"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <circle cx="12" cy="8.25" r="3.75" />
+        <path d="M4.5 20.25c.85-4.15 3.6-6.25 7.5-6.25s6.65 2.1 7.5 6.25" />
+      </symbol>
+      <symbol
+        id="i-send"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M20.75 3.25 3.9 10.1a.5.5 0 0 0-.05.92l6.4 3.2 3.2 6.4a.5.5 0 0 0 .92-.05Z" />
+        <path d="M20.75 3.25 10.25 14.22" />
+      </symbol>
     </svg>
+
+    <!--
+      Ambient background. Three slow blurred blobs behind the glass panels give
+      the panels something to refract, which is what separates this surface from
+      a flat one. Purely decorative, and it is the only reason the body carries
+      a multi-stop gradient rather than a flat fill.
+    -->
+    <div class="ambient" aria-hidden="true">
+      <span class="blob blob-a"></span>
+      <span class="blob blob-b"></span>
+      <span class="blob blob-c"></span>
+    </div>
 
     <p id="boot" class="boot" role="status">Loading the dashboard…</p>
 

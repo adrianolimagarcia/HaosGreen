@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A single part in a multi-modal message
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,13 +333,8 @@ pub fn parse_kimi_tool_calls(content: &str) -> Option<Vec<ToolCall>> {
         let call_index = descriptor.split(':').nth(1).unwrap_or("0").trim();
         let call_id = format!("kimi_fallback_{func_name}_{call_index}");
 
-        // Verify the arguments are valid JSON; fall back to an empty object on
-        // parse failure so the tool handler can still attempt execution.
-        let arguments = if serde_json::from_str::<serde_json::Value>(args_raw).is_ok() {
-            args_raw.to_string()
-        } else {
-            "{}".to_string()
-        };
+        // Preserve malformed arguments: the runner must reject them, not execute {}.
+        let arguments = args_raw.to_string();
 
         calls.push(ToolCall {
             id: call_id,
@@ -363,12 +359,64 @@ pub struct LlmClient {
     pub registry: Arc<crate::provider::ProviderRegistry>,
 }
 
+/// Default HTTP request timeout for LLM provider completions (120 seconds).
+pub const DEFAULT_LLM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Determines if an LLM error is transient/server-side and eligible for fallback.
+///
+/// Only typed HTTP statuses and reqwest timeout/connect causes qualify.
+/// Unknown/deterministic errors and untrusted response-body wording never qualify.
+pub fn is_fallback_eligible_error(err: &anyhow::Error) -> bool {
+    // 1. Check reqwest::Error downcasts anywhere in the cause chain
+    for cause in err.chain() {
+        if let Some(http) = cause.downcast_ref::<crate::provider::ProviderHttpError>() {
+            return matches!(http.status.as_u16(), 429 | 500 | 502 | 503 | 504);
+        }
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = req_err.status() {
+                return matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+            }
+            if req_err.is_timeout() || req_err.is_connect() {
+                return true;
+            }
+            // Decode/schema failures remain deterministic; a body transport failure
+            // and typed reset causes represent interrupted HTTP delivery.
+            if req_err.is_body() && !req_err.is_decode() {
+                return true;
+            }
+            let mut source = std::error::Error::source(req_err);
+            while let Some(cause) = source {
+                if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) {
+                        return true;
+                    }
+                }
+                source = cause.source();
+            }
+        }
+    }
+
+    // Only structured causes are authoritative; response bodies are untrusted.
+    false
+}
+
 impl LlmClient {
     pub fn new(registry: Arc<crate::provider::ProviderRegistry>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            registry,
-        }
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_LLM_TIMEOUT)
+            .build()
+            .expect("LLM HTTP client with bounded timeout must initialize");
+        Self { client, registry }
+    }
+
+    pub fn registry(&self) -> &crate::provider::ProviderRegistry {
+        &self.registry
     }
 
     /// Core chat method returning full completion metadata (message, finish_reason, model).
@@ -392,14 +440,80 @@ impl LlmClient {
         Ok(completion)
     }
 
-    /// Convenience wrapper that uses the default provider's model.
+    /// Chat completion with automatic fallback chain execution on eligible transient errors.
+    pub async fn chat_completion_with_fallback(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        primary_model: &str,
+    ) -> Result<ChatCompletion> {
+        match self
+            .chat_completion_with_model(messages, tools, primary_model)
+            .await
+        {
+            Ok(completion) => Ok(completion),
+            Err(primary_err) => {
+                if !is_fallback_eligible_error(&primary_err)
+                    || self.registry.fallback_chain().is_empty()
+                {
+                    return Err(primary_err);
+                }
+
+                let (primary_prov, primary_actual) = self.registry.resolve_model(primary_model);
+                let primary_prov_name = primary_prov.name();
+
+                let mut fallback_errors = Vec::new();
+
+                for candidate in self.registry.fallback_chain() {
+                    let (cand_prov, cand_actual) = self.registry.resolve_model(candidate);
+                    if cand_prov.name() == primary_prov_name && cand_actual == primary_actual {
+                        continue;
+                    }
+
+                    match self
+                        .chat_completion_with_model(messages, tools, candidate)
+                        .await
+                    {
+                        Ok(completion) => {
+                            tracing::info!(
+                                from = %primary_model,
+                                to = %candidate,
+                                "LLM call succeeded via fallback candidate"
+                            );
+                            return Ok(completion);
+                        }
+                        Err(fb_err) => {
+                            if !is_fallback_eligible_error(&fb_err) {
+                                return Err(fb_err);
+                            }
+                            fallback_errors.push(format!("{candidate}: {fb_err}"));
+                        }
+                    }
+                }
+
+                if fallback_errors.is_empty() {
+                    return Err(primary_err);
+                }
+
+                let errors_summary = fallback_errors.join("; ");
+                Err(anyhow::anyhow!(
+                    "All providers in fallback chain failed. Primary '{}' error: {}. Fallback errors: {}",
+                    primary_model,
+                    primary_err,
+                    errors_summary
+                ))
+            }
+        }
+    }
+
+    /// Convenience wrapper that uses the default provider's model with fallback chain execution.
     pub async fn chat(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<ChatMessage> {
         let default_model = self.registry.default_qualified_model();
-        self.chat_completion_with_model(messages, tools, &default_model)
+        self.chat_completion_with_fallback(messages, tools, &default_model)
             .await
             .map(|c| c.message)
     }
@@ -441,6 +555,11 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_llm_client_timeout_constant() {
+        assert_eq!(DEFAULT_LLM_TIMEOUT, Duration::from_secs(120));
+    }
 
     #[test]
     fn test_message_content_text_serializes_as_string() {
@@ -552,14 +671,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kimi_tool_calls_invalid_json_falls_back_to_empty_object() {
+    fn test_parse_kimi_tool_calls_invalid_json_preserves_raw_arguments() {
         let content = "<|tool_calls_section_begin|>\
             <|tool_call_begin|> functions.my_tool:0 \
             <|tool_call_argument_begin|> not valid json <|tool_call_end|>\
             <|tool_calls_section_end|>";
         let calls = parse_kimi_tool_calls(content).expect("should parse");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[0].function.arguments, "not valid json");
     }
 
     #[test]
@@ -901,5 +1020,383 @@ mod tests {
             tool_calls[0].function.name, "read_skill_file",
             "parsed tool name must match the Kimi content"
         );
+    }
+
+    #[test]
+    fn test_is_fallback_eligible_error() {
+        for (status, body, expected) in [
+            (400, "connection reset 503", false),
+            (401, "timeout 503", false),
+            (404, "connection reset", false),
+            (422, "503", false),
+            (503, "401 unauthorized schema invalid api key", true),
+            (429, "forbidden", true),
+        ] {
+            let err = anyhow::Error::new(crate::provider::ProviderHttpError {
+                provider: "test".into(),
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                body: body.into(),
+            })
+            .context("outer context 400");
+            assert_eq!(is_fallback_eligible_error(&err), expected);
+        }
+    }
+
+    #[test]
+    fn legacy_string_errors_are_not_authoritative() {
+        // Eligible: 503, 429, 500, 502, 504, timeout, connection errors, resets
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!("503")));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "503 Service Unavailable"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "OpenRouter API error (503): Service Unavailable"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!("429")));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "429 Too Many Requests"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "rate limit exceeded"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "500 Internal Server Error"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "502 Bad Gateway"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "504 Gateway Timeout"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!("timeout")));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "request timed out"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "operation timed out after 30s"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "failed to connect to host"
+        )));
+
+        // Ineligible: 400 (bad request), 401/403 (auth errors), tool/schema errors
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!("400")));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "400 Bad Request"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "bad request: missing required field"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!("401")));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "401 Unauthorized"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "invalid api key"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "invalid_api_key"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!("403")));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "403 Forbidden"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "tool error: function not allowed"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "schema validation error: field missing"
+        )));
+        assert!(!is_fallback_eligible_error(&anyhow::anyhow!(
+            "invalid tool schema"
+        )));
+    }
+
+    #[tokio::test]
+    async fn truncated_http_body_is_a_structured_network_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+        });
+        let error = reqwest::Client::new()
+            .get(format!("http://{addr}"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap_err();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(is_fallback_eligible_error(&error.into()));
+    }
+
+    #[test]
+    fn unknown_errors_do_not_trigger_fallback() {
+        for text in [
+            "503",
+            "connection reset by peer",
+            "timeout",
+            "schema error 503",
+        ] {
+            assert!(!is_fallback_eligible_error(&anyhow::anyhow!(text)));
+        }
+    }
+
+    type MockHandler = Arc<dyn Fn(&str) -> Result<ChatCompletion> + Send + Sync>;
+
+    struct MockTestProvider {
+        config: crate::provider::ProviderConfig,
+        handler: MockHandler,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for MockTestProvider {
+        fn name(&self) -> &str {
+            &self.config.name
+        }
+        fn default_model(&self) -> &str {
+            &self.config.default_model
+        }
+        fn supports_vision(&self) -> bool {
+            false
+        }
+        fn config(&self) -> &crate::provider::ProviderConfig {
+            &self.config
+        }
+        async fn chat_completion(
+            &self,
+            _client: &reqwest::Client,
+            _messages: &[ChatMessage],
+            _tools: &[ToolDefinition],
+            model: &str,
+            _max_tokens: u32,
+        ) -> Result<ChatCompletion> {
+            (self.handler)(model)
+        }
+        async fn list_models(&self, _client: &reqwest::Client) -> Result<Vec<String>> {
+            Ok(vec![self.config.default_model.clone()])
+        }
+    }
+
+    fn make_mock_provider(
+        name: &str,
+        default_model: &str,
+        handler: impl Fn(&str) -> Result<ChatCompletion> + Send + Sync + 'static,
+    ) -> Arc<dyn crate::provider::Provider> {
+        let config = crate::provider::ProviderConfig {
+            name: name.to_string(),
+            provider_type: crate::config::ProviderType::OpenAICompatible,
+            base_url: "http://localhost:8080/v1".to_string(),
+            api_key: None,
+            default_model: default_model.to_string(),
+            supports_vision: false,
+            max_tokens: 1024,
+            discover_models: false,
+            context_window: 4096,
+            context_window_cache: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            parse_retry_limit: 0,
+        };
+        Arc::new(MockTestProvider {
+            config,
+            handler: Arc::new(handler),
+        })
+    }
+
+    fn http_error(status: u16, body: &str) -> anyhow::Error {
+        crate::provider::ProviderHttpError {
+            provider: "mock".into(),
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            body: body.into(),
+        }
+        .into()
+    }
+
+    fn make_user_message(text: &str) -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::from_text(text)),
+            tool_calls: None,
+            tool_call_id: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_fallback_503_on_primary_falls_back_to_200_on_fallback_provider() {
+        let p1 = make_mock_provider("primary", "primary-model", |_| {
+            Err(http_error(503, "401 unauthorized schema invalid api key"))
+        });
+        let p2 = make_mock_provider("secondary", "secondary-model", |model| {
+            Ok(ChatCompletion {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(MessageContent::Text("hello from fallback".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+                model: model.to_string(),
+            })
+        });
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("primary".to_string(), p1);
+        providers.insert("secondary".to_string(), p2);
+
+        let registry = Arc::new(crate::provider::ProviderRegistry::new_with_fallback(
+            providers,
+            "primary".to_string(),
+            vec!["secondary/secondary-model".to_string()],
+        ));
+        let llm = LlmClient::new(registry);
+
+        let messages = make_user_message("ping");
+        let tools = vec![];
+        let completion = llm
+            .chat_completion_with_fallback(&messages, &tools, "primary/primary-model")
+            .await
+            .expect("should succeed via fallback provider");
+
+        assert_eq!(
+            completion.message.content.as_ref().map(|c| c.as_text()),
+            Some("hello from fallback".to_string())
+        );
+        assert_eq!(completion.model, "secondary/secondary-model");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_401_on_primary_does_not_fallback() {
+        let p1 = make_mock_provider("primary", "primary-model", |_| {
+            Err(http_error(401, "connection reset 503 Unauthorized"))
+        });
+        let fallback_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fallback_called_clone = fallback_called.clone();
+        let p2 = make_mock_provider("secondary", "secondary-model", move |model| {
+            fallback_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatCompletion {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(MessageContent::Text("should not reach here".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".into()),
+                model: model.to_string(),
+            })
+        });
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("primary".to_string(), p1);
+        providers.insert("secondary".to_string(), p2);
+
+        let registry = Arc::new(crate::provider::ProviderRegistry::new_with_fallback(
+            providers,
+            "primary".to_string(),
+            vec!["secondary/secondary-model".to_string()],
+        ));
+        let llm = LlmClient::new(registry);
+
+        let messages = make_user_message("ping");
+        let tools = vec![];
+        let err = llm
+            .chat_completion_with_fallback(&messages, &tools, "primary/primary-model")
+            .await
+            .expect_err("should return 401 without fallback");
+
+        assert!(err.to_string().contains("401"));
+        assert!(!fallback_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_all_failing_produces_aggregated_error_mentioning_both_providers() {
+        let p1 = make_mock_provider("primary", "primary-model", |_| {
+            Err(http_error(503, "primary outage"))
+        });
+        let p2 = make_mock_provider("secondary", "secondary-model", |_| {
+            Err(http_error(503, "secondary outage"))
+        });
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("primary".to_string(), p1);
+        providers.insert("secondary".to_string(), p2);
+
+        let registry = Arc::new(crate::provider::ProviderRegistry::new_with_fallback(
+            providers,
+            "primary".to_string(),
+            vec!["secondary/secondary-model".to_string()],
+        ));
+        let llm = LlmClient::new(registry);
+
+        let messages = make_user_message("ping");
+        let tools = vec![];
+        let err = llm
+            .chat_completion_with_fallback(&messages, &tools, "primary/primary-model")
+            .await
+            .expect_err("should return aggregated error");
+
+        let err_str = err.to_string();
+        assert!(err_str.contains("All providers in fallback chain failed"));
+        assert!(err_str.contains("primary/primary-model"));
+        assert!(err_str.contains("secondary/secondary-model"));
+        assert!(err_str.contains("primary outage"));
+        assert!(err_str.contains("secondary outage"));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_candidate_returning_non_eligible_error_aborts_chain() {
+        let p1 = make_mock_provider("primary", "primary-model", |_| {
+            Err(http_error(503, "Service Unavailable"))
+        });
+        let p2 = make_mock_provider("secondary", "secondary-model", |_| {
+            Err(http_error(401, "connection reset 503 Unauthorized"))
+        });
+        let p3_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p3_called_clone = p3_called.clone();
+        let p3 = make_mock_provider("tertiary", "tertiary-model", move |_| {
+            p3_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("503"))
+        });
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("primary".to_string(), p1);
+        providers.insert("secondary".to_string(), p2);
+        providers.insert("tertiary".to_string(), p3);
+
+        let registry = Arc::new(crate::provider::ProviderRegistry::new_with_fallback(
+            providers,
+            "primary".to_string(),
+            vec![
+                "secondary/secondary-model".to_string(),
+                "tertiary/tertiary-model".to_string(),
+            ],
+        ));
+        let llm = LlmClient::new(registry);
+
+        let messages = make_user_message("ping");
+        let tools = vec![];
+        let err = llm
+            .chat_completion_with_fallback(&messages, &tools, "primary/primary-model")
+            .await
+            .expect_err("should stop on 401");
+
+        assert!(err.to_string().contains("401"));
+        assert!(!p3_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

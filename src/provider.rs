@@ -25,10 +25,9 @@ pub struct ProviderConfig {
     pub max_tokens: u32,
     pub discover_models: bool,
     pub context_window: usize,
-    /// Runtime cache for the current model's context window, populated
-    /// asynchronously from the provider API. When None, falls back to
-    /// `context_window`.
-    pub context_window_cache: Arc<RwLock<Option<usize>>>,
+    /// Runtime cache for models' context window, keyed by model name, populated
+    /// asynchronously from the provider API. Falls back to `context_window` if a model is not cached.
+    pub context_window_cache: Arc<RwLock<HashMap<String, usize>>>,
     /// Number of retries when the response is missing the `choices` field.
     /// Defaults to 3; set to 0 to disable.
     pub parse_retry_limit: u32,
@@ -46,11 +45,31 @@ impl From<&ProviderSection> for ProviderConfig {
             max_tokens: s.max_tokens,
             discover_models: s.discover_models,
             context_window: s.context_window,
-            context_window_cache: Arc::new(RwLock::new(None)),
+            context_window_cache: Arc::new(RwLock::new(HashMap::new())),
             parse_retry_limit: 0, // overwritten by build_registry
         }
     }
 }
+
+/// HTTP failure with an authoritative status, independent of arbitrary response text.
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub provider: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} API error ({}): {}",
+            self.provider, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
 
 /// Internal helper: send a chat completion request with retry logic for
 /// missing/empty `choices` field. Returns the first valid `Choice` on success.
@@ -83,12 +102,12 @@ async fn chat_completion_with_retry(
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "{} API error ({}): {}",
-                provider_name,
+            return Err(ProviderHttpError {
+                provider: provider_name.to_string(),
                 status,
-                body
-            ));
+                body,
+            }
+            .into());
         }
 
         let body = match response.bytes().await {
@@ -176,6 +195,7 @@ pub trait Provider: Send + Sync {
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn Provider>>,
     default_provider: String,
+    fallback_chain: Vec<String>,
 }
 
 impl std::fmt::Debug for ProviderRegistry {
@@ -183,6 +203,7 @@ impl std::fmt::Debug for ProviderRegistry {
         f.debug_struct("ProviderRegistry")
             .field("providers", &self.providers.keys().collect::<Vec<_>>())
             .field("default_provider", &self.default_provider)
+            .field("fallback_chain", &self.fallback_chain)
             .finish()
     }
 }
@@ -192,7 +213,24 @@ impl ProviderRegistry {
         Self {
             providers,
             default_provider,
+            fallback_chain: Vec::new(),
         }
+    }
+
+    pub fn new_with_fallback(
+        providers: HashMap<String, Arc<dyn Provider>>,
+        default_provider: String,
+        fallback_chain: Vec<String>,
+    ) -> Self {
+        Self {
+            providers,
+            default_provider,
+            fallback_chain,
+        }
+    }
+
+    pub fn fallback_chain(&self) -> &[String] {
+        &self.fallback_chain
     }
 
     /// Resolve a model string to (provider, stripped_model).
@@ -241,24 +279,32 @@ impl ProviderRegistry {
     }
 
     /// Return the effective context window for a model: runtime cache
-    /// if populated, otherwise static config fallback.
+    /// if populated for the specific model, otherwise static config fallback.
     pub fn effective_context_window(&self, model: &str) -> usize {
-        let (provider, _) = self.resolve_model(model);
+        let (provider, actual_model) = self.resolve_model(model);
         let cached = provider
             .config()
             .context_window_cache
             .try_read()
             .ok()
-            .and_then(|c| *c);
+            .and_then(|c| c.get(actual_model).or_else(|| c.get(model)).copied());
         cached.unwrap_or(provider.config().context_window)
+    }
+
+    /// Cache the context window for a model on its resolved provider.
+    pub async fn set_cached_context_window(&self, model: &str, window: usize) {
+        let (provider, actual_model) = self.resolve_model(model);
+        let mut cache = provider.config().context_window_cache.write().await;
+        cache.insert(actual_model.to_string(), window);
     }
 }
 
-/// Build a ProviderRegistry from config sections.
-pub fn build_registry(
+/// Build a ProviderRegistry from config sections with a fallback chain.
+pub fn build_registry_with_fallback(
     sections: &[ProviderSection],
     default_name: &str,
     parse_retry_limit: u32,
+    fallback_chain: Vec<String>,
 ) -> Result<ProviderRegistry> {
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
 
@@ -284,7 +330,35 @@ pub fn build_registry(
         );
     }
 
-    Ok(ProviderRegistry::new(providers, default_name.to_string()))
+    // Unknown prefixes can be legacy vendor/model identifiers: retain default routing.
+    // Validate syntax and known-provider suffixes without reinterpreting legacy names.
+    for target in &fallback_chain {
+        let model = target
+            .split_once('/')
+            .filter(|(prefix, _)| providers.contains_key(*prefix))
+            .map_or(target.as_str(), |(_, model)| model);
+        if target.trim() != target
+            || model.trim().is_empty()
+            || target.chars().any(char::is_whitespace)
+        {
+            anyhow::bail!("Invalid fallback model target: {:?}", target);
+        }
+    }
+
+    Ok(ProviderRegistry::new_with_fallback(
+        providers,
+        default_name.to_string(),
+        fallback_chain,
+    ))
+}
+
+/// Build a ProviderRegistry from config sections.
+pub fn build_registry(
+    sections: &[ProviderSection],
+    default_name: &str,
+    parse_retry_limit: u32,
+) -> Result<ProviderRegistry> {
+    build_registry_with_fallback(sections, default_name, parse_retry_limit, Vec::new())
 }
 
 // === OpenRouterProvider ===
@@ -393,7 +467,12 @@ impl Provider for OpenRouterProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("OpenRouter models API error ({}): {}", status, body);
+            return Err(ProviderHttpError {
+                provider: self.config.name.clone(),
+                status,
+                body,
+            }
+            .into());
         }
         let list: serde_json::Value = response.json().await?;
         let models = list["data"]
@@ -511,12 +590,12 @@ impl Provider for OpenAICompatibleProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Provider '{}' models API error ({}): {}",
-                self.config.name,
+            return Err(ProviderHttpError {
+                provider: self.config.name.clone(),
                 status,
-                body
-            );
+                body,
+            }
+            .into());
         }
         let list: serde_json::Value = response.json().await?;
         let models = list["data"]
@@ -622,7 +701,12 @@ impl Provider for OllamaProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama models API error ({}): {}", status, body);
+            return Err(ProviderHttpError {
+                provider: self.config.name.clone(),
+                status,
+                body,
+            }
+            .into());
         }
         let body: serde_json::Value = response.json().await?;
         let models = body["models"]
@@ -822,10 +906,46 @@ mod tests {
         )];
         let reg = build_registry(&sections, "alpha", 3).unwrap();
         let provider = reg.get_provider("alpha").unwrap();
-        // Set cache manually
-        *provider.config().context_window_cache.try_write().unwrap() = Some(200_000);
+        // Set cache manually for the model
+        provider
+            .config()
+            .context_window_cache
+            .try_write()
+            .unwrap()
+            .insert("anthropic/claude-sonnet-4-6".to_string(), 200_000);
         let ctx = reg.effective_context_window("anthropic/claude-sonnet-4-6");
         assert_eq!(ctx, 200_000);
+    }
+
+    #[test]
+    fn effective_context_window_caches_per_model_without_cross_overwrite() {
+        let sections = vec![make_section(
+            "alpha",
+            ProviderType::OpenRouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-sonnet-4-6",
+        )];
+        let reg = build_registry(&sections, "alpha", 3).unwrap();
+        let provider = reg.get_provider("alpha").unwrap();
+
+        // Populate context cache for two different models on the same provider
+        {
+            let mut cache = provider.config().context_window_cache.try_write().unwrap();
+            cache.insert("anthropic/claude-sonnet-4-6".to_string(), 200_000);
+            cache.insert("moonshotai/kimi-k2.6".to_string(), 128_000);
+        }
+
+        // Each model returns its own cached context window, never overwriting each other
+        assert_eq!(
+            reg.effective_context_window("anthropic/claude-sonnet-4-6"),
+            200_000
+        );
+        assert_eq!(
+            reg.effective_context_window("moonshotai/kimi-k2.6"),
+            128_000
+        );
+        // An uncached model falls back to the provider's static context_window
+        assert_eq!(reg.effective_context_window("openai/gpt-4o"), 512_000);
     }
 
     #[test]
@@ -840,7 +960,7 @@ mod tests {
             max_tokens: 1024,
             discover_models: true,
             context_window: 512_000,
-            context_window_cache: Arc::new(RwLock::new(None)),
+            context_window_cache: Arc::new(RwLock::new(HashMap::new())),
             parse_retry_limit: 3,
         };
         let p = OllamaProvider::new(cfg);
@@ -859,7 +979,7 @@ mod tests {
             max_tokens: 1024,
             discover_models: true,
             context_window: 512_000,
-            context_window_cache: Arc::new(RwLock::new(None)),
+            context_window_cache: Arc::new(RwLock::new(HashMap::new())),
             parse_retry_limit: 3,
         };
         let p = OllamaProvider::new(cfg);
@@ -878,10 +998,52 @@ mod tests {
             max_tokens: 1024,
             discover_models: true,
             context_window: 512_000,
-            context_window_cache: Arc::new(RwLock::new(None)),
+            context_window_cache: Arc::new(RwLock::new(HashMap::new())),
             parse_retry_limit: 3,
         };
         let p = OllamaProvider::new(cfg);
         assert_eq!(p.discovery_url(), "http://localhost:11434/api/tags");
+    }
+
+    #[test]
+    fn fallback_targets_reject_empty_models_but_allow_legacy_vendor_models() {
+        let sections = vec![make_section(
+            "primary",
+            ProviderType::OpenRouter,
+            "https://openrouter.ai/api/v1",
+            "model-a",
+        )];
+        for target in ["", " ", "primary/", "primary/   ", "model\nname"] {
+            assert!(
+                build_registry_with_fallback(&sections, "primary", 0, vec![target.into()]).is_err(),
+                "{target:?}"
+            );
+        }
+        for target in ["legacy-model", "moonshotai/kimi-k2.6", "primary/model-a"] {
+            assert!(
+                build_registry_with_fallback(&sections, "primary", 0, vec![target.into()]).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn build_registry_with_fallback_populates_fallback_chain() {
+        let sections = vec![
+            make_section(
+                "primary",
+                ProviderType::OpenRouter,
+                "https://openrouter.ai/api/v1",
+                "model-a",
+            ),
+            make_section(
+                "secondary",
+                ProviderType::OpenRouter,
+                "https://openrouter.ai/api/v1",
+                "model-b",
+            ),
+        ];
+        let fallback_chain = vec!["secondary/model-b".to_string()];
+        let reg = build_registry_with_fallback(&sections, "primary", 3, fallback_chain).unwrap();
+        assert_eq!(reg.fallback_chain(), &["secondary/model-b".to_string()]);
     }
 }

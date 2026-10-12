@@ -107,8 +107,8 @@ impl ConversationManager {
         incoming: &IncomingMessage,
         config: &Config,
         supports_vision: bool,
-    ) -> Result<Vec<ContentPart>> {
-        let (augmented_text, image_parts) = crate::file_processor::process_attachments(
+    ) -> Result<(String, Vec<ContentPart>)> {
+        let (extracted_text, image_parts) = crate::file_processor::process_attachments(
             &incoming.attachments,
             &incoming.text,
             config,
@@ -117,9 +117,17 @@ impl ConversationManager {
         )
         .await;
 
+        // Combine incoming.text and extracted_text so no text is lost in persistence (HG-01 & HG-02)
+        let combined_text = match (incoming.text.is_empty(), extracted_text.is_empty()) {
+            (false, false) => format!("{}\n\n{extracted_text}", incoming.text),
+            (false, true) => incoming.text.clone(),
+            (true, false) => extracted_text.clone(),
+            (true, true) => String::new(),
+        };
+
         let user_msg = ChatMessage {
             role: "user".to_string(),
-            content: Some(MessageContent::Text(augmented_text)),
+            content: Some(MessageContent::Text(combined_text)),
             tool_calls: None,
             tool_call_id: None,
         };
@@ -127,7 +135,7 @@ impl ConversationManager {
             .save_message(&self.conversation_id, &user_msg)
             .await?;
 
-        Ok(image_parts)
+        Ok((extracted_text, image_parts))
     }
 
     pub fn add_user_turn(&mut self, msg: ChatMessage) {
@@ -208,8 +216,29 @@ impl ConversationManager {
 
     pub fn inject_rag_context(&mut self, rag_block: &str) {
         if !rag_block.is_empty() {
-            self.system_prompt
-                .push_str(&format!("\n\n# Retrieved Context\n{rag_block}"));
+            let rag_suffix = format!("\n\n# Retrieved Context\n{rag_block}");
+            self.system_prompt.push_str(&rag_suffix);
+
+            // Update self.messages[0] (or the first system message) so prepare() produces
+            // a prompt that includes the RAG context block for the LLM.
+            if let Some(first_msg) = self.messages.first_mut() {
+                if first_msg.role == "system" {
+                    if let Some(content) = &mut first_msg.content {
+                        match content {
+                            MessageContent::Text(text) => text.push_str(&rag_suffix),
+                            MessageContent::Parts(parts) => {
+                                if let Some(ContentPart::Text { text }) = parts.first_mut() {
+                                    text.push_str(&rag_suffix);
+                                } else {
+                                    parts.push(ContentPart::Text { text: rag_suffix });
+                                }
+                            }
+                        }
+                    } else {
+                        first_msg.content = Some(MessageContent::Text(rag_suffix));
+                    }
+                }
+            }
         }
     }
 
@@ -393,7 +422,7 @@ mod tests {
             max_tokens: 100,
             discover_models: false,
             context_window: 4096,
-            context_window_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            context_window_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             parse_retry_limit: 0,
         };
         let provider: Arc<dyn crate::provider::Provider> =
@@ -818,5 +847,144 @@ mod tests {
                 .as_text(),
             "UNIQUE_KEYWORD_B follow-up"
         );
+    }
+
+    fn minimal_test_config() -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[telegram]
+bot_token = "test"
+allowed_user_ids = [1]
+
+[openrouter]
+api_key = "test"
+
+[sandbox]
+allowed_directory = "."
+"#,
+        )
+        .unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_add_incoming_preserves_text_and_extracts_attachments() {
+        let store = crate::memory::MemoryStore::open_in_memory().unwrap();
+        let conv_id = store
+            .get_or_create_conversation("test", "user_attach")
+            .await
+            .unwrap();
+
+        let mut cm = manager(vec![ChatMessage {
+            role: "system".to_string(),
+            content: Some(MessageContent::Text("system prompt".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        cm.memory = store.clone();
+        cm.conversation_id = conv_id.clone();
+
+        let config = minimal_test_config();
+
+        // 1. User message without attachments
+        let incoming_no_attach = IncomingMessage {
+            platform: "test".to_string(),
+            user_id: "user_attach".to_string(),
+            chat_id: "chat1".to_string(),
+            user_name: "User".to_string(),
+            text: "Hello, this is my text message".to_string(),
+            attachments: vec![],
+        };
+
+        let (extracted_text, image_parts) = cm
+            .add_incoming(&incoming_no_attach, &config, false)
+            .await
+            .unwrap();
+
+        assert_eq!(extracted_text, "");
+        assert!(image_parts.is_empty());
+
+        // Check persisted message in memory store
+        let loaded = store.load_messages(&conv_id).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].content.as_ref().unwrap().as_text(),
+            "Hello, this is my text message"
+        );
+
+        // 2. User message with a DOCX attachment created via docx_rs
+        let dir = tempfile::tempdir().unwrap();
+        let docx_path = dir.path().join("sample.docx");
+        let docx_file = std::fs::File::create(&docx_path).unwrap();
+        docx_rs::Docx::new()
+            .add_paragraph(
+                docx_rs::Paragraph::new()
+                    .add_run(docx_rs::Run::new().add_text("Extracted Docx Text")),
+            )
+            .build()
+            .pack(docx_file)
+            .unwrap();
+
+        let incoming_with_docx = IncomingMessage {
+            platform: "test".to_string(),
+            user_id: "user_attach".to_string(),
+            chat_id: "chat1".to_string(),
+            user_name: "User".to_string(),
+            text: "Please analyze this file:".to_string(),
+            attachments: vec![crate::platform::Attachment {
+                kind: crate::platform::AttachmentKind::Docx,
+                path: docx_path,
+                mime_type:
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        .to_string(),
+                file_name: Some("sample.docx".to_string()),
+            }],
+        };
+
+        let (extracted_docx, image_parts) = cm
+            .add_incoming(&incoming_with_docx, &config, false)
+            .await
+            .unwrap();
+
+        assert!(extracted_docx.contains("Extracted Docx Text"));
+        assert!(image_parts.is_empty());
+
+        let loaded2 = store.load_messages(&conv_id).await.unwrap();
+        assert_eq!(loaded2.len(), 2);
+        let second_persisted = loaded2[1].content.as_ref().unwrap().as_text();
+        assert!(second_persisted.starts_with("Please analyze this file:"));
+        assert!(second_persisted.contains("Extracted Docx Text"));
+    }
+
+    #[test]
+    fn test_inject_rag_context_updates_system_message_and_prepare() {
+        let mut cm = manager(vec![ChatMessage {
+            role: "system".to_string(),
+            content: Some(MessageContent::Text("Initial system prompt".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+
+        let rag_block = "[1] Relevant memory: User likes cats\n[2] Relevant doc: Rust 2024 edition";
+        cm.inject_rag_context(rag_block);
+
+        assert!(cm.system_prompt.contains("# Retrieved Context"));
+        assert!(cm.system_prompt.contains("User likes cats"));
+
+        // Verify messages[0] has been updated
+        let sys_content = cm.messages[0].content.as_ref().unwrap().as_text();
+        assert!(sys_content.contains("Initial system prompt"));
+        assert!(sys_content.contains("# Retrieved Context"));
+        assert!(sys_content.contains(rag_block));
+
+        // Verify prepare() outputs the injected context
+        let prepared = cm.prepare(100_000);
+        let prepared_sys = prepared.messages[0].content.as_ref().unwrap().as_text();
+        assert!(prepared_sys.contains("Initial system prompt"));
+        assert!(prepared_sys.contains("# Retrieved Context"));
+        assert!(prepared_sys.contains(rag_block));
     }
 }

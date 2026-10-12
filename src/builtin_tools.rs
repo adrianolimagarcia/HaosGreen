@@ -307,11 +307,12 @@ impl ToolHandler for BuiltinTools {
                     parameters: json!({
                         "type": "object",
                         "properties": {
+                            "title": { "type": "string", "description": "Title of the plan to update" },
                             "step_id": { "type": "integer", "description": "Zero-based index of the step to update" },
                             "status": { "type": "string", "enum": ["todo", "in_progress", "done", "failed"], "description": "New status for the step" },
                             "notes": { "type": "string", "description": "Optional notes — result summary, error message, etc." }
                         },
-                        "required": ["step_id", "status"]
+                        "required": ["title", "step_id", "status"]
                     }),
                 },
             },
@@ -320,7 +321,7 @@ impl ToolHandler for BuiltinTools {
                 function: FunctionDefinition {
                     name: "plan_view".to_string(),
                     description: "View the current plan as a checklist. Call at the end of execution to review progress before synthesising the final answer.".to_string(),
-                    parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+                    parameters: json!({ "type": "object", "properties": {"title": {"type": "string", "description": "Title of the plan to view"}}, "required": ["title"] }),
                 },
             },
             ToolDefinition {
@@ -525,6 +526,7 @@ impl ToolHandler for BuiltinTools {
                     "title": title,
                     "steps": steps,
                     "statuses": vec![json!("todo"); steps.len()],
+                    "notes": vec![Value::Null; steps.len()],
                 });
                 let body = serde_json::to_string_pretty(&plan)?;
                 write_no_follow(&plan_path, body.as_bytes())
@@ -544,13 +546,21 @@ impl ToolHandler for BuiltinTools {
                 ))
             }
             "plan_update" => {
-                let title = args["title"].as_str().unwrap_or("default");
+                let title = args["title"].as_str().context("Missing 'title' argument")?;
                 validate_plan_title(title)?;
-                let step_id = args["step_id"].as_u64().context("Missing 'step_id'")? as usize;
+                let step_id = usize::try_from(
+                    args["step_id"]
+                        .as_u64()
+                        .context("Missing or invalid 'step_id'")?,
+                )
+                .context("'step_id' is too large")?;
                 let status = args["status"]
                     .as_str()
                     .context("Missing 'status' argument")?;
-                let _notes = args.get("notes").and_then(|v| v.as_str());
+                if !["todo", "in_progress", "done", "failed"].contains(&status) {
+                    anyhow::bail!("Invalid plan status '{status}'");
+                }
+                let notes = args.get("notes").and_then(|v| v.as_str());
                 let plan_path = resolve_plan_path(&ctx.sandbox_dir, title)?;
                 let content = read_no_follow(&plan_path).await.map_err(|e| {
                     if is_symlink_refusal(&e) {
@@ -561,20 +571,35 @@ impl ToolHandler for BuiltinTools {
                     }
                 })?;
                 let mut plan: Value = serde_json::from_str(&content)?;
-                if let Some(statuses) = plan.get_mut("statuses").and_then(|s| s.as_array_mut()) {
-                    if step_id < statuses.len() {
-                        statuses[step_id] = json!(status);
-                        if let Some(n) = _notes {
-                            if let Some(notes_arr) =
-                                plan.get_mut("notes").and_then(|n| n.as_array_mut())
-                            {
-                                if step_id < notes_arr.len() {
-                                    notes_arr[step_id] = json!(n);
-                                }
-                            }
-                        }
-                    }
+                let step_count = plan
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .context("Invalid plan: missing steps array")?
+                    .len();
+                let statuses = plan
+                    .get("statuses")
+                    .and_then(Value::as_array)
+                    .context("Invalid plan: missing statuses array")?;
+                if statuses.len() != step_count || step_id >= step_count {
+                    anyhow::bail!("Invalid plan step index {step_id} or inconsistent statuses");
                 }
+                // Legacy plans have no notes. Initialize only absent/null notes;
+                // reject malformed arrays rather than discard existing data.
+                if plan.get("notes").is_none_or(Value::is_null) {
+                    plan["notes"] = json!(vec![Value::Null; step_count]);
+                }
+                let notes_arr = plan
+                    .get_mut("notes")
+                    .and_then(Value::as_array_mut)
+                    .context("Invalid plan: notes must be an array")?;
+                if notes_arr.len() > step_count {
+                    anyhow::bail!("Invalid plan: too many notes");
+                }
+                notes_arr.resize(step_count, Value::Null);
+                if let Some(n) = notes {
+                    notes_arr[step_id] = json!(n);
+                }
+                plan["statuses"][step_id] = json!(status);
                 let body = serde_json::to_string_pretty(&plan)?;
                 write_no_follow(&plan_path, body.as_bytes())
                     .await
@@ -589,7 +614,7 @@ impl ToolHandler for BuiltinTools {
                 Ok(format!("Updated step {step_id} to '{status}'"))
             }
             "plan_view" => {
-                let title = args["title"].as_str().unwrap_or("default");
+                let title = args["title"].as_str().context("Missing 'title' argument")?;
                 validate_plan_title(title)?;
                 let plan_path = resolve_plan_path(&ctx.sandbox_dir, title)?;
                 let content = read_no_follow(&plan_path).await.map_err(|e| {
@@ -946,6 +971,192 @@ mod tests {
     use crate::tool_registry::ToolUiMode;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn audit_plan_contract() {
+        let dir = tempdir().unwrap();
+        let tools = make_tools();
+        for name in ["plan_update", "plan_view"] {
+            let def = tools
+                .define()
+                .into_iter()
+                .find(|d| d.function.name == name)
+                .unwrap();
+            assert!(def.function.parameters["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("title")));
+            assert!(exec(
+                &tools,
+                name,
+                json!({"step_id":0,"status":"done"}),
+                dir.path(),
+                dir.path()
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_plan_notes_and_validation() {
+        let dir = tempdir().unwrap();
+        let tools = make_tools();
+        exec(
+            &tools,
+            "plan_create",
+            json!({"title":"audit","steps":["one","two"]}),
+            dir.path(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let path = dir.path().join(".plans/audit.json");
+        let original = tokio::fs::read_to_string(&path).await.unwrap();
+        let plan: Value = serde_json::from_str(&original).unwrap();
+        assert_eq!(plan["notes"], json!([null, null]));
+        for args in [
+            json!({"title":"audit","step_id":0,"status":"invalid"}),
+            json!({"title":"audit","step_id":2,"status":"done"}),
+            json!({"title":"audit","step_id":-1,"status":"done"}),
+        ] {
+            assert!(exec(&tools, "plan_update", args, dir.path(), dir.path())
+                .await
+                .is_err());
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
+        }
+        // Legacy files lack notes; retain steps and initialize aligned notes.
+        tokio::fs::write(
+            &path,
+            r#"{"title":"audit","steps":["one","two"],"statuses":["todo","done"]}"#,
+        )
+        .await
+        .unwrap();
+        exec(
+            &tools,
+            "plan_update",
+            json!({"title":"audit","step_id":0,"status":"done","notes":"result"}),
+            dir.path(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let plan: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_eq!(plan["notes"], json!(["result", null]));
+        assert_eq!(plan["steps"], json!(["one", "two"]));
+        assert_eq!(plan["statuses"], json!(["done", "done"]));
+    }
+
+    #[tokio::test]
+    async fn audit_plan_invalid_update_leaves_file_unchanged() {
+        let dir = tempdir().unwrap();
+        let tools = make_tools();
+        exec(
+            &tools,
+            "plan_create",
+            json!({"title":"audit","steps":["one"]}),
+            dir.path(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let path = dir.path().join(".plans/audit.json");
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+        for (index, status) in [(0, "invalid"), (1, "done")] {
+            assert!(exec(
+                &tools,
+                "plan_update",
+                json!({"title":"audit","step_id":index,"status":status}),
+                dir.path(),
+                dir.path()
+            )
+            .await
+            .is_err());
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_plan_legacy_notes() {
+        let dir = tempdir().unwrap();
+        let tools = make_tools();
+        tokio::fs::create_dir(dir.path().join(".plans"))
+            .await
+            .unwrap();
+        let path = dir.path().join(".plans/audit.json");
+        tokio::fs::write(
+            &path,
+            r#"{"steps":["one","two"],"statuses":["todo","done"]}"#,
+        )
+        .await
+        .unwrap();
+        exec(
+            &tools,
+            "plan_update",
+            json!({"title":"audit","step_id":0,"status":"done","notes":"result"}),
+            dir.path(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        let plan: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(path).await.unwrap()).unwrap();
+        assert_eq!(plan["notes"], json!(["result", null]));
+    }
+
+    #[tokio::test]
+    async fn audit_plan_handlers_require_title() {
+        let dir = tempdir().unwrap();
+        let tools = make_tools();
+        exec(
+            &tools,
+            "plan_create",
+            json!({"title":"default","steps":["one"]}),
+            dir.path(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        for name in ["plan_update", "plan_view"] {
+            let err = exec(
+                &tools,
+                name,
+                json!({"step_id":0,"status":"done"}),
+                dir.path(),
+                dir.path(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("title"));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_plan_malformed_arrays_are_not_overwritten() {
+        let dir = tempdir().unwrap();
+        let tools = make_tools();
+        tokio::fs::create_dir(dir.path().join(".plans"))
+            .await
+            .unwrap();
+        let path = dir.path().join(".plans/audit.json");
+        for body in [
+            r#"{"steps":["one"],"statuses":[]}"#,
+            r#"{"steps":["one"],"statuses":["todo"],"notes":"existing"}"#,
+        ] {
+            tokio::fs::write(&path, body).await.unwrap();
+            assert!(exec(
+                &tools,
+                "plan_update",
+                json!({"title":"audit","step_id":0,"status":"done"}),
+                dir.path(),
+                dir.path()
+            )
+            .await
+            .is_err());
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), body);
+        }
+    }
 
     fn make_tools() -> BuiltinTools {
         BuiltinTools::new(

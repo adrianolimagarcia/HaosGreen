@@ -81,26 +81,94 @@ impl ScheduledTaskStore {
 
     pub async fn list_all_active(&self) -> Result<Vec<ScheduledTask>> {
         let conn = self.conn.lock().await;
-        self.query_tasks(&conn, "WHERE status = 'active'", rusqlite::params![])
+        self.query_tasks(
+            &conn,
+            "WHERE status IN ('active','registering')",
+            rusqlite::params![],
+        )
+    }
+
+    /// A missing row or a store error must never authorize execution.
+    pub async fn active_generation(&self, id: &str) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().await;
+        Ok(conn
+            .query_row(
+                "SELECT generation FROM scheduled_tasks WHERE id=?1 AND status='active'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub async fn is_eligible(&self, id: &str, generation: i64) -> Result<bool> {
+        Ok(self.active_generation(id).await? == Some(generation))
+    }
+
+    pub async fn generation(&self, id: &str) -> Result<i64> {
+        let conn = self.conn.lock().await;
+        Ok(conn.query_row(
+            "SELECT generation FROM scheduled_tasks WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Reactivation invalidates every callback and queued run of the previous incarnation.
+    pub async fn reactivate(
+        &self,
+        id: &str,
+        generation: i64,
+        expected_status: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().await;
+        // Fence both the incarnation and the status observed by the caller.
+        let changed = conn.execute("UPDATE scheduled_tasks SET status='registering', generation=generation+1 WHERE id=?1 AND generation=?2 AND status=?3", rusqlite::params![id, generation, expected_status])?;
+        anyhow::ensure!(changed == 1, "Task changed while preparing rerun");
+        Ok(generation + 1)
+    }
+
+    /// Race the registration commit atomically without invalidating its winner.
+    pub async fn reject_registration(&self, id: &str, generation: i64) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute("UPDATE scheduled_tasks SET status='failed_registration' WHERE id=?1 AND generation=?2 AND status='registering'", rusqlite::params![id, generation])? == 1)
+    }
+
+    pub async fn finish_generation(&self, id: &str, generation: i64, status: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute("UPDATE scheduled_tasks SET status=?3 WHERE id=?1 AND generation=?2 AND status IN ('active','registering')", rusqlite::params![id, generation, status])? == 1)
     }
 
     pub async fn set_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
+            "UPDATE scheduled_tasks SET status = ?1,
+             generation = generation + CASE WHEN ?1 = 'cancelled' THEN 1 ELSE 0 END
+             WHERE id = ?2 AND status != 'cancelled'",
             rusqlite::params![status, id],
         )
         .context("Failed to update task status")?;
         Ok(())
     }
 
+    pub async fn register_generation(&self, id: &str, generation: i64, job_id: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute("UPDATE scheduled_tasks SET scheduler_job_id=?3, status='active' WHERE id=?1 AND generation=?2 AND status='registering'", rusqlite::params![id, generation, job_id])?;
+        anyhow::ensure!(changed == 1, "Task changed while registering scheduler job");
+        Ok(())
+    }
+
     pub async fn update_scheduler_job_id(&self, id: &str, job_id: &str) -> Result<()> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE scheduled_tasks SET scheduler_job_id = ?1 WHERE id = ?2",
+        let changed = conn.execute(
+            "UPDATE scheduled_tasks SET scheduler_job_id = ?1 WHERE id = ?2 AND status='active'",
             rusqlite::params![job_id, id],
         )
         .context("Failed to update scheduler_job_id")?;
+        anyhow::ensure!(
+            changed == 1,
+            "Task missing or inactive while persisting scheduler job"
+        );
         Ok(())
     }
 
@@ -138,6 +206,12 @@ impl ScheduledTaskStore {
         }
     }
 
+    /// Retrieve a task by ID ensuring it belongs to the given user_id (P1-04 ownership check).
+    pub async fn get_owned(&self, id: &str, user_id: &str) -> Result<Option<ScheduledTask>> {
+        let task = self.get_by_id(id).await?;
+        Ok(task.filter(|t| t.user_id == user_id))
+    }
+
     pub async fn update_next_run_at(&self, id: &str, next_run_at: &str) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
@@ -146,6 +220,18 @@ impl ScheduledTaskStore {
         )
         .context("Failed to update next_run_at")?;
         Ok(())
+    }
+
+    /// Claim a queued run atomically with its persisted eligibility check.
+    pub async fn begin_run(
+        &self,
+        id: &str,
+        generation: i64,
+        run_id: &str,
+        run_at: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute("INSERT INTO scheduled_task_runs (id,task_id,run_at,status) SELECT ?3,id,?4,'running' FROM scheduled_tasks WHERE id=?1 AND generation=?2 AND status='active'", rusqlite::params![id,generation,run_id,run_at])? == 1)
     }
 
     pub async fn insert_run(
@@ -276,6 +362,121 @@ mod tests {
             created_at: "2026-01-01T00:00:00".to_string(),
             next_run_at: Some("2099-01-01T09:00:00".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn one_shot_rerun_terminalizes_current_generation() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let store = ScheduledTaskStore::new(memory.connection());
+        store
+            .create(&make_task("rerun", "user", "one_shot"))
+            .await
+            .unwrap();
+        store.set_status("rerun", "completed").await.unwrap();
+        let generation = store.reactivate("rerun", 0, "completed").await.unwrap();
+        assert!(!store.is_eligible("rerun", generation).await.unwrap());
+        store
+            .register_generation("rerun", generation, "job")
+            .await
+            .unwrap();
+        assert!(store
+            .finish_generation("rerun", generation, "completed")
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_by_id("rerun").await.unwrap().unwrap().status,
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_fences_cancelled_work_after_reactivation() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let store = ScheduledTaskStore::new(memory.connection());
+        store
+            .create(&make_task("fence", "user", "one_shot"))
+            .await
+            .unwrap();
+        let generation = store.active_generation("fence").await.unwrap().unwrap();
+        assert!(store.is_eligible("fence", generation).await.unwrap());
+        store.set_status("fence", "cancelled").await.unwrap();
+        store
+            .reactivate("fence", generation + 1, "cancelled")
+            .await
+            .unwrap();
+        assert!(!store
+            .begin_run("fence", generation + 2, "premature", "now")
+            .await
+            .unwrap());
+        store
+            .register_generation("fence", generation + 2, "job")
+            .await
+            .unwrap();
+        assert!(!store
+            .register_generation("fence", generation, "stale")
+            .await
+            .is_ok());
+        assert!(!store
+            .begin_run("fence", generation, "stale-run", "now")
+            .await
+            .unwrap());
+        assert!(store
+            .begin_run("fence", generation + 2, "current-run", "now")
+            .await
+            .unwrap());
+        assert!(store
+            .reactivate("fence", generation + 2, "cancelled")
+            .await
+            .is_err());
+        assert!(!store.is_eligible("fence", generation).await.unwrap());
+        assert!(!store
+            .finish_generation("fence", generation, "completed")
+            .await
+            .unwrap());
+        assert!(store.is_eligible("fence", generation + 2).await.unwrap());
+        assert!(!store.is_eligible("missing", 0).await.unwrap());
+        memory
+            .connection()
+            .lock()
+            .await
+            .execute_batch("DROP TABLE scheduled_task_runs; DROP TABLE scheduled_tasks")
+            .unwrap();
+        assert!(store.is_eligible("fence", generation).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_cancel_does_not_invalidate_a_later_cas() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let store = ScheduledTaskStore::new(memory.connection());
+        store
+            .create(&make_task("duplicate", "user", "one_shot"))
+            .await
+            .unwrap();
+        store.set_status("duplicate", "cancelled").await.unwrap();
+        let generation = store.generation("duplicate").await.unwrap();
+        store.set_status("duplicate", "cancelled").await.unwrap();
+        assert_eq!(store.generation("duplicate").await.unwrap(), generation);
+    }
+
+    #[tokio::test]
+    async fn terminal_status_preserves_cancellation() {
+        let memory = MemoryStore::open_in_memory().unwrap();
+        let store = ScheduledTaskStore::new(memory.connection());
+        store
+            .create(&make_task("cancel-race", "user", "one_shot"))
+            .await
+            .unwrap();
+        store.set_status("cancel-race", "cancelled").await.unwrap();
+        store.set_status("cancel-race", "completed").await.unwrap();
+        assert_eq!(
+            store
+                .get_by_id("cancel-race")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
     }
 
     #[tokio::test]
